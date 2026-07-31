@@ -3,32 +3,30 @@ const b = await chromium.launch({ headless: true, args: ['--use-angle=default','
 const p = await b.newPage();
 p.on('pageerror', e => console.log('ERR', e.message.slice(0,200)));
 await p.goto('http://127.0.0.1:5173/?capture=1&pr=1', { waitUntil: 'domcontentloaded' });
-await p.waitForFunction(() => !!window.__DESCENT__?.game?.effects, null, { timeout: 240000 });
+await p.waitForFunction(() => !!window.__DESCENT__?.game?.track, null, { timeout: 300000 });
 console.log(JSON.stringify(await p.evaluate(() => {
-  const g = window.__DESCENT__.game;
-  g.capture.takeControl(); g.capture.setPose('scree-speed');
-  const st = g.race.player.bike.state, dust = g.effects.dust;
-  let everGnd = 0, everTrail = 0, maxAlive = 0, cpZero = 0, samples = 0;
-  const origTrail = dust.trail.bind(dust);
-  dust.trail = (...a) => { everTrail++; return origTrail(...a); };
-  const pool = dust.pool;
-  for (let i = 0; i < 180; i++) {
-    g.capture.step(1/60);
-    samples++;
-    if (st.rear.grounded) everGnd++;
-    const cp = st.rear.contactPoint;
-    if (st.rear.grounded && Math.abs(cp.x) < 1e-6 && Math.abs(cp.z) < 1e-6) cpZero++;
-    const alive = pool?.used ?? 0;
-    if (alive > maxAlive) maxAlive = alive;
+  const g = window.__DESCENT__.game, tr = g.track, te = g.terrain;
+  const secs = tr.sectionRanges.map(r => ({ kind: r.kind, d0: r.start, d1: r.end }));
+  const out = [];
+  for (const sec of secs) {
+    let mn = 1e9, mx = -1e9, sum = 0, n = 0;
+    const prev = [];
+    let maxSlopeDeg = 0;
+    for (let d = sec.d0; d <= sec.d1; d += 1.5) {
+      const s = tr.sampleAtDistance(d);
+      const e = te.heightAt(s.position.x, s.position.z) - s.position.y;
+      mn = Math.min(mn, e); mx = Math.max(mx, e); sum += e; n++;
+      prev.push([s.position.x, s.position.y, s.position.z]);
+    }
+    // steepest centreline segment, degrees from horizontal
+    for (let i = 1; i < prev.length; i++) {
+      const dx = prev[i][0]-prev[i-1][0], dy = prev[i][1]-prev[i-1][1], dz = prev[i][2]-prev[i-1][2];
+      const horiz = Math.hypot(dx, dz);
+      const deg = Math.abs(Math.atan2(dy, Math.max(horiz, 1e-4))) * 180/Math.PI;
+      if (deg > maxSlopeDeg) maxSlopeDeg = deg;
+    }
+    out.push({ sec: sec.kind, min: +mn.toFixed(2), max: +mx.toFixed(2), mean: +(sum/n).toFixed(2), steepestDeg: +maxSlopeDeg.toFixed(1) });
   }
-  return {
-    samples, framesRearGrounded: everGnd, trailCallsMade: everTrail,
-    contactPointAtOrigin: cpZero, maxAliveParticles: maxAlive,
-    poolKeys: pool ? Object.keys(pool) : null,
-    finalSpeed: +st.speed.toFixed(2),
-    frontGrounded: st.front.grounded, rearGrounded: st.rear.grounded,
-    pitch: +st.pitch.toFixed(3), lean: +st.lean.toFixed(3),
-    rearContact: [+st.rear.contactPoint.x.toFixed(1), +st.rear.contactPoint.y.toFixed(1), +st.rear.contactPoint.z.toFixed(1)],
-  };
+  return out;
 }, null), null, 1));
 await b.close();

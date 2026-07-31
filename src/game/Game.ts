@@ -147,7 +147,10 @@ const SEQUENCES: Record<string, { from: string; input?: Partial<BikeInput> }> = 
   launch:         { from: 'summit-rider', input: { pedal: 1 } },
   switchback:     { from: 'switchback-lean', input: { steer: 0.9, pedal: 0.5 } },
   'tabletop-air': { from: 'tabletop-air', input: { airPitch: 0.35 } },
-  landing:        { from: 'ravine-gap', input: { airPitch: 0.15 } },
+  // Chase, not the ravine-gap orbit: at dist 19 the rider is 45-73 px and a
+  // landing cannot be judged at that size. This sequence exists to review the
+  // absorption chain, so it has to be close enough to see a knee bend.
+  landing:        { from: 'tabletop-air', input: { airPitch: 0.15 } },
   crash:          { from: 'crash' },
   'scree-speed':  { from: 'scree-speed', input: { pedal: 1 } },
   'trick-360':    { from: 'tabletop-air', input: { airYaw: 1 } },
@@ -172,6 +175,16 @@ export class Game {
 
   private bikes: Bike[] = [];
   private captureControlled = false;
+  /**
+   * Frames left to suppress HUD popups for after a capture teleport.
+   *
+   * Jumping the player 700 m down the course crosses three checkpoints inside a
+   * single physics step, so the race layer legitimately fires three split
+   * popups at once and the HUD stacks them for their full 1.9 s life. That is
+   * correct behaviour reacting to an event that never happens in play — it is
+   * the review harness contaminating the thing it exists to review.
+   */
+  private suppressPopupFrames = 0;
   private scriptedInput: BikeInput | null = null;
   private debugOverlay = false;
   private headless: boolean;
@@ -301,6 +314,17 @@ export class Game {
 
     this.effects.setSubject(this.race.player.bike.state);
     this.effects.cameraDirector.setReplaySource(this.race.replay);
+
+    // The boom solver needs to know the pack exists. Without this the camera
+    // has no idea other riders are there, and since they spawn 3.5/8.0/12.5 m
+    // behind the player they sit directly ON the boom — which is what put an
+    // opponent 3.7 m from the lens and filled the frame with a stranger's torso
+    // while the actual subject was 7.8 m out. The director falls back to a
+    // name-based scene scan without this, which works but is fragile.
+    const occluders = this.race.racers
+      .filter((r) => r !== this.race.player)
+      .map((r) => r.bike.state);
+    this.effects.cameraDirector.setOccluders?.(occluders);
     await frame();
 
     progress(0.97, 'Wiring loop');
@@ -372,7 +396,12 @@ export class Game {
     this.effects.update(dt, elapsed, camera, realDt);
 
     // 4. Readouts.
-    this.hud.update(this.race.getHudModel(), dt, elapsed);
+    const hudModel = this.race.getHudModel();
+    if (this.suppressPopupFrames > 0) {
+      this.suppressPopupFrames--;
+      hudModel.popups.length = 0;
+    }
+    this.hud.update(hudModel, dt, elapsed);
     this.audio.setRiderInput(this.race.player.input);
     this.audio.update(player, (this.race.player.bike as Bike).physics.surface, dt);
 
@@ -447,6 +476,20 @@ export class Game {
       if (!isPlayer) _v.addScaledVector(sample.left, i % 2 === 0 ? 1.6 : -1.6);
       _fwd.copy(sample.tangent);
 
+      // Spawn on whichever surface is HIGHER: the ribbon mesh or the
+      // heightfield under it.
+      //
+      // The physics collides with the heightfield; the ribbon is only what you
+      // see. They currently disagree by as much as 8 m (measured: scree +1.06
+      // to +2.15, tabletop -7.92 to +1.89, streambed -4.22 to +3.15), so
+      // spawning on the ribbon buried the bike 1-2.5 m underground in half the
+      // poses and dropped it 5 m in others. Taking the max means a pose is
+      // never spawned inside the mountain — the bike settles the short distance
+      // instead of exploding out of it. This is a GUARD, not the fix: the carve
+      // needs to make the two agree, and that is tracked separately.
+      const groundY = this.terrain.heightAt(_v.x, _v.z);
+      if (groundY > _v.y) _v.y = groundY;
+
       // `sample.position` is the ribbon SURFACE, and the bike's origin is on
       // the AXLE LINE — one wheel radius above whatever it is standing on.
       // Spawning the origin at the surface buried both wheels 0.27 m in the
@@ -460,7 +503,6 @@ export class Game {
       bike.reset(_v, _fwd);
       bike.state.velocity.copy(_fwd).multiplyScalar(s.speed);
       if (s.launch) bike.state.velocity.y += s.launch;
-      if (s.crash && isPlayer) bike.physics.forceCrash(0.82);
     }
 
     const dir = this.effects.cameraDirector;
@@ -469,6 +511,16 @@ export class Game {
       dir.setOrbit(s.orbit.yaw, s.orbit.pitch, s.orbit.dist, s.orbit.spin ?? 0.35);
     }
     dir.resetTo(this.race.player.bike.state);
+
+    // Swallow the checkpoint splits the teleport just crossed, and wipe any
+    // popup already on screen from the previous pose.
+    this.suppressPopupFrames = 4;
+    this.hud.resetRun();
+
+    // AFTER the camera reset, not before. `resetTo` consumes the pending crash
+    // edge, so forcing the crash first meant the crash-focus envelope never saw
+    // it and the one pose named `crash` was the one that never pushed in.
+    if (s.crash) (this.race.player.bike as Bike).physics.forceCrash(0.82);
 
     if (s.input) this.setScripted(s.input);
     return true;

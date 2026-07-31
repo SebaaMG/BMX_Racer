@@ -101,7 +101,9 @@ const FRAGMENT = /* glsl */ `
   uniform float uIdThreshold;
   uniform float uIdWeight;
   uniform float uStrength;
-  uniform vec2  uFade;               // start, end (metres)
+  uniform vec2  uFade;               // start, end (metres) — INTERIOR lines only
+  uniform vec2  uContourFade;        // start, end (metres) — the contour's own
+  uniform float uContourFloor;       // how much contour ink survives at uFade.y
   uniform float uHullSuppression;
   uniform vec2  uCurvature;          // weight, floor
   uniform float uContourStrength;
@@ -166,22 +168,43 @@ const FRAGMENT = /* glsl */ `
       w[i]   = 1.0 / max(dep[i], 0.02);
     }
 
+    // ── The contour, widened ────────────────────────────────────────────────
+    // A one-texel contour is a hairline at retina, and it disappears entirely
+    // in the fifty-percent downsample every reviewer actually looks at. The
+    // terrain carries NO inverted hull, so on a ridge against the sky this term
+    // is the only ink that will ever exist — it has to hold a two-pixel core.
+    // The second ring supplies that core; it is weighted below the inner ring
+    // so the stroke tapers outward instead of ending in a hard wall of ink.
+    float contourWide = 0.0;
+    {
+      const vec2 RING2[8] = vec2[8](
+        vec2(-2.0,  0.0), vec2( 2.0,  0.0), vec2( 0.0, -2.0), vec2( 0.0,  2.0),
+        vec2(-2.0, -2.0), vec2( 2.0, -2.0), vec2(-2.0,  2.0), vec2( 2.0,  2.0)
+      );
+      for (int i = 0; i < 8; i++) {
+        float d = texture(uGNormalDepth, vUv + RING2[i] * uTexel).w;
+        contourWide = max(contourWide, 1.0 - step(0.0000001, d));
+      }
+    }
+
     // ── Hull ink detection ───────────────────────────────────────────────────
-    // Cross-shaped dilation: a 3x3 Sobel reaches exactly one pixel, and the
-    // ring of hull ink is at least two pixels wide, so any pixel whose Sobel
-    // response is caused by the silhouette has a cardinal neighbour inside the
-    // ink. Sampling the four diagonals as well costs four more depth fetches
-    // and, measured against this geometry, changes nothing.
+    // Cross-shaped dilation. The inner cross catches the Sobel's one-pixel
+    // reach; the outer cross at two texels exists because the contour above now
+    // reaches two, and an undilated test would let the widened contour stack a
+    // second stroke just outside the hull's own ink on every hulled silhouette.
     float farClip = uCamPlanes.y * 0.995;
     float hull = 0.0;
     {
-      int cross4[5] = int[5](1, 3, 4, 5, 7);
-      for (int k = 0; k < 5; k++) {
-        int i = cross4[k];
-        float dm = viewDepth(texture(uSceneDepth, vUv + OFF[i] * uTexel).r);
+      const vec2 HULL_TAPS[9] = vec2[9](
+        vec2( 0.0,  0.0),
+        vec2( 0.0, -1.0), vec2(-1.0,  0.0), vec2( 1.0,  0.0), vec2( 0.0,  1.0),
+        vec2( 0.0, -2.0), vec2(-2.0,  0.0), vec2( 2.0,  0.0), vec2( 0.0,  2.0)
+      );
+      for (int k = 0; k < 9; k++) {
+        vec2 uvT = vUv + HULL_TAPS[k] * uTexel;
+        float dm = viewDepth(texture(uSceneDepth, uvT).r);
         if (dm >= farClip) continue;                 // nothing was drawn there
-        vec4 g = texture(uGNormalDepth, vUv + OFF[i] * uTexel);
-        float dg = g.w;
+        float dg = texture(uGNormalDepth, uvT).w;
         // Either the G-buffer is empty (hull against the sky) or it holds
         // something well behind what the main pass drew (hull against terrain).
         float gap = (dg <= 0.0) ? 1.0e6 : (dg - dm);
@@ -232,16 +255,31 @@ const FRAGMENT = /* glsl */ `
     float weight = mix(1.0 - uCurvature.x * 0.55, 1.0 + uCurvature.x * 0.85, curv);
     weight = clamp(weight, 0.35, 1.95);
 
-    float edge = max(max(eNormal, eDepth), max(eId * uIdWeight, contour * uContourStrength));
+    // ── Two fades, not one ──────────────────────────────────────────────────
+    // INTERIOR lines have to die with distance: past a few hundred metres a
+    // crease detector over a mountain returns scribble, not draughtsmanship.
+    //
+    // The CONTOUR is the opposite case and used to share that fade, which is
+    // why not one ridgeline in the game carried ink. Every ridge silhouette in
+    // these frames sits beyond the interior fade end, the terrain carries no
+    // inverted hull to fall back on, and so the largest drawn shape in the
+    // picture terminated in a raw colour step. It gets its own, far longer
+    // fade, and that fade lands on a FLOOR rather than on zero — a ridge at two
+    // kilometres is still a drawn edge, just a lighter one.
+    float fade = 1.0 - smoothstep(uFade.x, uFade.y, dC);
+    float contourFade = mix(1.0, uContourFloor, smoothstep(uContourFade.x, uContourFade.y, dC));
+
+    float interior = max(max(eNormal, eDepth), eId * uIdWeight) * fade;
+    float contourE = max(contour, contourWide * 0.62) * uContourStrength * contourFade;
+
+    float edge = max(interior, contourE);
     // Raising the edge response to a power below 1 pushes more of the falloff
     // above the visible threshold, which reads as a THICKER stroke; above 1 it
     // reads as thinner. That is the pen-pressure model: curvature drives both
     // the width and the darkness, exactly as it does on the hull.
     edge = pow(saturate1(edge), 1.0 / weight);
 
-    float fade = 1.0 - smoothstep(uFade.x, uFade.y, dC);
-
-    float alpha = edge * uStrength * fade * mix(0.82, 1.0, weight);
+    float alpha = edge * uStrength * mix(0.82, 1.0, weight);
     // Characters carry heavier line work than backgrounds. The stylisation
     // mask is 1 on skinned geometry, which is exactly the rider.
     alpha *= mix(1.0, uCharacterBoost, saturate1(aC.z));
@@ -315,9 +353,14 @@ export class LinesPass {
       uIdWeight: { value: 0.9 },
       uStrength: { value: LINES.sobelStrength },
       uFade: { value: new Vector2(LINES.sobelFadeStart, LINES.sobelFadeEnd) },
+      // The contour's own range. These belong in Palette.LINES next to
+      // sobelFadeStart/End — they are art-direction constants, not plumbing —
+      // but that file is owned elsewhere this pass, so they live here for now.
+      uContourFade: { value: new Vector2(LINES.contourFadeStart, LINES.contourFadeEnd) },
+      uContourFloor: { value: LINES.contourFloor },
       uHullSuppression: { value: LINES.hullSuppression },
       uCurvature: { value: new Vector2(LINES.curvatureWeight, LINES.curvatureFloor) },
-      uContourStrength: { value: 0.78 },
+      uContourStrength: { value: LINES.contourStrength },
       uCharacterBoost: { value: 1.22 },
       uInkColor: { value: new Color().copy(INK) },
       uDebug: { value: 0 },

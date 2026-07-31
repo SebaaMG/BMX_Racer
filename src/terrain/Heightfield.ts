@@ -717,9 +717,31 @@ export function carveFeatures(
         const landing = 17;
         const halfW = W * 0.5;
         const reach = L * 0.5 + landing + 6;
-        const ref = meanHeight(fx, fz, L * 0.5);
         // The deck follows the descent profile rather than sitting level, or
         // the landing ramp would point uphill.
+        //
+        // That was the INTENT; the code used one constant mean for the whole
+        // 64 m feature. On ground that drops ~10 m across the mound, a constant
+        // reference cuts the uphill run-in down by metres and fills the
+        // downhill out-run by metres — and because the carve also ended in a
+        // hard `return`, the cut appeared instantly at the boundary. The result
+        // was a NEAR-VERTICAL WALL at the start of the run-in: measured as a 74
+        // degree face, over which the track centreline became multivalued in XZ
+        // (three consecutive spline points within 1 m horizontally spanning 4.5
+        // m of height). A heightfield cannot represent that, so the physics saw
+        // a mesa where the mesh showed a ramp, and the bike fell through it.
+        //
+        // The reference now follows the fall line between the two ends, and the
+        // whole carve feathers out longitudinally instead of stopping dead.
+        const sUp = -L * 0.5 - takeoff;
+        const sDn = L * 0.5 + landing;
+        const refUp = meanHeight(fx + dirX * sUp, fz + dirZ * sUp, 9);
+        const refDn = meanHeight(fx + dirX * sDn, fz + dirZ * sDn, 9);
+        const refAt = (sv: number): number =>
+          lerp(refUp, refDn, clamp01((sv - sUp) / Math.max(sDn - sUp, 1e-3)));
+        /** Metres of run-in and run-out over which the carve blends away. */
+        const endFeather = 9;
+
         forBox(fx, fz, reach, reach, (i, x, z) => {
           const dx = x - fx;
           const dz = z - fz;
@@ -741,10 +763,16 @@ export function carveFeatures(
             hh = H * Math.pow(1 - k, 1.25);
           }
           const across = 1 - smoothstep(halfW, halfW + 6.5, u);
+          // Longitudinal feather. Without this the carve's authority went from
+          // 0.85 to 0 across a single texel at each end, which is the step the
+          // spline then tried to climb.
+          const along =
+            smoothstep(sUp, sUp + endFeather, s) * (1 - smoothstep(sDn - endFeather, sDn, s));
+          const w = across * along;
+          const ref = refAt(s);
           const add = hh * across;
-          height[i] = Math.max(height[i], ref + add - (ref - height[i]) * 0);
-          height[i] = lerp(height[i], ref + add, across * 0.85);
-          if (add > 0.35) mark(i, SurfaceKind.Dirt);
+          height[i] = lerp(height[i], ref + add, w * 0.85);
+          if (add > 0.35 && w > 0.4) mark(i, SurfaceKind.Dirt);
         });
         break;
       }

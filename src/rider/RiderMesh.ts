@@ -700,18 +700,53 @@ function buildSkinParts(): BufferGeometry[] {
     );
   }
 
-  // Calves: knee to the top of the shoe.
+  // Thighs: hip to knee.
+  //
+  // These did not exist. The rider had a torso, two arms and two CALVES, and
+  // between the shorts hem and the knee there was nothing at all — which is
+  // most of why one leg read as "absent entirely" against the background and
+  // the other as a floating shin. The shorts hide the top two thirds, but the
+  // shorts are a separate material with its own outline, so without a thigh
+  // inside them the leg reads as a detached block above a detached tube.
+  //
+  // Radii sit comfortably inside the shorts loft (0.121 → 0.108 half-width) so
+  // nothing pokes through a baggy short at any knee angle.
+  for (const side of [1, -1]) {
+    const hp = side > 0 ? P.hipL : P.hipR;
+    const kn = side > 0 ? P.kneeL : P.kneeR;
+    const thigh: BoneName = side > 0 ? 'thighL' : 'thighR';
+    const shin: BoneName = side > 0 ? 'shinL' : 'shinR';
+    const path = [mix(hp, kn, 0.04), mix(hp, kn, 0.30), mix(hp, kn, 0.58), mix(hp, kn, 0.80), mix(hp, kn, 0.96)];
+    const rx = [D.thighTop, D.thighTop * 0.96, D.thighBottom * 1.16, D.thighBottom * 1.02, D.thighBottom * 0.94];
+    const ry = [D.thighTop * 1.04, D.thighTop * 1.00, D.thighBottom * 1.22, D.thighBottom * 1.08, D.thighBottom * 0.96];
+    parts.push(
+      skinPart(loftLimb(path, rx, ry, 12, 1, 0), [
+        { bone: 'pelvis', falloff: 0.080, bias: 0.5 },
+        { bone: thigh, falloff: 0.145 },
+        { bone: shin, falloff: 0.075, bias: 0.7 },
+      ]),
+    );
+  }
+
+  // Calves: knee to the ankle.
+  //
+  // The old path stopped at 0.88 of the knee→ankle line with a ROUNDED CAP,
+  // leaving a 5 cm gap between the end of the shin and the top of the shoe with
+  // nothing but a thin collar spanning it. From behind, at speed, that is a leg
+  // ending in a blunt rounded stub above the crank — which is exactly what the
+  // review saw. It now runs to 0.99 and is cap-less, so the shin, the collar
+  // and the shoe are one continuous limb.
   for (const side of [1, -1]) {
     const kn = side > 0 ? P.kneeL : P.kneeR;
     const an = side > 0 ? P.ankleL : P.ankleR;
     const shin: BoneName = side > 0 ? 'shinL' : 'shinR';
     const thigh: BoneName = side > 0 ? 'thighL' : 'thighR';
     const foot: BoneName = side > 0 ? 'footL' : 'footR';
-    const path = [mix(kn, an, 0.10), mix(kn, an, 0.34), mix(kn, an, 0.62), mix(kn, an, 0.88)];
-    const rx = [D.shinTop, D.shinTop * 0.92, D.shinBottom * 1.20, D.shinBottom];
-    const ry = [D.shinTop * 1.06, D.shinTop * 0.96, D.shinBottom * 1.24, D.shinBottom];
+    const path = [mix(kn, an, 0.04), mix(kn, an, 0.30), mix(kn, an, 0.60), mix(kn, an, 0.84), mix(kn, an, 0.99)];
+    const rx = [D.shinTop * 1.04, D.shinTop * 0.94, D.shinBottom * 1.24, D.shinBottom * 1.02, D.shinBottom * 0.90];
+    const ry = [D.shinTop * 1.10, D.shinTop * 0.98, D.shinBottom * 1.30, D.shinBottom * 1.06, D.shinBottom * 0.92];
     parts.push(
-      skinPart(loftLimb(path, rx, ry, 12, 1, 1), [
+      skinPart(loftLimb(path, rx, ry, 12, 1, 0), [
         { bone: thigh, falloff: 0.070, bias: 0.6 },
         { bone: shin, falloff: 0.115 },
         { bone: foot, falloff: 0.055, bias: 0.7 },
@@ -769,29 +804,51 @@ function buildJerseyParts(): BufferGeometry[] {
     ]),
   );
 
-  // Deltoid caps + sleeves.
+  // Deltoid + sleeve, as ONE loft.
+  //
+  // This used to be a 78 mm sphere sitting on top of a 74 mm tube. Two closed
+  // surfaces overlapping at a step, each computing its own normals and each
+  // getting its own inverted hull, which is why the shoulder read as an armour
+  // ball with a hard sleeve seam cut across it — the ink was drawing a silhouette
+  // edge where two separate solids intersected, not where the character has an
+  // edge.
+  //
+  // One continuous loft cannot have that seam. It starts inboard and above the
+  // shoulder joint (rounded into the torso), swells through the deltoid, and
+  // tapers down the upper arm to a cuff — which is the actual shape of a jersey
+  // sleeve over a deltoid, and it reads as one form under a hard cel ramp.
   for (const side of [1, -1]) {
     const sh = side > 0 ? P.shoulderL : P.shoulderR;
     const el = side > 0 ? P.elbowL : P.elbowR;
     const clav: BoneName = side > 0 ? 'clavL' : 'clavR';
     const upper: BoneName = side > 0 ? 'upperArmL' : 'upperArmR';
 
+    const sleeve = [
+      offset(sh, -side * 0.026, 0.034, -0.004),
+      offset(sh, side * 0.002, 0.010, 0),
+      mix(sh, el, 0.20),
+      mix(sh, el, 0.38),
+      mix(sh, el, 0.54),
+    ];
+    const srx = [
+      D.upperArmTop * 1.16,
+      D.upperArmTop * 1.46,
+      D.upperArmTop * 1.31,
+      D.upperArmTop * 1.20,
+      D.upperArmTop * 1.13,
+    ];
+    const sry = [
+      D.upperArmTop * 1.18,
+      D.upperArmTop * 1.44,
+      D.upperArmTop * 1.27,
+      D.upperArmTop * 1.16,
+      D.upperArmTop * 1.09,
+    ];
     parts.push(
-      skinPart(sphereForm(offset(sh, side * 0.006, 0.012, 0), 0.078, 0.080, 0.082, 12, 10), [
+      skinPart(loftLimb(sleeve, srx, sry, 14, 2, 0), [
         { bone: clav, falloff: 0.090, bias: 0.55 },
-        { bone: upper, falloff: 0.110 },
-        { bone: 'chest', falloff: 0.090, bias: 0.5 },
-      ]),
-    );
-
-    const sleeve = [mix(sh, el, 0.06), mix(sh, el, 0.28), mix(sh, el, 0.50)];
-    const srx = [D.upperArmTop * 1.34, D.upperArmTop * 1.22, D.upperArmTop * 1.14];
-    const sry = [D.upperArmTop * 1.30, D.upperArmTop * 1.18, D.upperArmTop * 1.10];
-    parts.push(
-      skinPart(loftLimb(sleeve, srx, sry, 12, 0, 0), [
-        { bone: clav, falloff: 0.075, bias: 0.4 },
-        { bone: upper, falloff: 0.130 },
-        { bone: 'chest', falloff: 0.075, bias: 0.35 },
+        { bone: upper, falloff: 0.135 },
+        { bone: 'chest', falloff: 0.085, bias: 0.45 },
       ]),
     );
   }
@@ -817,17 +874,44 @@ function buildClothParts(): BufferGeometry[] {
   const parts: BufferGeometry[] = [];
   const g = D.clothGap;
 
-  // Seat / waistband. Sits over the jersey hem.
-  const seatPath = [offset(P.pelvis, 0, 0.070, 0.012), P.pelvis, offset(P.pelvis, 0, -0.062, -0.012)];
+  // Seat / waistband.
+  //
+  // The old version was three rings all at full hip size over a 13 cm run: a
+  // 37 cm wide, 29 cm deep barrel with parallel sides. Side-on that is a
+  // rectangular block hanging off the rider, which is precisely why a stills
+  // review called it "a detached rectangular slab that reads as a pannier".
+  //
+  // Real shorts are narrow at the waist, widest across the seat, and then tuck
+  // UNDER toward the saddle — five rings with a proper taper at both ends, and
+  // 20% less depth so the profile is a hip rather than a box.
+  const seatPath = [
+    offset(P.pelvis, 0, 0.098, 0.016),
+    offset(P.pelvis, 0, 0.052, 0.010),
+    P.pelvis,
+    offset(P.pelvis, 0, -0.046, -0.014),
+    offset(P.pelvis, 0, -0.082, -0.030),
+  ];
   parts.push(
     skinPart(
       loftLimb(
         seatPath,
-        [D.hipHalfWidth * 0.98 + g * 1.6, D.hipHalfWidth + g * 1.8, D.hipHalfWidth * 1.02 + g * 1.8],
-        [D.hipDepth * 0.98 + g * 1.6, D.hipDepth + g * 1.8, D.hipDepth * 1.06 + g * 1.8],
+        [
+          D.waistHalfWidth * 1.02 + g,
+          D.hipHalfWidth * 0.94 + g * 1.4,
+          D.hipHalfWidth + g * 1.6,
+          D.hipHalfWidth * 0.93 + g * 1.4,
+          D.hipHalfWidth * 0.74 + g,
+        ],
+        [
+          D.waistDepth * 1.00 + g,
+          D.hipDepth * 0.90 + g * 1.2,
+          D.hipDepth * 0.94 + g * 1.3,
+          D.hipDepth * 0.84 + g * 1.1,
+          D.hipDepth * 0.62 + g,
+        ],
         18,
         0,
-        0,
+        1,
       ),
       [
         { bone: 'pelvis', falloff: 0.150 },
@@ -839,32 +923,35 @@ function buildClothParts(): BufferGeometry[] {
   );
 
   // Legs of the shorts — baggy, ending just above the knee, with the hem bone
-  // owning the last two rings so it can flap.
+  // owning the last two rings so it can flap. The waistband end now starts
+  // INSIDE the seat form and tapers, so the two read as one garment instead of
+  // a tube socketed into a block; and the widest point has moved down the thigh
+  // to where a short actually flares.
   for (const side of [1, -1]) {
     const hip = side > 0 ? P.hipL : P.hipR;
     const knee = side > 0 ? P.kneeL : P.kneeR;
     const thigh: BoneName = side > 0 ? 'thighL' : 'thighR';
     const hem: BoneName = side > 0 ? 'shortsL' : 'shortsR';
     const path = [
-      mix(hip, knee, -0.06),
-      mix(hip, knee, 0.22),
-      mix(hip, knee, 0.48),
-      mix(hip, knee, 0.66),
-      mix(hip, knee, 0.72),
+      mix(hip, knee, -0.02),
+      mix(hip, knee, 0.24),
+      mix(hip, knee, 0.50),
+      mix(hip, knee, 0.68),
+      mix(hip, knee, 0.755),
     ];
     const rx = [
-      D.thighTop * 1.18 + g,
-      D.thighTop * 1.14 + g,
-      D.thighBottom * 1.42 + g,
-      D.thighBottom * 1.52 + g,
+      D.thighTop * 1.04 + g,
+      D.thighTop * 1.12 + g,
       D.thighBottom * 1.44 + g,
+      D.thighBottom * 1.56 + g,
+      D.thighBottom * 1.38 + g,
     ];
     const ry = [
-      D.thighTop * 1.14 + g,
-      D.thighTop * 1.12 + g,
+      D.thighTop * 1.00 + g,
+      D.thighTop * 1.10 + g,
+      D.thighBottom * 1.42 + g,
+      D.thighBottom * 1.60 + g,
       D.thighBottom * 1.40 + g,
-      D.thighBottom * 1.56 + g,
-      D.thighBottom * 1.46 + g,
     ];
     parts.push(
       skinPart(loftLimb(path, rx, ry, 16, 0, 0), [
@@ -911,6 +998,67 @@ function buildRubberParts(): BufferGeometry[] {
       _q.setFromRotationMatrix(gloveBasis);
       parts.push(rigidPart(boxForm(0.026, 0.020, 0.044, knuckle, _q.clone(), 0.4), hand));
     }
+
+    // Fingers.
+    //
+    // The glove was an ellipsoid with three knuckle blocks on top and nothing
+    // below — a fist, with no indication that anything was wrapped around the
+    // bar. Four tapered digits curling from the knuckle line down the FRONT of
+    // the grip and back underneath give the hand a grip read at close range,
+    // and in silhouette they break the ball into something with structure.
+    //
+    // Each finger is a three-point arc: knuckle → front of the bar → tucked
+    // under it. The curl angle increases from the index finger to the little
+    // finger, which is what a hand on a bar actually does and what stops the
+    // four reading as a comb.
+    for (let k = 0; k < 4; k++) {
+      const along = (k - 1.5) * 0.026;
+      const curl = 1 + k * 0.10;
+      const root = new Vector3()
+        .copy(palm)
+        .addScaledVector(barDir, along)
+        .addScaledVector(gripUp, 0.024)
+        .addScaledVector(gripFwd, 0.030);
+      const mid = new Vector3()
+        .copy(palm)
+        .addScaledVector(barDir, along)
+        .addScaledVector(gripUp, -0.008 * curl)
+        .addScaledVector(gripFwd, 0.052 * curl);
+      const tip = new Vector3()
+        .copy(palm)
+        .addScaledVector(barDir, along * 0.94)
+        .addScaledVector(gripUp, -0.044 * curl)
+        .addScaledVector(gripFwd, 0.028 * curl);
+      const r0 = 0.0115 - k * 0.0008;
+      parts.push(
+        rigidPart(
+          loftLimb(
+            [root, mid, tip],
+            [r0, r0 * 0.94, r0 * 0.80],
+            [r0 * 1.05, r0 * 0.96, r0 * 0.82],
+            6,
+            0,
+            1,
+            barDir,
+          ),
+          hand,
+        ),
+      );
+    }
+    // Thumb, over the top of the bar and inboard.
+    const thumbRoot = new Vector3()
+      .copy(palm)
+      .addScaledVector(barDir, -side * 0.038)
+      .addScaledVector(gripUp, 0.016)
+      .addScaledVector(gripFwd, 0.020);
+    const thumbTip = new Vector3()
+      .copy(palm)
+      .addScaledVector(barDir, -side * 0.052)
+      .addScaledVector(gripUp, -0.020)
+      .addScaledVector(gripFwd, 0.044);
+    parts.push(
+      rigidPart(loftLimb([thumbRoot, thumbTip], [0.014, 0.011], [0.015, 0.011], 6, 0, 1, gripUp), hand),
+    );
 
     const cuffA = new Vector3().copy(wrist).addScaledVector(new Vector3().subVectors(elbow, wrist).normalize(), 0.060);
     const cuffB = new Vector3().copy(wrist).addScaledVector(new Vector3().subVectors(elbow, wrist).normalize(), 0.014);

@@ -64,6 +64,19 @@ const SKIRT_COLS = [0, NC - 1];
 
 /** How far the skirt drops below whichever is lower: ribbon edge or terrain. */
 const SKIRT_DROP = 0.42;
+/**
+ * The cap on how far below the TRAIL EDGE a skirt column may hang.
+ *
+ * Without it the skirt dives to `terrainHeight - SKIRT_DROP` no matter how far
+ * the hillside has fallen away, so wherever the trail runs along an embankment
+ * the sealing curtain becomes a visible fin metres deep and a quarter of a
+ * metre wide — the orange spikes dripping below the lower trail edge into empty
+ * air, and, at a switchback apex where a dozen rows pile up, a starburst of
+ * them. Capped, the curtain stops at a plausible cut-bank depth: it still seals
+ * everywhere the ground is close, and where the ground is not close the edge
+ * reads as the finite bank the trail actually has.
+ */
+const SKIRT_MAX_DROP = 1.05;
 /** Depth of the vertical end cap at a jump lip. Pure silhouette. */
 const CAP_DEPTH = 1.25;
 /** Metres of track per V unit of the trail texture. */
@@ -243,7 +256,14 @@ export class TrackRibbon {
       // rather than a cliff.
       if (isSkirt && side === bermSide && berm > 0) uEff = side * (au + berm * 0.75);
 
-      const lateral = uEff * hw;
+      // Never let a column reach the centre of curvature. Beyond that radius
+      // the swept surface folds through itself and the inside of the corner
+      // renders as inverted, self-intersecting triangles.
+      let lateral = uEff * hw;
+      const kappa = s.curvature[i];
+      if (kappa > 1e-5) lateral = Math.min(lateral, 0.62 / kappa);
+      else if (kappa < -1e-5) lateral = Math.max(lateral, 0.62 / kappa);
+
       let x = _c.x + _sl.x * lateral;
       let y = _c.y + _sl.y * lateral;
       let z = _c.z + _sl.z * lateral;
@@ -262,7 +282,9 @@ export class TrackRibbon {
       if (isSkirt) {
         const tY = terrain.heightAt(x, z);
         const ground = Number.isFinite(tY) ? Math.min(y, tY) : y;
-        y = ground - SKIRT_DROP;
+        // See SKIRT_MAX_DROP. `y` here is still the trail-edge height at this
+        // column, which is what the cap has to be measured from.
+        y = Math.max(ground - SKIRT_DROP, y - SKIRT_MAX_DROP);
       }
 
       pos[c * 3] = x;
@@ -408,10 +430,22 @@ export class TrackRibbon {
  * been widened by a braid around a rock.
  */
 function edgeIrregularity(n: Noise2D, pinch: Noise2D, d: number, phase: number): number {
-  const slow = n.noise(d * 0.055 + phase, 11.3);
-  const fast = n.noise(d * 0.24 + phase, 4.7);
+  // EVERY OCTAVE HERE IS BAND-LIMITED TO THE ROW SPACING.
+  //
+  // The fastest octave used to run at 0.24 cycles per metre — a 4.2 m period —
+  // and `stepAt` places rows 1.7 m apart on open trail. Two and a half samples
+  // per cycle is Nyquist to within a rounding error, so the reconstructed edge
+  // alternated in and out row by row and the lower trail edge came out as a
+  // row of two dozen large triangular teeth: a textbook aliasing sawtooth
+  // dressed up as irregularity.
+  //
+  // The floor is now six rows per cycle on the fastest term (0.098 cycles/m at
+  // 1.7 m spacing), which is enough to reconstruct the wander as a curve. The
+  // amplitude moves to the slower octaves to keep the same total wander.
+  const slow = n.noise(d * 0.032 + phase, 11.3);
+  const mid = n.noise(d * 0.082 + phase, 4.7);
   const scallop = Math.max(0, pinch.noise(d * 0.017 + phase, 21.1) - 0.42) * 0.62;
-  return 1.07 + slow * 0.07 + fast * 0.028 + scallop;
+  return 1.07 + slow * 0.075 + mid * 0.026 + scallop;
 }
 
 function duplicateRow(src: Row, fixedNormal: boolean): Row {
@@ -432,12 +466,31 @@ function dropRow(src: Row, depth: number): Row {
   return r;
 }
 
+/**
+ * How many rows the along-track difference spans, each side.
+ *
+ * A one-row central difference is what made the ribbon render as a run of
+ * separately-valued paving slabs. Rows are at most 1.7 m apart, the terrain
+ * they follow is not smooth at that scale, and so every row ended up with its
+ * own slightly different pitch. Feed a wobble of a couple of degrees into a
+ * HARD cel ramp at a grazing angle and consecutive rows fall on opposite sides
+ * of a band threshold — the quads become visible as flat plates with a seam
+ * between each pair, which is the one thing a swept surface must never do.
+ *
+ * Three rows each side, plus the smoothing below, leaves the ribbon one
+ * continuous banded surface whose band edges run ACROSS the trail, following
+ * the real change of gradient rather than the tessellation.
+ */
+const NORMAL_SPAN = 3;
+/** Passes of a [1,2,1] filter along the track after the difference. */
+const NORMAL_SMOOTH_PASSES = 2;
+
 function computeRunNormals(run: Row[]): void {
   for (let r = 0; r < run.length; r++) {
     const row = run[r];
     if (row.fixedNormal) continue;
-    const prev = run[Math.max(0, r - 1)];
-    const next = run[Math.min(run.length - 1, r + 1)];
+    const prev = run[Math.max(0, r - NORMAL_SPAN)];
+    const next = run[Math.min(run.length - 1, r + NORMAL_SPAN)];
     for (let c = 0; c < NC; c++) {
       const c0 = Math.max(0, c - 1);
       const c1 = Math.min(NC - 1, c + 1);
@@ -458,6 +511,45 @@ function computeRunNormals(run: Row[]): void {
       row.nrm[c * 3] = _n.x;
       row.nrm[c * 3 + 1] = _n.y;
       row.nrm[c * 3 + 2] = _n.z;
+    }
+  }
+  smoothRunNormals(run);
+}
+
+/**
+ * Low-pass the row normals ALONG the track only.
+ *
+ * Along the track, because that is the axis the aliasing is on. Across the
+ * track there is a deliberate crease at every edge column and a berm wall to
+ * hold, and smoothing that direction would round off exactly the breaks the
+ * Sobel pass is supposed to ink.
+ */
+function smoothRunNormals(run: Row[]): void {
+  if (run.length < 3) return;
+  const stride = NC * 3;
+  const tmp = new Float32Array(run.length * stride);
+
+  for (let p = 0; p < NORMAL_SMOOTH_PASSES; p++) {
+    for (let r = 0; r < run.length; r++) {
+      const a = run[Math.max(0, r - 1)].nrm;
+      const b = run[r].nrm;
+      const c = run[Math.min(run.length - 1, r + 1)].nrm;
+      const base = r * stride;
+      for (let k = 0; k < stride; k++) tmp[base + k] = (a[k] + 2 * b[k] + c[k]) * 0.25;
+    }
+    for (let r = 0; r < run.length; r++) {
+      const row = run[r];
+      if (row.fixedNormal) continue;
+      const base = r * stride;
+      for (let c = 0; c < NC; c++) {
+        const x = tmp[base + c * 3];
+        const y = tmp[base + c * 3 + 1];
+        const z = tmp[base + c * 3 + 2];
+        const l = Math.hypot(x, y, z) || 1;
+        row.nrm[c * 3] = x / l;
+        row.nrm[c * 3 + 1] = y / l;
+        row.nrm[c * 3 + 2] = z / l;
+      }
     }
   }
 }
@@ -501,7 +593,17 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       float rock = prof.b;
       float lipM = prof.a;
 
-      vec4 tr = texture(uTrailTex, vUv);
+      // The lookup is DOMAIN-WARPED. uTrailTex is a generated surface with
+      // concentric structure in it, and the ribbon's uv is a rectangle — one
+      // tile per 24 m of course by the full width — so straight sampling lays
+      // visible nested rings down the middle of the trail, which read as wood
+      // grain on a dirt road. Two cheap noise octaves tear the rings into
+      // patches without touching the texture's statistics.
+      vec2 trailWarp = vec2(
+        vnoise(vec2(dAlong * 0.075, across * 2.1)),
+        vnoise(vec2(dAlong * 0.075 + 13.1, across * 2.1))
+      ) - 0.5;
+      vec4 tr = texture(uTrailTex, vUv + trailWarp * vec2(0.26, 0.075));
       float wear = tr.r;
       float gravel = tr.g;
       float moisture = tr.b;
@@ -541,6 +643,22 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       float wob = fbm2(vec2(dAlong * 0.85, 3.1), 3);
       float edgeT = bandStep(abs(across), 0.895 + (wob - 0.5) * 0.055, 0.008);
       celCol = mix(celCol, mix(celCol, uBandColor[0], 0.62), edgeT);
+
+      // ── Aerial plates ────────────────────────────────────────────────────
+      // Same construction, and for exactly the same reason, as the block of
+      // the same name in TerrainMaterial: the trail is a near-flat plane
+      // running from under the wheels to the horizon, so its shading term is
+      // very nearly constant over its whole visible length. Everything above
+      // is quantised, which means that without this the ribbon has NOTHING
+      // varying along it and renders as one continuous wash — the largest
+      // single shape in most frames in this game, painted as a gradient.
+      //
+      // Boundaries at 6, 15, 37 and 90 metres, saturating there so the fog
+      // bands own everything past the range where they have any strength.
+      float aerialT = saturate1(log2(max(vViewDist, 4.0) * 0.25) / 9.0);
+      float plate = min(floor(aerialT * 7.0 + 0.5) / 7.0, 0.43);
+      celCol = mix(celCol, uSkyBounce * 1.28, plate * 0.62);
+      celCol *= mix(0.88, 1.06, plate / 0.43);
     `,
   });
   // CelMaterial sets the NPR_VERTEX_COLOR define but three only declares the

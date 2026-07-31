@@ -274,12 +274,46 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
     vec2 tc = uvT * texels;
     float footprint = max(max(fwidth(tc.x), fwidth(tc.y)), 1.0);
     float zStep = clamp(exp2(ceil(log2(footprint))), 1.0, 32.0);
-    float noiseFreq = 1.6 / zStep;
+    // The jitter noise has to have a WAVELENGTH COMPARABLE TO THE BLOCK, not to
+    // the texel. At 1.6/zStep the wavelength was zStep/1.6 metres — a third of
+    // the block it was supposed to be fraying — so on a steeply oblique face,
+    // where one screen pixel already spans several metres of ground, the block
+    // index resolved differently in adjacent pixels and the far field broke
+    // into orange salt-and-pepper over grey rock. The zone map is 2 m per
+    // texel, so a block is 2*zStep metres across; this puts the wander at
+    // roughly two blocks per cycle, which frays the grid without ever
+    // resolving below a screen pixel.
+    float noiseFreq = 0.24 / zStep;
     vec2 jit = vec2(fbm2(worldXZ * noiseFreq, 2), fbm2(worldXZ * noiseFreq + 47.3, 2)) - 0.5;
     // About a third of a block of wander: enough to break the grid, small
     // enough that the boundary still reads as one drawn line rather than a wave.
     vec2 jitTexels = jit * (uZoneJitter * texels) * max(1.0, zStep * 0.30);
-    vec2 zoneTc = (floor((tc + jitTexels) / zStep) + 0.5) * zStep;
+
+    // ── THE LATTICE IS ROTATED, AND THAT IS NOT A REFINEMENT ────────────────
+    // A snapped boundary is a staircase; there is no way round that, because the
+    // block IS a screen pixel by construction and anything that frays it at the
+    // block scale aliases at the pixel scale. What CAN be fixed is the
+    // staircase's ORIENTATION. Axis-aligned, it produces long right-angled runs
+    // that the material-id Sobel then draws as a hard rectilinear zigzag across
+    // the snowfields — unmistakably a grid, and the single most computer-looking
+    // mark left on the mountain.
+    //
+    // Rotating the lattice by a very low-frequency angle field breaks that: the
+    // boundary is still made of straight snapped segments, but they run at an
+    // angle that drifts across the map, so what the eye reads is cut paper
+    // rather than a raster. The angle field's wavelength is twenty blocks, so it
+    // is constant to within a few percent across any one block and the lattice
+    // never tears; and because both the main pass and the prepass call this one
+    // function, the ink and the paint stay on the same boundary.
+    float ang = (fbm2(worldXZ * (0.012 / zStep) + 91.7, 2) - 0.5) * 2.6;
+    float ca = cos(ang);
+    float sa = sin(ang);
+    mat2 rot = mat2(ca, -sa, sa, ca);
+    vec2 lat = rot * (tc + jitTexels);
+    vec2 latSnap = (floor(lat / zStep) + 0.5) * zStep;
+    // Inverse of a rotation is its transpose; written out so no matrix inverse
+    // is generated for a 2x2 orthonormal frame.
+    vec2 zoneTc = mat2(ca, sa, -sa, ca) * latSnap;
     return clamp(int(texture(uZoneTex, zoneTc / texels).r * 255.0 + 0.5), 0, kindCount - 1);
   }
 `;
@@ -354,6 +388,41 @@ const TERRAIN_FRAGMENT = /* glsl */ `
   }
 
   /**
+   * A stroke centred on one band boundary, about one and a half pixels wide.
+   *
+   * A terminator on terrain is invisible to every line system in the project.
+   * The Sobel pass reads normal, depth and material id, and all three are
+   * CONTINUOUS across a band boundary — the surface does not bend there, it
+   * does not step there, and it is the same material on both sides. So the
+   * largest shapes in the picture changed value without one stroke marking the
+   * change, which is the single thing a painted background never does. The only
+   * place in the pipeline that knows where the boundary is, is here.
+   *
+   * THE WIDTH IS PURELY THE SCREEN-SPACE DERIVATIVE, with no floor under it.
+   * A floor expressed in shading units is a line of unbounded SCREEN width: on
+   * near-flat ground fwidth(lit) goes to nothing and the shading term drifts
+   * across a threshold over tens of metres, so a fixed 0.0016 of value became a
+   * stroke metres wide and the valley floor filled with fat nested contour
+   * arcs. Keyed to the derivative alone the stroke is one and a half pixels
+   * wherever it exists, and on ground genuinely flat enough to have no
+   * terminator at all it correctly draws nothing.
+   */
+  float terminatorInk(float x, float t) {
+    float w = max(fwidth(x) * 1.5, 1e-7);
+    return 1.0 - smoothstep(0.0, w, abs(x - t));
+  }
+
+  /** All three boundaries of zone z's ramp, drawn. */
+  float zoneTerminatorInk(int z, float lit) {
+    vec4 th = uZoneThresh[z];
+    float has4 = step(3.5, uZoneMiscA[z].x);
+    float ink = terminatorInk(lit, th.x);
+    ink = max(ink, terminatorInk(lit, th.y));
+    ink = max(ink, terminatorInk(lit, th.z) * has4);
+    return ink;
+  }
+
+  /**
    * Screen-space hatch, parameterised per zone.
    *
    * A copy of applyHatch with the strength and scale passed in rather than read
@@ -367,15 +436,27 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     float amount = strength * uHatchGlobal;
     float deep = 1.0 - saturate1(bandIdx);
     float mid  = saturate1(1.0 - abs(bandIdx - 1.0));
-    float cover = deep + mid * 0.42;
+    // The mid tier used to be weighted 0.42, which — multiplied by a palette
+    // hatch strength of 0.18 and then again by saturate1(cover) — put the
+    // maximum darkening on packed dirt at four percent. Four percent is not a
+    // hatch, it is a rounding error, and the shadow band on the largest plane
+    // in the frame was left as flat paint.
+    float cover = deep + mid * 0.58;
     vec2 huv = fragCoord / (34.0 * scale);
     const float a = 0.5934;                       // ~34 degrees off the pixel grid
     mat2 rot = mat2(cos(a), -sin(a), sin(a), cos(a));
     vec3 atlas = texture(uHatchTex, rot * huv).rgb;
-    float tier = mix(atlas.g, atlas.r, deep);
+    // TERRAIN SKIPS THE COARSE TIER. The atlas packs coarse/medium/fine in
+    // R/G/B and applyHatch reaches for R in the deepest band, which is right on
+    // a rider: his shadow side is a couple of hundred pixels across and wants a
+    // stroke you can see the direction of. The same band on terrain is half the
+    // frame, and a screen whose cell is visible at that size stops reading as
+    // tone and starts reading as a texture stuck to the mountain. One tier
+    // finer throughout — the biggest shape on the page takes the finest screen.
+    float tier = mix(atlas.b, atlas.g, deep);
     float breakup = fbm2(fragCoord * 0.004, 2);
     float h = tier * mix(0.72, 1.0, breakup);
-    return mix(col, col * 0.74, h * cover * amount * saturate1(cover));
+    return mix(col, col * 0.70, h * cover * amount * saturate1(cover));
   }
 
   vec3 terrainShade(CelInput s) {
@@ -426,11 +507,18 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     float isSnow  = float(zone == ${SurfaceKind.Snow});
     float isWater = float(zone == ${SurfaceKind.Water});
 
-    // Water is the one terrain surface with motion in it. Two crossed waves,
-    // amplitude small enough that the banded specular breaks into moving
-    // shapes rather than sliding as a sheet.
+    // Water is the one terrain surface with motion in it.
+    //
+    // The amplitude used to be 0.055 and scaled by farFade, and both were
+    // wrong. A ripple that only tilts the normal by three degrees cannot move a
+    // highlight across a surface, and killing it at range meant the one shot in
+    // the game that is mostly water had none of it at all. Two crossed waves
+    // plus a slow chop, at an amplitude that genuinely breaks the mirror, and
+    // NO distance fade — the stream bed is looked at from thirty metres and
+    // from three hundred.
     float ripple = sin(w.x * 2.4 + uTime * 1.6) + sin(w.y * 3.1 - uTime * 2.2);
-    N = normalize(N + vec3(ripple * 0.055, 0.0, ripple * 0.041) * (isWater * farFade));
+    float chop   = sin(w.x * 0.62 - w.y * 0.51 + uTime * 0.9);
+    N = normalize(N + vec3(ripple * 0.17 + chop * 0.09, 0.0, ripple * 0.13 - chop * 0.07) * isWater);
 
     // ── Lighting. Identical in structure to celShade; only the ramp differs ─
     vec3 V = s.viewDir;
@@ -463,6 +551,44 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     col = mix(col, col * bounce * 1.55, uAmbient * (1.0 - 0.55 * saturate1(bIdx / 3.0)));
     col *= s.albedoTint;
 
+    // ── The drawn terminator ───────────────────────────────────────────────
+    // See zoneTerminatorInk. This is the stroke that turns a band boundary
+    // into a drawn edge instead of a raw colour step, and it is the only line
+    // system in the project that can see one.
+    col = mix(col, col * 0.58, zoneTerminatorInk(zone, lit) * 0.80);
+
+    // ── Aerial plates ──────────────────────────────────────────────────────
+    // The defect this exists to kill, stated exactly: on flat ground lit is
+    // constant BY CONSTRUCTION. Once every distance fade in this shader is
+    // quantised there is nothing left varying across a flat surface at all, so
+    // the largest plane in the frame renders as one enormous flat wash with a
+    // smooth fog ramp laid over the top — which is precisely the "smooth
+    // continuous ramp, nothing else" the review kept finding.
+    //
+    // A background painter does not paint receding ground as one plane. They
+    // paint it as a STACK of flat plates, each a step cooler and hazier than
+    // the one in front, with a boundary between them you can point at. On
+    // receding ground an iso-distance contour runs roughly horizontally across
+    // the frame, which is exactly where those boundaries belong.
+    //
+    // Logarithmic, so the plates are roughly even in SCREEN space rather than
+    // in world space: eight plateaus from 4 m to 2 km, one step every 1.29
+    // octaves, which lands two hard steps inside the first forty metres.
+    // The plate boundaries land at 6, 15, 37 and 90 metres, and the stack
+    // saturates there.
+    float aerialT = saturate1(log2(max(s.viewDist, 4.0) * 0.25) / 9.0);
+    float aerial  = floor(aerialT * 7.0 + 0.5) / 7.0;
+    // SATURATING, and that matters as much as the quantisation. The plates are
+    // carrying the near and middle field, which is where the shading term is
+    // constant and the fog is still sitting on plateau zero with a strength of
+    // 0.16. Past a couple of hundred metres the fog bands take the job over
+    // completely, and stacking more haze on top of them only greys the far
+    // distance into the wash the fog quantisation exists to prevent. Fog band 1
+    // begins at 223 m, so the two systems hand over cleanly with no overlap.
+    float plate = min(aerial, 0.43);
+    col = mix(col, uSkyBounce * 1.28, plate * 0.62);
+    col *= mix(0.88, 1.06, plate / 0.43);
+
     // ── Surface detail ─────────────────────────────────────────────────────
     // Two vertical projections plus a horizontal one, blended by how the face
     // is oriented. A pure top-down projection smears into vertical streaks on
@@ -470,13 +596,29 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // shader; a full three-axis triplanar costs a third more fetches than this
     // for a difference nobody can see on a heightfield, which by construction
     // never has a face steeper than vertical.
-    float wallness = 1.0 - smoothstep(0.42, 0.82, abs(N.y));
-    float kx = abs(N.x) / max(abs(N.x) + abs(N.z), 1e-4);
+    // Both blend weights are QUANTISED to three steps. A continuous blend
+    // between two orthogonal projections is what produces the vertical
+    // smearing and the faint concentric moire a cliff face shows in these
+    // frames: the two samples slide past each other pixel by pixel. Three
+    // steps keeps the projection change from reading as a seam while stopping
+    // it from sweeping.
+    float wallness = floor((1.0 - smoothstep(0.42, 0.82, abs(N.y))) * 3.0 + 0.5) / 3.0;
+    float kx = floor((abs(N.x) / max(abs(N.x) + abs(N.z), 1e-4)) * 3.0 + 0.5) / 3.0;
     float ds = uDetailScale;
 
     float rockZ = texture(uDetailRock, vec2(wp.z, wp.y) * ds).r;
     float rockX = texture(uDetailRock, vec2(wp.x, wp.y) * ds).r;
-    float rockY = texture(uDetailRock, w * ds * 0.72).r;
+    // THE TOP-DOWN PROJECTION USES A DIFFERENT TEXTURE, and that is the whole
+    // point of writing it out rather than reusing rockZ. uDetailRock is the
+    // bark generator and bark is CONCENTRIC. On a vertical face those rings
+    // read correctly as bedding, which is why the two side projections keep
+    // them; projected straight down onto open ground they lay literal tree
+    // rings across the valley floor — the nested arcs visible on every flat
+    // foreground plane in these frames, which no amount of domain warping
+    // removes because a warp bends a ring, it does not open it. The paper
+    // grain has no preferred centre and no preferred direction, which is
+    // exactly what ground seen from above wants.
+    float rockY = texture(uDetailGrain, w * ds * 0.85).r;
     float bedding = mix(rockY, mix(rockZ, rockX, kx), wallness);
 
     float gravel = texture(uDetailGravel, w * ds * 2.4).g;
@@ -487,10 +629,32 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // flat paper shapes, and any residual texture in them fights the fog bands.
     float detail = floor((1.0 - smoothstep(80.0, 430.0, s.viewDist)) * 4.0 + 0.5) / 4.0;
 
+    // Rock bedding is a LARGE-scale feature and gets its own, far longer fade.
+    // A canyon wall is normally seen from three to eight hundred metres, so on
+    // the short fade above the one surface feature that could have broken the
+    // wall up had already gone to zero by the time the wall was in frame — and
+    // what was left, on a face where N.y is near zero and lit is therefore
+    // constant across the whole plane, was lit concrete.
+    float detailBed = floor((1.0 - smoothstep(420.0, 1500.0, s.viewDist)) * 3.0 + 0.5) / 3.0;
+
     // Every one of these is a HARD step. Nothing in this block is allowed to
     // introduce a gradient across the largest surface in the frame.
     float bed = bandStep(bedding, 0.46, 0.025);
-    col = mix(col, col * 0.87, bed * (isRock * 0.60 + isScree * 0.20 + isWater * 0.35) * detail);
+    col = mix(col, col * 0.87, bed * (isRock * 0.70 + isScree * 0.30 + isWater * 0.35) * detailBed);
+
+    // ── Strata ─────────────────────────────────────────────────────────────
+    // Two hard bedding planes, sampled almost purely on world height so they
+    // run level across a face the way real strata do, with just enough plan
+    // drift that two neighbouring walls do not line up. This is the value break
+    // that gives a vertical face plateaus to read; without it a wall has no
+    // shading variation available to it at all, because every other term in
+    // this shader is either a function of N (constant on a plane) or of view
+    // distance (nearly constant across a face seen side-on).
+    float strata = fbm2(vec2((wp.x + wp.z) * 0.010, wp.y * 0.085), 2);
+    float wallMask = wallness * detailBed
+                   * (isRock * 1.0 + isScree * 0.8 + isSnow * 0.35 + isDirt * 0.55 + isGrass * 0.3);
+    col = mix(col, col * 0.845, bandStep(strata, 0.46, 0.02) * wallMask * 0.85);
+    col = mix(col, col * 1.11,  bandStep(strata, 0.61, 0.02) * wallMask * 0.60);
 
     float pebble = 1.0 - bandStep(gravel, 0.30, 0.02);
     col = mix(col, col * vec3(1.07, 1.05, 1.0), pebble * (isScree * 0.34 + isDirt * 0.16) * detail);
@@ -513,12 +677,39 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     col = terrainHatch(col, bIdx, s.fragCoord, uZoneMiscB[zone].x, uZoneMiscB[zone].y);
 
     float spec = bandedSpecular(N, V, L, uZoneMiscA[zone].w);
-    col += uSpecColor * spec * uZoneMiscA[zone].z * shadow * saturate1(ndlRaw * 2.0)
-         * mix(0.12, 1.0, farFade);
+    col += uSpecColor * spec * uZoneMiscA[zone].z * (1.0 - isWater) * shadow
+         * saturate1(ndlRaw * 2.0) * mix(0.12, 1.0, farFade);
 
     float rim = celRim(N, V, uZoneMiscB[zone].w);
     float sunSide = saturate1(dot(normalize(N + L * 0.35), V) * 0.5 + 0.75);
-    col += uRimColor * rim * uZoneMiscB[zone].z * mix(0.35, 1.0, sunSide);
+    col += uRimColor * rim * uZoneMiscB[zone].z * (1.0 - isWater) * mix(0.35, 1.0, sunSide);
+
+    // ── Water ──────────────────────────────────────────────────────────────
+    // RAMPS.water asks for specPower 160 and rimPower 4, and on this course
+    // NEITHER CAN EVER FIRE. The sun sits at 21.5 degrees and the camera looks
+    // down a valley at maybe 25, so the half-vector on a level water surface
+    // stands about 23 degrees off the horizontal and N.H tops out near 0.4 —
+    // pow(0.4, 160) is zero to every float in the machine. The rim is the same
+    // story from the other side: N.V on that surface is about 0.42, so the
+    // Fresnel term reaches 0.11 against a 0.42 threshold. The stream bed
+    // therefore rendered as a flat painted puddle no matter what the palette
+    // asked for, and no amount of turning the strengths up would have changed
+    // it. Both terms are rebuilt here at exponents the geometry can actually
+    // reach, which is why they are not simply read from the ramp block.
+    //
+    // Everything stays HARD: two glint tiers and one rim step, so the result is
+    // a drawn glitter track broken up by the ripple rather than a wet sheen.
+    vec3  Hw   = normalize(L + V);
+    float glint = pow(saturate1(dot(N, Hw)), 4.0);
+    float fleck = bandStep(glint, 0.052, 0.004) * 0.55
+                + bandStep(glint, 0.108, 0.003) * 0.45;
+    float wrim = bandStep(pow(1.0 - saturate1(dot(N, V)), 1.6), 0.40, 0.03);
+    // Flow contours: the current, drawn as banded bright lines running with the
+    // ripple. Water in a cel background is drawn, not simulated.
+    float flow = bandStep(sin(w.x * 1.35 + w.y * 0.9 + uTime * 0.85 + ripple * 0.7), 0.72, 0.03);
+    col += isWater * (uSpecColor * fleck * 1.05 * shadow
+                    + uRimColor * wrim * 0.34
+                    + uSpecColor * flow * 0.16);
 
     return col;
   }
@@ -544,6 +735,25 @@ export const ZONE_RAMPS: Record<SurfaceKind, RampPreset> = {
   [SurfaceKind.Trail]: RAMPS.trail,
 };
 
+/**
+ * Terrain-only gain on the palette's hatch strengths.
+ *
+ * The ramp presets are shared with the rider, the bike and the vegetation,
+ * where a hatch strength of 0.18 is a whisper laid over a shape the eye is
+ * already reading from its silhouette. Terrain has no silhouette to lean on: it
+ * is one plane covering half the frame, and at 0.18 — multiplied again by the
+ * mid-tier cover weight — its shadow band came out four percent darker than its
+ * lit band and read as flat paint. The hatch is the ONLY texture a shadowed
+ * plane gets, so terrain takes the same pen pressed harder — but only about
+ * two-thirds again. Past roughly 0.45 the screen cell becomes legible at the
+ * size terrain occupies and the hatch reads as a texture stuck to the mountain
+ * rather than as tone laid over the picture.
+ *
+ * This lives here rather than in Palette because it is a statement about how
+ * big the surface is, not about what the surface is made of.
+ */
+const TERRAIN_HATCH_GAIN = 1.7;
+
 function packZoneUniforms(): {
   colors: Color[];
   thresholds: Vector4[];
@@ -568,7 +778,9 @@ function packZoneUniforms(): {
     thresholds.push(new Vector4(t[0], t[1], t[2], 0));
 
     miscA.push(new Vector4(p.colors.length, p.edgeSoftness, p.specStrength, p.specPower));
-    miscB.push(new Vector4(p.hatchStrength, p.hatchScale, p.rimStrength, p.rimPower));
+    miscB.push(
+      new Vector4(p.hatchStrength * TERRAIN_HATCH_GAIN, p.hatchScale, p.rimStrength, p.rimPower),
+    );
   }
 
   return { colors, thresholds, miscA, miscB };

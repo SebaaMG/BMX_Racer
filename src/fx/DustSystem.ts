@@ -60,7 +60,7 @@ import { Rng } from '../core/RNG';
 import { clamp, clamp01 } from '../core/MathX';
 import { dustPuffSet } from '../npr/GeneratedTextures';
 import { globalUniformBlock } from '../npr/NprGlobals';
-import { INK, RAMPS } from '../npr/Palette';
+import { INK, RAMPS, SUN_RIM_COLOR } from '../npr/Palette';
 import { GLSL_COMMON, GLSL_FOG, GLSL_FRAG_OUT, GLSL_GLOBAL_UNIFORMS, GLSL_SHADOW } from '../npr/ShaderChunks';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -337,6 +337,7 @@ const DUST_VERT = /* glsl */ `
   out float vAlpha;
   out vec3  vWorldPos;
   out float vViewDist;
+  out float vNear;
 
   void main() {
     // Defaults so a culled particle never leaves a varying undefined.
@@ -346,6 +347,7 @@ const DUST_VERT = /* glsl */ `
     vAlpha = 0.0;
     vWorldPos = aOrigin;
     vViewDist = 1.0;
+    vNear = 0.0;
 
     float t = uFxTime - aParams.x;
     float age = t * aParams.y;
@@ -376,19 +378,35 @@ const DUST_VERT = /* glsl */ `
     float drag = mix(2.9, 1.15, isPlume);
     vec3 p = aOrigin + aVel * ((1.0 - exp(-drag * t)) / drag);
     // Dust lifts on its own turbulence and then gives up.
-    float rise = mix(0.45, 1.25, aParams.z) * mix(0.7, 1.5, isPlume);
+    //
+    // The plume multiplier used to be 1.5, which over a 2.4s life carried a
+    // puff nearly four metres straight up. That is a bonfire, not a wheel: a
+    // dust trail hangs at roughly rider height and is left BEHIND, and the
+    // vertical travel is what made the scree plume read as a smoke column
+    // standing over a stationary fire rather than as something a bike did.
+    // Ground-hugging is the whole silhouette of the effect.
+    float rise = mix(0.28, 0.72, aParams.z) * mix(0.85, 1.05, isPlume);
     p.y += rise * t * (1.0 - 0.55 * age);
 
     float sz = aShape.x * (1.0 + aShape.y * q) * uSizeScale;
     float ang = aShape.w + aShape.z * q;
 
     // ── Opacity ──────────────────────────────────────────────────────────────
-    // Squared so the puff sits at full opacity for most of its life and then
-    // leaves quickly, then ceil()-quantised to four hard levels: 1, .75, .5, .25
-    // and cut. Never a smooth ramp.
+    // Three hard levels and a cut: 1, 2/3, 1/3, gone. An animator holds the
+    // drawing opaque and then takes it out in two beats; they do not fade it.
+    //
+    // This used to square the fade before quantising, which sounds like the
+    // same idea and is not: squaring drove the *middle* of the puff's life to
+    // 0.04-0.16, and ceil()x4 floored all of that at 0.25. A puff therefore
+    // spent most of its visible existence at a quarter opacity, in a hue taken
+    // from the very surface it was kicked off — dust the same colour as the
+    // ground, at 25%, over a fogged mid-value scree field, is below the
+    // threshold at which anything is a picture element. Measured against a
+    // dust-free frame the peak channel delta was single digits out of 255.
+    // Linear fade, quantised to thirds, holds the puff opaque through the
+    // first half of its life, which is when it is meant to be read.
     float fade = 1.0 - q;
-    fade *= fade;
-    vAlpha = ceil(clamp(fade, 0.0, 1.0) * 4.0) * 0.25;
+    vAlpha = ceil(clamp(fade, 0.0, 1.0) * 3.0) / 3.0;
 
     // ── Billboard ────────────────────────────────────────────────────────────
     vec3 R = camRightWS();
@@ -409,6 +427,28 @@ const DUST_VERT = /* glsl */ `
     vTint = aTint;
     vWorldPos = wpos;
     vViewDist = length(wpos - uCameraPos);
+
+    // ── Near-camera cut ──────────────────────────────────────────────────────
+    // A puff two metres across that the camera has walked inside of covers the
+    // entire frame, and a chase camera rides through its own subject's dust
+    // constantly — cornering, landing, and every time the rider slows. Without
+    // this the stream bed rendered as a single screen-filling grey ring with
+    // the rider somewhere inside it, which is not a near-plane artefact but the
+    // system working exactly as written at a distance it was never sized for.
+    //
+    // Quantised to thirds like every other opacity here, so a puff the camera
+    // closes on steps out over three frames instead of dissolving. A smooth
+    // proximity fade would be the one continuous alpha ramp in the picture.
+    // It is carried separately from vAlpha rather than folded into it because
+    // the ink contour deliberately refuses to follow vAlpha down (see the
+    // fragment stage) — folding it in would leave a puff the camera is inside
+    // of drawn as a hard black ring across the whole frame, which is worse
+    // than the grey disc it replaced.
+    vNear = ceil(clamp((vViewDist - 0.85) / 1.75, 0.0, 1.0) * 3.0) / 3.0;
+    if (vNear <= 0.0) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
 
     gl_Position = projectionMatrix * viewMatrix * vec4(wpos, 1.0);
   }
@@ -438,6 +478,7 @@ const DUST_FRAG = /* glsl */ `
   in float vAlpha;
   in vec3  vWorldPos;
   in float vViewDist;
+  in float vNear;
 
   void main() {
     vec4 tex = texture(uAtlas, vUv);
@@ -447,10 +488,22 @@ const DUST_FRAG = /* glsl */ `
 
     float texLum = luma(tex.rgb);
     // The generated puff carries its own ink ring (near-black) and a single
-    // hard shadow lobe (mid grey). We keep the ring as ink and use the lobe as
-    // a BIAS on the lighting term rather than as a second multiply, so the
-    // drawn shading and the world lighting agree instead of stacking.
-    float isInk = 1.0 - step(0.035, texLum);
+    // hard shadow lobe (#6a6a6a, linear ~0.152). We keep the ring as ink and
+    // use the lobe as a BIAS on the lighting term rather than as a second
+    // multiply, so the drawn shading and the world lighting agree instead of
+    // stacking.
+    //
+    // The ink test is a BAND STEP at the midpoint between the ring and the
+    // lobe, not a step() near zero. That distinction is the difference between
+    // an outline that survives and one that evaporates: the atlas is mipped
+    // (it has to be — an unmipped binary alpha crawls horribly at distance),
+    // and a ~3px ink ring is averaged toward the white fill by mip 1. A
+    // step() at 0.035 only catches pixels that are still nearly pure black,
+    // so beyond a couple of metres the contour simply stopped existing and
+    // the puffs went from drawn shapes to flat blobs. fxBandStep places a
+    // crisp, fwidth-antialiased edge on the blurred ramp's half-height
+    // contour instead, which is stable at every mip level.
+    float isInk = 1.0 - fxBandStep(texLum, 0.048, 0.008);
     float drawnShade = (1.0 - isInk) * (1.0 - smoothstep(0.10, 0.60, texLum));
 
     // Sphere impostor: reconstruct a bulging normal from the quad footprint so
@@ -482,7 +535,16 @@ const DUST_FRAG = /* glsl */ `
     vec3 viewDir = normalize(vWorldPos - uCameraPos);
     col = applyQuantizedFog(col, vViewDist, viewDir, gl_FragCoord.xy);
 
-    fragColor = vec4(col, vAlpha * uOpacity);
+    // THE LINE OUTLIVES THE FILL. On the last two steps of a puff's life the
+    // fill drops to 2/3 then 1/3, and if the contour drops with it the puff
+    // stops being a drawing and becomes precisely the soft translucent smudge
+    // this entire system exists to avoid — the failure mode arrives at the end
+    // of every single puff's life rather than being designed out. An animator
+    // inking a dispersing cloud keeps the line at full strength and lets the
+    // interior go; the shape stays legible right up to the frame it is cut.
+    float alpha = mix(vAlpha, max(vAlpha, 0.78), isInk) * vNear * uOpacity;
+
+    fragColor = vec4(col, alpha);
   }
 `;
 
@@ -539,16 +601,33 @@ export class DustSystem {
     this.aShape = this.pool.array('aShape');
     this.aTint = this.pool.array('aTint');
 
-    // Every slot starts dead (birth far in the past, life 1) so nothing renders
-    // before the first emission.
-    for (let i = 0; i < capacity; i++) this.aParams[i * 4 + 1] = 1;
+    // Every slot starts dead. The birth stamp must be far in the PAST in
+    // absolute terms, not merely zero: the shader's liveness test is
+    // `age = (uFxTime - birth) / life`, so birth 0 with life 1 leaves every
+    // untouched slot reporting age < 1 — i.e. ALIVE — for the entire first
+    // second of the FX clock. Those phantom instances sit at the world origin
+    // with scale 0, so they cost a degenerate quad each rather than showing,
+    // but they made instanceCount and every liveness measurement useless for
+    // exactly the window in which the system is most often inspected.
+    for (let i = 0; i < capacity; i++) {
+      this.aParams[i * 4] = -1e9;
+      this.aParams[i * 4 + 1] = 1;
+    }
 
     // Bands come from the scree ramp: the most neutral, least chromatic of the
     // terrain ramps, so a per-surface hue tint can push it anywhere without
     // fighting a colour that was already committed.
-    const b0 = RAMPS.scree.colors[0];
-    const b1 = RAMPS.scree.colors[2];
-    const b2 = RAMPS.scree.colors[3];
+    //
+    // They are taken one band UP the ramp from the terrain's own, and the
+    // brightest is lifted toward the sun rim. Airborne dust is not the ground
+    // — it is a thin, loosely-packed cloud lit from every direction at once,
+    // and it is lighter in value than the surface it came off. Starting the
+    // shadow band at the terrain's darkest violet made a puff in shadow
+    // literally the same colour as the rock behind it, which is invisible no
+    // matter what the alpha is.
+    const b0 = RAMPS.scree.colors[1];
+    const b1 = RAMPS.scree.colors[3];
+    const b2 = RAMPS.scree.colors[3].clone().lerp(SUN_RIM_COLOR, 0.45);
 
     this.material = new ShaderMaterial({
       glslVersion: GLSL3,
@@ -609,6 +688,20 @@ export class DustSystem {
   /** Current FX clock, for callers that stamp their own births. */
   get time(): number {
     return this.fxTime;
+  }
+
+  /**
+   * Exact number of live puffs. O(capacity) — this is a DIAGNOSTIC, for the
+   * perf overlay and the capture probes, and must not be called per frame from
+   * an emission path. `emittedThisFrame` is the cheap signal.
+   */
+  countAlive(): number {
+    let n = 0;
+    for (let i = 0; i < this.pool.capacity; i++) {
+      const age = (this.fxTime - this.aParams[i * 4]) * this.aParams[i * 4 + 1];
+      if (age >= 0 && age < 1) n++;
+    }
+    return n;
   }
 
   private tooFar(x: number, y: number, z: number): boolean {
@@ -781,12 +874,20 @@ export class DustSystem {
     let count = Math.floor(expected);
     if (this.rng.next() < expected - count) count++;
     if (count <= 0) return;
-    if (count > 8) count = 8;
+    if (count > 12) count = 12;
 
-    // Loose ground (scree, snow, water) throws a genuine plume: bigger, slower
-    // to disperse, and persistent enough to hang behind the rider as a trail
+    // Loose DRY ground (scree, snow) throws a genuine plume: bigger, slower to
+    // disperse, and persistent enough to hang behind the rider as a trail
     // rather than popping and vanishing.
-    const plume = dustScale >= 1.15;
+    //
+    // Water is explicitly not that, despite having the highest dustAmount in
+    // the table. 1.8 is a spray multiplier — it means water throws the MOST
+    // material, not that it hangs in the air, and the classification here was
+    // reading the magnitude and ignoring the substance. A wheel through the
+    // stream bed was producing a two-metre, two-second grey plume: a dust
+    // cloud rising off a river. Water gets short, small, fast puffs and the
+    // real read comes from DebrisSystem.splash, which throws actual droplets.
+    const plume = dustScale >= 1.15 && surface.kind !== SurfaceKind.Water;
     const kind = plume ? DUST_PLUME : DUST_SKID;
     const tint = dustTintFor(surface.kind);
 
@@ -809,8 +910,13 @@ export class DustSystem {
         .addScaledVector(_b, Math.sin(ja) * jr)
         .addScaledVector(_n, this.rng.range(0.03, 0.18));
 
-      const life = plume ? this.rng.range(1.6, 2.4) : this.rng.range(0.7, 1.15);
-      const scale = (plume ? this.rng.range(0.45, 0.85) : this.rng.range(0.20, 0.36)) * (0.85 + dustScale * 0.3);
+      // Plumes were 0.45-0.85 base, which after the surface factor and the x2
+      // atlas compensation put a single puff at over two metres across. Three
+      // of those is a fog bank with no internal structure; the plume has to be
+      // built out of MANY smaller drawings whose overlapping contours are what
+      // give it a readable silhouette, exactly as it is drawn on paper.
+      const life = plume ? this.rng.range(1.5, 2.2) : this.rng.range(0.7, 1.15);
+      const scale = (plume ? this.rng.range(0.26, 0.50) : this.rng.range(0.18, 0.32)) * (0.85 + dustScale * 0.3);
       const growth = plume ? this.rng.range(1.7, 2.5) : this.rng.range(1.1, 1.7);
       const spin = this.rng.signed() * (plume ? 0.5 : 1.1);
 

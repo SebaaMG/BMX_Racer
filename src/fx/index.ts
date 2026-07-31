@@ -61,6 +61,10 @@ export type { CameraDirectorOptions } from './CameraDirector';
 
 const _fallbackPos = new Vector3();
 const _fallbackNrm = new Vector3(0, 1, 0);
+/** Scratch for the one-off smear-rig scene scan. */
+const _scanPos = new Vector3();
+/** Bike wheels spin about their pivot's local X. */
+const _WHEEL_AXIS = new Vector3(1, 0, 0);
 
 /**
  * Used when the physics has not filled in a contact yet (first frame, or a
@@ -120,17 +124,33 @@ export class Effects implements IEffects {
 
   private impactSteppedThisFrame = false;
 
+  // ── Self-wiring smear ──────────────────────────────────────────────────────
+  // The scene is kept solely so the facade can find the subject's own meshes.
+  // See resolveSmearRig().
+  private scene: Scene;
+  private smearWired = false;
+  private smearAttempts = 0;
+  private frontSpin: SpinSmear | null = null;
+  private rearSpin: SpinSmear | null = null;
+  private smearTargets: Object3D[] = [];
+
   constructor(deps: EffectsDeps) {
     this.rng = new Rng(deps.seed ?? 'fx');
     this.autoEmit = deps.autoEmit ?? true;
     this.terrain = deps.terrain ?? null;
+    this.scene = deps.scene;
 
     this.object = new Object3D();
     this.object.name = 'fx';
     this.object.matrixAutoUpdate = false;
 
+    // 1600, not 1100. A scree plume plus a landing spray plus a skid can be
+    // ~700 live puffs, and the ring recycles its OLDEST live instance when it
+    // wraps — so a capacity that merely "usually" fits shows up as puffs
+    // vanishing mid-life at exactly the busiest moment. Headroom here is one
+    // 32 kB float buffer and it removes a whole class of popping.
     this.dust = new DustSystem({
-      capacity: deps.dustCapacity ?? 1100,
+      capacity: deps.dustCapacity ?? 1600,
       rng: this.rng.fork('dust'),
     });
     this.debris = new DebrisSystem({
@@ -160,9 +180,94 @@ export class Effects implements IEffects {
   /** The BikeState everything automatic is derived from. Null outside a race. */
   setSubject(state: BikeState | null): void {
     this.subject = state;
+    // A new subject invalidates whatever rig we resolved for the old one.
+    this.smearWired = false;
+    this.smearAttempts = 0;
     if (state) {
       this.prevAirborne = state.mode === 'airborne';
       this.prevCrashing = state.mode === 'crashing';
+    }
+  }
+
+  /**
+   * Find the subject's own meshes and wire the smear systems to them.
+   *
+   * This exists because there is a genuine hole in the contracts: BikeState is
+   * pure data — position, velocity, wheel states — and carries no Object3D at
+   * all, while `setSmearTargets` and `addSpinSmear` need scene nodes. Nothing
+   * in the codebase bridged that gap, so SpeedFX's two geometry-smear systems
+   * were fully implemented, fully tested by their own shaders, and called by
+   * absolutely nobody. Wheels were razor-crisp at 78 km/h with a 26" wheel
+   * turning 40 degrees per rendered frame.
+   *
+   * Rather than require the Game to reach into two subsystems and hand us
+   * their internals, we resolve it here from the scene the facade was already
+   * given. Bikes name their wheel pivots `frontWheel` / `rearWheel` and their
+   * roots `bike:<id>`; rigs name their roots `rider:<id>`. We take the bike
+   * root NEAREST the subject's own position, which needs no id convention at
+   * all and is correct even with five racers on the grid.
+   *
+   * Retried for a few frames and then given up on: the rig is built during
+   * load and a missed frame is invisible, but an unbounded retry would walk
+   * the whole scene graph every frame forever if a name ever changed.
+   */
+  private resolveSmearRig(state: BikeState): void {
+    this.smearWired = true;
+    this.smearAttempts++;
+
+    let best: Object3D | null = null;
+    let bestD = Infinity;
+    this.scene.traverse((o) => {
+      if (!o.name.startsWith('bike:') || o.name.endsWith(':hull')) return;
+      o.getWorldPosition(_scanPos);
+      const d = _scanPos.distanceToSquared(state.position);
+      if (d < bestD) {
+        bestD = d;
+        best = o;
+      }
+    });
+
+    const bikeRoot = best as Object3D | null;
+    // Nothing found yet (still loading) — allow a handful of retries.
+    if (!bikeRoot || bestD > 400) {
+      if (this.smearAttempts < 240) this.smearWired = false;
+      return;
+    }
+
+    const id = bikeRoot.name.slice('bike:'.length);
+    const riderRoot = this.scene.getObjectByName(`rider:${id}`) ?? null;
+
+    // Geometry smear: the rider first (limbs are what streak in a trick), the
+    // bike second. SpeedFX clones at most `maxMeshesPerTarget` meshes each and
+    // only draws them while the smear is actually active.
+    const targets: Object3D[] = [];
+    if (riderRoot) targets.push(riderRoot);
+    targets.push(bikeRoot);
+    // Drop any clones built for a previous subject before adopting the new
+    // list — SpeedFX caps simultaneous targets, so stale entries would
+    // eventually starve the real ones.
+    for (const old of this.smearTargets) {
+      if (!targets.includes(old)) this.speed.release(old);
+    }
+    this.smearTargets = targets;
+    this.setSmearTargets(targets);
+
+    // Wheel spin smear. The wheel pivots spin about their own local X — that
+    // is the axis BikeVisual writes `rotation.x` on — and the radius is the
+    // committed tyre radius, so the annulus lands exactly on the tyre.
+    // Re-ANCHOR an existing handle rather than adding a second one. setSubject
+    // can legitimately be called again (restart, or switching to a replay
+    // rider) and a fresh addSpinSmear each time would leak a draw call per
+    // call and leave the old annulus welded to the previous bike's wheel.
+    const front = bikeRoot.getObjectByName('frontWheel');
+    const rear = bikeRoot.getObjectByName('rearWheel');
+    if (front) {
+      if (this.frontSpin) this.frontSpin.setAnchor(front);
+      else this.frontSpin = this.addSpinSmear(front, BIKE.wheelRadius, _WHEEL_AXIS);
+    }
+    if (rear) {
+      if (this.rearSpin) this.rearSpin.setAnchor(rear);
+      else this.rearSpin = this.addSpinSmear(rear, BIKE.wheelRadius, _WHEEL_AXIS);
     }
   }
 
@@ -190,8 +295,25 @@ export class Effects implements IEffects {
   }
 
   /**
-   * Advance the impact-frame state machine and return the time scale to apply
-   * to THIS frame. Call first, with the real (unscaled) frame delta.
+   * Advance the impact-frame state machine and return the SCALED dt for THIS
+   * frame — `realDt * timeScale`, in SECONDS. Call first, with the real
+   * (unscaled) frame delta; feed the result to everything visual.
+   *
+   * IT RETURNS A DELTA, NOT A SCALE, and that distinction was the single most
+   * destructive bug in the project. It used to return `timeScale` — a bare
+   * multiplier, 1.0 in the overwhelmingly common case — while its only caller
+   * (Game.render) took the result and used it as the frame delta for the rider
+   * rigs, the camera, the terrain streamer, the HUD, the audio and every
+   * particle system. So the entire visual half of the game advanced by ONE
+   * SECOND per rendered frame.
+   *
+   * Dust was where it showed first and worst. A puff is emitted stamped with
+   * the current FX clock; the same frame, DustSystem.update advanced that clock
+   * by a full second; the vertex shader computed age = 1.0 / life >= 1 and
+   * collapsed every instance to a degenerate clip position. Particles were
+   * emitted, pooled and killed without ever surviving to a single draw — which
+   * is exactly the measured signature: trail() called, pool filled, nothing on
+   * screen, ever.
    *
    * Optional — if you never call it, update() advances the impact machine
    * itself and the freeze simply lands one frame later.
@@ -199,7 +321,7 @@ export class Effects implements IEffects {
   beginFrame(realDt: number): number {
     this.impact.update(realDt);
     this.impactSteppedThisFrame = true;
-    return this.timeScale;
+    return realDt * this.timeScale;
   }
 
   // ── Frame ─────────────────────────────────────────────────────────────────
@@ -219,6 +341,8 @@ export class Effects implements IEffects {
 
     const s = this.subject;
     if (s && this.autoEmit) {
+      if (!this.smearWired) this.resolveSmearRig(s);
+      this.driveSpinSmear(s);
       this.detectEvents(s, rd);
       if (dt > 0) this.emitFromState(s, dt);
     }
@@ -229,6 +353,20 @@ export class Effects implements IEffects {
   }
 
   // ── Automatic emission ────────────────────────────────────────────────────
+
+  /**
+   * Push this frame's wheel speeds into the spin smears.
+   *
+   * BikeState already carries `spinRate` per wheel in rad/s, so nothing has to
+   * be differenced or guessed — and it is the PHYSICAL rate, which is what the
+   * effect must key off. At 78 km/h a 0.33 m wheel turns 65 rad/s: 62 degrees
+   * per rendered frame, far past the point where a spoke pattern can be
+   * sampled without strobing, which is exactly the regime the annulus is for.
+   */
+  private driveSpinSmear(s: BikeState): void {
+    if (this.frontSpin) this.frontSpin.setSpin(s.front?.spinRate ?? 0);
+    if (this.rearSpin) this.rearSpin.setSpin(s.rear?.spinRate ?? 0);
+  }
 
   private detectEvents(s: BikeState, dt: number): void {
     if (this.landCooldown > 0) this.landCooldown -= dt;
@@ -279,12 +417,34 @@ export class Effects implements IEffects {
     // so a wheel that has gone light through a compression stops throwing dust.
     const load01 = clamp01((w.load ?? 0) / (BIKE.mass * BIKE.gravity * 0.75));
 
-    const roll = clamp01((s.speed - 4) / 16) * 0.42;
+    // Rolling contribution.
+    //
+    // SIZING THIS PROPERLY IS THE WHOLE EFFECT, and the old numbers were out by
+    // most of an order of magnitude. The formula topped out around 10 puffs a
+    // second; the course is ridden on the groomed ribbon whose dustAmount is
+    // 0.55, so ~6 reached the emitter; the bike is airborne roughly two frames
+    // in three down anything rough, so ~2/s actually landed; at a ~0.9 s life
+    // that is TWO live puffs behind the rider. No amount of shader work makes
+    // two puffs into a dust tail.
+    //
+    // What a tail has to be, geometrically: at 19 m/s a 0.9 s puff is 17 m
+    // behind the wheel by the time it dies, so a continuous ribbon of ~0.5 m
+    // puffs needs 35-60 of them alive at once. That, not a feeling, is where
+    // the base rate comes from — and it is why the cap below exists, because
+    // the same formula under a full lock-up would otherwise ask for 400/s and
+    // bury the rider in his own dust.
+    const roll = clamp01((s.speed - 3) / 13) * 0.95;
     const skid = clamp01(slip / 5.5) + lock * 0.75 + spinUp * 0.5;
-    const rate = (roll + skid * 1.4) * 24 * weight * (0.35 + load01 * 0.9);
+    const isWater = surf.kind === SurfaceKind.Water;
+    // Water carries its read in droplets, not in airborne particulate, so the
+    // dust channel is cut right back there and the splash below does the work.
+    // Left at full rate, water's 1.8 dustAmount made it the single dustiest
+    // surface on the mountain, which is the opposite of true.
+    const rate = Math.min((roll + skid * 1.4) * 88 * weight * (0.35 + load01 * 0.9), 210 * weight)
+      * (isWater ? 0.20 : 1);
     if (rate > 0.5) this.dust.trail(pos, nrm, s.velocity, rate, dt, surf);
 
-    if (surf.kind === SurfaceKind.Water) {
+    if (isWater) {
       if (s.speed > 2.5 && this.rng.next() < clamp01(dt * (4 + s.speed * 0.7))) {
         this.debris.splash(pos, nrm, s.velocity, clamp01(0.25 + s.speed / 22) * weight);
       }

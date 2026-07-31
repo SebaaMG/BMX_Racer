@@ -340,11 +340,31 @@ export class Terrain implements ITerrain, ScatterSource {
    *
    *  1. THE HEIGHT is pulled toward the ribbon's own cross-section — including
    *     its bank — a little below the ribbon surface, so the mesh sits just
-   *     proud of the ground instead of z-fighting with it. Accumulated as a
-   *     max-weight field and applied once, rather than blended per carve point:
-   *     the carve points overlap heavily, and repeated lerping toward slightly
-   *     different targets would flatten the corridor far more than any single
-   *     point asks for, turning the trail into a trench.
+   *     proud of the ground instead of z-fighting with it.
+   *
+   *     THE TARGET IS A WEIGHTED AVERAGE OVER THE CARVE POINTS, NOT THE ONE
+   *     POINT WITH THE HIGHEST WEIGHT, and that is the whole correctness
+   *     argument of this function. The previous version kept `if (w > weight)`
+   *     against a weight that SATURATES AT 1 anywhere within sixty percent of
+   *     the reach — about five metres of track — while the carve points are
+   *     three and a half metres apart. So five or six consecutive points all
+   *     tied at exactly 1.0, the strict comparison kept whichever was visited
+   *     first, and the loop runs uphill to downhill: every texel in the
+   *     corridor took its height from a point up to five metres BACK UP THE
+   *     COURSE. On a twenty percent grade that is a metre; over a jump lip it
+   *     was eight. Measured, before the fix: scree +1.06..+2.15 m, tabletop
+   *     -7.89..+4.33 m, mean error positive in every single section — the
+   *     signature of a systematic uphill bias, not of noise.
+   *
+   *     The physics collides with this field and not with the ribbon, so the
+   *     mesh was floating metres over the surface the wheels were on, riders
+   *     spawned inside the mountain, and the trail carried a quantisation
+   *     staircase 0.2 m rms that no suspension could follow.
+   *
+   *     A tent weight whose half-width is the carve-point SPACING makes the
+   *     accumulated targets a partition of unity, so the result is an exact
+   *     linear interpolation of the centreline between consecutive points —
+   *     which is what the ribbon mesh is drawing.
    *
    *  2. THE ZONE under the ribbon becomes Trail, so a wheel that drops off the
    *     mesh edge onto the carved ground still reports trail grip rather than
@@ -360,14 +380,14 @@ export class Terrain implements ITerrain, ScatterSource {
     this.carveApplied = true;
 
     const size = this.size;
-    const weight = new Float32Array(size * size);
-    const target = new Float32Array(size * size);
-    // Trail-zone coverage is tracked SEPARATELY from the height blend weight.
-    // The height weight deliberately falls off along the track between carve
-    // samples so consecutive discs blend into each other; thresholding THAT to
-    // decide where the trail material starts makes the boundary dip once per
-    // sample, which is the regular sawtooth the reviewer saw scalloping the
-    // trail edge from a distance. Coverage is a lateral question only.
+    // Lateral coverage drives the BLEND STRENGTH and nothing else. It is a
+    // question about how far this texel is from the centreline, and it must not
+    // fall off between carve samples: thresholding a weight that dips once per
+    // sample is what scalloped the trail edge into a sawtooth.
+    const cover = new Float32Array(size * size);
+    // The along-track tent, accumulated as a weighted mean of the targets.
+    const sumW = new Float32Array(size * size);
+    const sumWY = new Float32Array(size * size);
     const zoneMark = new Uint8Array(size * size);
     const feather = Math.max(carve.featherWidth, 0.5);
 
@@ -377,6 +397,8 @@ export class Terrain implements ITerrain, ScatterSource {
     let bz1 = 0;
 
     const n = carve.points.length;
+    const alongSpan = carvePointSpacing(carve.points);
+
     for (let i = 0; i < n; i++) {
       const p = carve.points[i];
       const hw = carve.halfWidths[i];
@@ -412,23 +434,27 @@ export class Terrain implements ITerrain, ScatterSource {
 
           const lateral = wx * lx + wz * lz;
           const along = Math.abs(wx * _tan.x + wz * _tan.z);
-          const w =
-            (1 - smoothstep(hw, hw + feather, Math.abs(lateral))) *
-            (1 - smoothstep(reach * 0.6, reach, along));
-          if (w <= 0.001) continue;
+          const wLat = 1 - smoothstep(hw, hw + feather, Math.abs(lateral));
+          if (wLat <= 0.001) continue;
 
           const k = row + ix;
+          if (wLat > cover[k]) cover[k] = wLat;
           // Strictly INSIDE the ribbon mesh (0.86 of the half-width), so the
           // mesh always covers the zone patch and its 2 m texel edge can never
           // be the visible boundary.
           if (Math.abs(lateral) < hw * 0.86 && along < reach) zoneMark[k] = 1;
-          if (w > weight[k]) {
-            weight[k] = w;
-            // 0.12m below the ribbon surface: enough that the mesh never
-            // z-fights the ground it is lying on, small enough that the skirt
-            // still seals the seam from a low camera.
-            target[k] = p.y - 0.12 + lateral * tanBank;
-          }
+
+          // The tent. Zero at one point-spacing away, so exactly two points
+          // contribute to any position on a straight run and their weights sum
+          // to one — a linear interpolation of the centreline height.
+          const wAlong = 1 - along / alongSpan;
+          if (wAlong <= 0) continue;
+          const w = wLat * wAlong;
+          sumW[k] += w;
+          // 0.12m below the ribbon surface: enough that the mesh never
+          // z-fights the ground it is lying on, small enough that the skirt
+          // still seals the seam from a low camera.
+          sumWY[k] += w * (p.y - 0.12 + lateral * tanBank);
         }
       }
     }
@@ -437,9 +463,9 @@ export class Terrain implements ITerrain, ScatterSource {
       const row = iz * size;
       for (let ix = bx0; ix <= bx1; ix++) {
         const k = row + ix;
-        const w = weight[k];
-        if (w <= 0.001) continue;
-        this.height[k] = lerp(this.height[k], target[k], clamp01(w));
+        const w = cover[k];
+        if (w <= 0.001 || sumW[k] <= 1e-6) continue;
+        this.height[k] = lerp(this.height[k], sumWY[k] / sumW[k], clamp01(w));
         // Water survives the trail stamp. The course drops INTO the stream bed
         // rather than bridging it, so painting hardpack trail over the channel
         // floor both erased the only water in the game and handed the rider
@@ -625,4 +651,27 @@ export async function createTerrain(opts: CreateTerrainOptions = {}): Promise<Te
 
 function now(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+/**
+ * The typical along-track spacing of the carve points, as a MEDIAN.
+ *
+ * Median rather than mean, and rather than a per-point neighbour distance,
+ * because the carve list is not contiguous: `getCarve` drops every sample
+ * inside the ravine, so two consecutive entries there are twenty metres apart.
+ * A per-point span would give those two an enormous tent and smear the lips of
+ * the gap into the hillside; a mean would be dragged upward by the same
+ * outliers. The list is otherwise uniform in arc length by construction, so one
+ * median describes every point that matters.
+ */
+function carvePointSpacing(points: Vector3[]): number {
+  if (points.length < 2) return 3.5;
+  const d: number[] = [];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    d.push(Math.hypot(b.x - a.x, b.z - a.z));
+  }
+  d.sort((p, q) => p - q);
+  return clamp(d[d.length >> 1], 0.75, 8);
 }

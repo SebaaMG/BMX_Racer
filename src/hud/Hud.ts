@@ -99,8 +99,19 @@ export class Hud implements IHud {
     this.object = this.root.group;
 
     // ── Layer table. Insertion order is z-order. ────────────────────────────
+    // ── THE PROFILE PANEL'S SIZE IS A COMPOSITION DECISION ────────────────────
+    // It was 880 x 210 at (30, 24) — 46% of the design width and the whole
+    // top-left quadrant. In eight of sixteen review frames it sat on the
+    // horizon, which is the one line in a downhill racing shot that has to stay
+    // readable. HUD furniture frames a picture; it does not stand in front of
+    // it. 600 x 164 keeps every element the panel had (silhouette, skyline,
+    // checkpoint hairlines, rival markers, the flooded ridden section) at
+    // exactly the same internal proportions, occupies 31% of the width, and
+    // clears the horizon in every pose in the set. It also ends at design x 608,
+    // which puts 117 units of clean air between it and the clock's TIME label —
+    // the second half of the header-collision fix.
     this.profile = this.mount(new RouteProfileWidget(
-      new HudLayer('profile', place('top-left', 30, 24, 880, 210)),
+      new HudLayer('profile', place('top-left', 26, 18, 600, 164)),
     ));
     this.clock = this.mount(new ClockWidget(
       new HudLayer('clock', place('top', 0, 22, 470, 200)),

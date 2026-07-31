@@ -248,6 +248,40 @@ export const POSE_HALFLIFE = (() => {
   return h;
 })();
 
+/**
+ * Half-life for the four LOCK channels when the lock is being RE-MADE.
+ *
+ * Releasing a contact and re-making one are not the same action and must not
+ * share a timing. A foot leaving a pedal for a superman, a no-footer or a
+ * tailwhip is a kick: it is over in two frames and any hesitation reads as the
+ * rider being unsure. A foot coming BACK has to find the platform — the rider
+ * is looking down, the pedal is moving, and it takes a beat. Running the return
+ * on the same 30 ms half-life as the release is what makes procedural riders
+ * look magnetic, with feet that teleport onto pedals the instant a trick ends.
+ *
+ * Hands are a little quicker than feet on the way back because the bar is not
+ * going anywhere and the rider can see it.
+ */
+export const POSE_HALFLIFE_RETURN = (() => {
+  const h = new Float32Array(POSE_CHANNELS);
+  h.set(POSE_HALFLIFE);
+  h[PC.handLockL] = 0.075;
+  h[PC.handLockR] = 0.075;
+  h[PC.footLockL] = 0.115;
+  h[PC.footLockR] = 0.115;
+  return h;
+})();
+
+/** 1 for the four contact-lock channels, 0 elsewhere. Indexed by channel. */
+export const LOCK_CHANNELS = (() => {
+  const m = new Uint8Array(POSE_CHANNELS);
+  m[PC.handLockL] = 1;
+  m[PC.handLockR] = 1;
+  m[PC.footLockL] = 1;
+  m[PC.footLockR] = 1;
+  return m;
+})();
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Riding poses
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +396,35 @@ export const BRAKE = pose({
   elbowOutR: -0.14,
   kneeOutL: 0.10,
   kneeOutR: 0.10,
+});
+
+/**
+ * COASTING / FREEWHEELING — moving fast, not driving the cranks.
+ *
+ * A BMX gear spins out around 30 km/h, so above that a rider is NOT pedalling,
+ * and the difference between working and resting has to be visible or every
+ * high-speed frame looks like every other one. The tells are all small and all
+ * specific: cranks level, heels dropped onto the platforms, hips slid back and
+ * down out of the wind, chest lower, chin up looking further ahead. Nothing
+ * here is a large angle; the whole point is that it changes the SHAPE of the
+ * silhouette without changing the pose the rider is in.
+ */
+export const COAST = pose({
+  pelvisY: -0.030,
+  pelvisZ: -0.075,
+  pelvisPitch: -0.08,
+  spineBend: 0.30,
+  chestBend: -0.14,
+  headPitch: -0.24,
+  elbowOutL: 0.04,
+  elbowOutR: 0.04,
+  kneeOutL: 0.05,
+  kneeOutR: 0.05,
+  // Heels down on the platforms — the single clearest "not pedalling" read.
+  ankleFlexL: -0.30,
+  ankleFlexR: -0.30,
+  shrug: -0.04,
+  hemSwing: 0.25,
 });
 
 /** PEDALLING (standing) — the attitude a rider takes when actually driving. */

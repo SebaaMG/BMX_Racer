@@ -7,7 +7,9 @@
  * the only cue the player has for lateral motion: nothing moves relative to
  * anything else, so a 60 km/h corner and a 20 km/h corner look identical.
  *
- * Everything here exists to break that rigidity in controlled ways.
+ * Everything here exists to break that rigidity in controlled ways — and then
+ * to put hard, non-negotiable floors under the result, because a camera that
+ * expresses motion but loses its subject has failed at the only job it has.
  *
  * THE LAG. The chase anchor does not follow the bike's heading — it follows a
  * LAGGED heading, half-life 0.16–0.30s scaling with speed. Entering a corner
@@ -16,6 +18,26 @@
  * through the exit. On top of that the position spring is deliberately
  * UNDER-damped (zeta 0.68), so it overshoots and settles rather than arriving.
  * Those two things together are the whip.
+ *
+ * THE BOOM. Everything the springs produce is then run through a boom solver
+ * (`resolveBoom`) that treats the camera as a rigid arm pivoting on the rider's
+ * chest. The arm has a HARD MINIMUM LENGTH, a hard maximum, a terrain sweep
+ * along its whole length, and a clearance test against every other rider on the
+ * mountain. It can only ever SHORTEN — a camera that solves a collision by
+ * flying upward loses the subject, which is exactly what the previous version
+ * did: it computed the lift a violation at parameter `s` demanded as `depth/s`,
+ * so a rock 20% of the way down the arm asked for FIVE TIMES its own depth in
+ * altitude and the camera went 32 m into the sky. Retraction is damped fast in
+ * and slow out and the result is written back into the springs, so the arm
+ * never stores a hidden discrepancy that pops when the constraint releases.
+ *
+ * THE FRAMING. The subject is composed inside a SAFE AREA, not at the centre of
+ * the raster. The HUD owns the top 20% and the bottom 12% of the frame, and a
+ * rider parked behind the boost bar is not framed, it is hidden. A closed loop
+ * measures where the subject actually landed on screen last frame and biases
+ * the look point until it sits inside the band. Closed loop rather than a
+ * hand-tuned pitch offset because the FOV, the boom length and the terrain all
+ * move, and any open-loop offset is only correct for one of their values.
  *
  * THE FOV. 62° cruising to 78° flat out, but on a 2.7 exponent, so almost all
  * of the change lives in the top third of the speed range. A linear FOV ramp
@@ -28,17 +50,23 @@
  * the capture harness compares builds frame for frame and a random camera would
  * make every diff a false positive.
  *
- * THE SWING. Above a threshold of air, rising, with enough hang time left, the
- * camera orbits ~66° to show the trick — and then starts coming back EARLY,
- * cancelling itself the moment the projected time-to-land drops below 0.55s.
- * A camera still orbiting when the wheels touch is worse than never orbiting.
+ * THE SWING. Above a threshold of air, with enough hang time left, the camera
+ * orbits ~66° to show the trick — and then starts coming back EARLY, cancelling
+ * itself the moment the projected time-to-land drops below 0.55s. A camera
+ * still orbiting when the wheels touch is worse than never orbiting.
  *
- * THE SLOW-MO. Rare by construction: 7m of air, past apex, 9s cooldown. It
- * exposes a timeScale the Game multiplies its dt by; the camera itself keeps
- * moving on the scaled clock so the whole world slows together.
+ * THE SLOW-MO. Rare by construction: a genuinely big jump, past apex, on a long
+ * cooldown. It exposes a timeScale the Game multiplies its dt by; the camera
+ * itself keeps moving on the scaled clock so the whole world slows together.
+ *
+ * THE CRASH. A crash is the most cinematic moment in the game and the camera
+ * used to respond to one by doing nothing at all. `crashFocus` is a 2.2s
+ * envelope that pulls the boom in to 60%, lifts and stiffens the rig so it
+ * ARRIVES instead of whipping, kills the corner drift, narrows the lens, and
+ * runs a short slow-mo. The subject gets bigger when it goes wrong, not smaller.
  */
 
-import { PerspectiveCamera, Quaternion, Vector3 } from 'three';
+import { Object3D, PerspectiveCamera, Quaternion, Vector3 } from 'three';
 
 import {
   BikeMode,
@@ -50,6 +78,7 @@ import {
   type ReplayFrame,
 } from '../game/Contracts';
 import {
+  DEG,
   clamp,
   clamp01,
   dampAngleHL,
@@ -68,6 +97,8 @@ import { Rng } from '../core/RNG';
 import { BIKE } from '../game/WorldConstants';
 
 // ── Module scratch ───────────────────────────────────────────────────────────
+// Nothing in the update path allocates. Every vector below is written before it
+// is read, within a single synchronous call, and never escapes.
 const _flatVel = new Vector3();
 const _fwd = new Vector3();
 const _dirV = new Vector3();
@@ -78,12 +109,23 @@ const _camFinal = new Vector3();
 const _lookFinal = new Vector3();
 const _shakeDir = new Vector3();
 const _tmp = new Vector3();
+const _pivot = new Vector3();
+const _boomDir = new Vector3();
+const _probe = new Vector3();
+const _view = new Vector3();
 const _qa = new Quaternion();
 const _qb = new Quaternion();
 const UP = new Vector3(0, 1, 0);
 
 /** Deterministic shake noise. Never Math.random — captures must be comparable. */
 const SHAKE_NOISE = new Noise2D('camera-shake');
+
+/** Hard ceiling on how many other riders the boom solver will consider. */
+const MAX_OCCLUDERS = 12;
+
+/** Reusable occluder position slots. Allocated once, refilled every frame. */
+const _occPos: Vector3[] = [];
+for (let i = 0; i < MAX_OCCLUDERS; i++) _occPos.push(new Vector3());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tuning
@@ -97,10 +139,24 @@ export const CAMERA_TUNING = {
   /** Speed treated as "flat out", m/s. */
   referenceSpeed: 26,
 
-  chaseDistance: 5.0,
-  chaseDistanceSpeedGain: 2.1,
-  chaseHeight: 1.90,
-  chaseHeightSpeedGain: 0.55,
+  /**
+   * Boom length at rest, metres, measured from the rider's CHEST (see
+   * `subjectPivotHeight`) rather than from the axle reference point.
+   *
+   * This used to be 5.0 + 2.1·speed, which put the rider 7–8 m away and made
+   * him 105–176 px tall in a 900 px frame — 12–19% of frame height, a thumbnail.
+   * The rider rig is the highest-visibility craft in the game and it was being
+   * shot from the far side of the road. At 3.0 + 1.35·speed he lands around
+   * 27–33% of frame height, which is a legible subject, and the FOV curve
+   * (62°→78°) keeps the mountain in the shot behind him.
+   */
+  chaseDistance: 3.55,
+  chaseDistanceSpeedGain: 1.35,
+  chaseHeight: 1.58,
+  chaseHeightSpeedGain: 0.52,
+  /** Height above BikeState.position that the boom pivots on — the chest. */
+  subjectPivotHeight: 0.95,
+
   /** Position spring: under-damped, which is where the whip comes from. */
   chaseOmega: 6.2,
   chaseZeta: 0.68,
@@ -116,26 +172,152 @@ export const CAMERA_TUNING = {
   rollGain: 0.0085,
   rollMax: 0.12,
 
+  // ── Boom safety ────────────────────────────────────────────────────────────
+  /** The floor. The camera never gets closer to the chest pivot than this. */
+  boomMin: 3.05,
+  /**
+   * The leash. However far the springs run, the camera may not sit further from
+   * the pivot than (solved boom length + this). Without it the under-damped
+   * spring's steady-state lag grows linearly with speed — 4.3 m at 19 m/s and
+   * 10.3 m at 47 m/s — and a crash that dumps the speed leaves the camera
+   * stranded at the far end of it.
+   */
+  boomMaxSlack: 3.0,
+  /** Terrain clearance required at the CAMERA end of the boom. */
+  terrainMargin: 1.15,
+  /**
+   * SIGHT-LINE clearance along the boom, ramped from `boomClearNear` at the
+   * pivot end to `boomClearFar` at the camera end. It has to ramp: near the
+   * pivot the "obstruction" is the ground the rider is riding on.
+   *
+   * Both numbers are deliberately far smaller than `terrainMargin`, because
+   * this test asks "is the mountain BETWEEN the camera and the rider", not "is
+   * the camera comfortably clear of the ground" — `floorCamera` already owns
+   * the second question. Sized like a clearance margin (0.45 → 1.15) it fired
+   * on the chord of every rocky descent, because a 4.8 m arm on scree only has
+   * about a metre of clearance mid-chord to begin with. That pinned the arm at
+   * `boomMin` for the whole of `scree-speed` and put the rider at 46% of frame
+   * height with the camera in his back wheel.
+   */
+  boomClearNear: 0.15,
+  boomClearFar: 0.50,
+  /** Sight-line samples are only taken beyond this fraction of the boom. */
+  boomClearFrom: 0.34,
+  boomSamples: 7,
+  /** How far in front of an obstruction the camera parks. */
+  boomBackoff: 0.55,
+  /** Violation depth ignored before the boom reacts. Kills bump chatter. */
+  boomDeadband: 0.18,
+  /** Retract in ~5 frames; recover over a third of a second. Never a pop. */
+  boomShortenHL: 0.075,
+  boomRecoverHL: 0.34,
+
+  /** Radius of the subject's own body, for the near-fade and lift tests. */
+  bodyRadius: 0.95,
+  /** Radius of another rider's body as an occluding cylinder. */
+  occluderRadius: 1.10,
+  /** Clearance kept between the camera and an occluder on the boom line. */
+  occluderClearance: 1.25,
+  /**
+   * The occluder rule may never retract the arm below this fraction of what the
+   * shot asked for. In a four-up pack somebody is nearly always somewhere on
+   * the arm, and a rule that answers every one of them by diving toward the
+   * rider is not a camera, it is a yo-yo. Past this floor the response switches
+   * to rising over the intruder instead.
+   */
+  occluderBoomFloor: 0.86,
+  /** Horizontal radius around the camera within which a rider forces a lift. */
+  occluderLiftRadius: 1.70,
+  /**
+   * Ceiling on how steeply the arm may point upward, as sin(elevation). Without
+   * it a rider dropping down a face drags the arm to vertical and the shot
+   * becomes a plan view of a helmet. 0.72 is about 46 degrees — a steep
+   * three-quarter, which still reads as a rider on a mountain.
+   */
+  boomMaxRise: 0.72,
+  /** Height of a rider's head above their BikeState.position. */
+  riderTop: 1.75,
+
   /** Peak shake displacement in metres at amount 1.0. */
   shakeMetres: 0.42,
   /** Primary oscillation, rad/s (~10 Hz). */
   shakeFrequency: 62,
 
+  /** Vertical escape when shortening cannot solve it. Bounded, unlike `depth/s`. */
+  liftMax: 2.6,
+  liftAttackHL: 0.05,
+  liftReleaseHL: 0.30,
+
+  /** Another rider begins dithering out at this range and is gone by `Full`. */
+  nearFadeStart: 2.60,
+  nearFadeFull: 1.05,
+
+  // ── Safe-area composition ──────────────────────────────────────────────────
+  /**
+   * The HUD owns the top 20% and the bottom 12% of the frame. Compose inside
+   * that with a margin, and hold an inner band so the controller is not
+   * constantly correcting a subject that is already fine.
+   */
+  safeTop: 0.255,
+  safeBottom: 0.815,
+  safeInnerPad: 0.045,
+  frameBiasMax: 3.0,
+  /** Loop gain. Under 1 so the controller converges rather than ringing. */
+  frameBiasGain: 0.6,
+  frameBiasCorrectHL: 0.18,
+  frameBiasRelaxHL: 0.55,
+
+  // ── Air swing ──────────────────────────────────────────────────────────────
   airSwingArc: 1.15,
-  airSwingMinAirTime: 0.55,
+  /**
+   * Was 0.55s of air before the swing would even be considered, and then a
+   * further requirement of 1.1s of flight REMAINING. A 7 m tabletop has about
+   * 1.5s of hang time total, so the first gate consumed most of the second one
+   * and the swing never fired once in the whole review set. Both are now sized
+   * against what the course actually launches you off.
+   */
+  airSwingMinAirTime: 0.20,
+  airSwingMinRemaining: 0.72,
+  airSwingMinPeak: 2.2,
   airSwingBailout: 0.55,
   airSwingCooldown: 2.2,
   airSwingRise: 1.4,
 
-  slowMoMinPeak: 7.0,
+  // ── Slow-mo ────────────────────────────────────────────────────────────────
+  /**
+   * Also never fired. The old apex test wanted `airTime > 0.85` AND
+   * `|velocity.y| < 1.8`; on a 7 m jump apex arrives at 0.75s, so the two
+   * windows barely overlapped and any jitter closed the gap. Detect the apex by
+   * the sign of the vertical velocity instead of by a clock.
+   */
+  slowMoMinPeak: 5.5,
+  slowMoMinAirTime: 0.40,
+  slowMoMinRemaining: 0.35,
   slowMoScale: 0.38,
   slowMoAttack: 0.12,
   slowMoHold: 0.30,
   slowMoRelease: 0.32,
   slowMoCooldown: 9.0,
 
-  collisionSamples: 5,
-  collisionMargin: 1.35,
+  // ── Crash focus ────────────────────────────────────────────────────────────
+  crashFocusAttack: 0.16,
+  crashFocusHold: 1.15,
+  crashFocusRelease: 0.85,
+  /** Boom multiplier at full focus — the push-in. */
+  crashFocusPull: 0.88,
+  crashFocusRise: 0.45,
+  /** Lens narrows into the crash. Widening it would flatten the impact. */
+  crashFocusFov: 7.0,
+  crashSlowMoMinSeverity: 0.28,
+  crashSlowMoScale: 0.45,
+  crashSlowMoAttack: 0.09,
+  crashSlowMoHold: 0.34,
+  crashSlowMoRelease: 0.40,
+  crashSlowMoCooldown: 4.0,
+
+  /** Retained for source compatibility; the boom solver supersedes them. */
+  collisionSamples: 7,
+  collisionMargin: 1.15,
 } as const;
 
 function estimateAirRemaining(t: BikeState): number {
@@ -167,6 +349,8 @@ export interface CameraDirectorOptions {
   rng?: Rng;
   /** Detect landings/crashes from BikeState itself. Off if you drive them. */
   autoDetectEvents?: boolean;
+  /** Other riders the boom must not collide with. See `setOccluders`. */
+  occluders?: readonly BikeState[];
 }
 
 export class CameraDirector implements ICameraDirector {
@@ -227,13 +411,48 @@ export class CameraDirector implements ICameraDirector {
   private swingAmount = 0;
   private swingCooldown = 0;
 
-  // Slow-mo.
+  // Slow-mo. The envelope shape is captured at trigger time so a crash hold and
+  // a big-air hold can have different timing without two state machines.
   private slowActive = false;
   private slowT = 0;
   private slowCooldown = 0;
+  private slowScale: number = CAMERA_TUNING.slowMoScale;
+  private slowA: number = CAMERA_TUNING.slowMoAttack;
+  private slowH: number = CAMERA_TUNING.slowMoHold;
+  private slowR: number = CAMERA_TUNING.slowMoRelease;
+  private slowCool: number = CAMERA_TUNING.slowMoCooldown;
 
-  // Collision.
+  // Crash focus.
+  private crashT = -1;
+  private crashFocus = 0;
+
+  // Boom solver state.
+  /** Metres the boom is currently retracted from what the springs asked for. */
+  private boomRetract = 0;
+  /** Vertical escape currently applied. Bounded by `liftMax`. */
   private collisionLift = 0;
+  /** Last solved boom length, pivot to camera. */
+  private boomLength = 0;
+  /**
+   * The boom length the active mode ASKED for this frame, before any constraint.
+   * The leash is measured against this and not against the previous solution —
+   * leashing to the last frame would let the arm grow by a full slack every
+   * frame, which is not a leash at all.
+   */
+  private boomDesired = 8;
+
+  // Occluders (other riders).
+  private occluders: readonly BikeState[] | null = null;
+  private occNodes: (Object3D | null)[] = new Array(MAX_OCCLUDERS).fill(null);
+  private occCount = 0;
+  private discovered: Object3D[] = [];
+  private discoveredBodies: Object3D[] = [];
+  private discoverTimer = 0;
+  private discoveredSceneKids = -1;
+  private autoDiscover = true;
+
+  // Safe-area framing controller.
+  private frameBias = 0;
 
   // Event edge detection.
   private prevAirborne = false;
@@ -289,6 +508,7 @@ export class CameraDirector implements ICameraDirector {
     this.sx.value = this.camPos.x;
     this.sy.value = this.camPos.y;
     this.sz.value = this.camPos.z;
+    if (opts.occluders) this.setOccluders(opts.occluders);
   }
 
   setTerrain(t: ITerrain | null): void {
@@ -297,6 +517,107 @@ export class CameraDirector implements ICameraDirector {
 
   get lookAtPoint(): Vector3 {
     return this.lookPos;
+  }
+
+  /** Current solved boom length, metres, pivot-to-camera. Read-only, for tests. */
+  get boomDistance(): number {
+    return this.boomLength;
+  }
+
+  // ── Occluders ─────────────────────────────────────────────────────────────
+
+  /**
+   * Register the OTHER riders on the mountain so the boom can avoid them.
+   *
+   * This is the supported path and the Game should call it once, with every
+   * non-player racer's BikeState:
+   *
+   *   dir.setOccluders(race.racers.filter(r => r !== race.player).map(r => r.bike.state));
+   *
+   * Passing null re-enables the scene-scan fallback below.
+   */
+  setOccluders(states: readonly BikeState[] | null): void {
+    this.occluders = states && states.length ? states : null;
+    this.autoDiscover = !this.occluders;
+    if (this.occluders) {
+      this.discovered.length = 0;
+      this.discoveredBodies.length = 0;
+    }
+  }
+
+  /**
+   * Fallback discovery, used until `setOccluders` is called.
+   *
+   * The racers are direct children of the scene named `racer:<id>`, each holding
+   * a `bike:<id>` group that carries the world transform. Scanning for them costs
+   * one shallow pass over the scene's children, is re-run at most every two
+   * seconds, and lets the boom solver be correct in a build where nothing has
+   * wired the explicit path yet. It is deliberately a fallback: an explicit list
+   * is cheaper and does not depend on node names.
+   */
+  private discoverOccluders(dt: number): void {
+    this.discoverTimer -= dt;
+    const scene = this.terrain?.object?.parent ?? this.camera.parent;
+    if (!scene) return;
+    if (this.discoverTimer > 0 && scene.children.length === this.discoveredSceneKids) return;
+    this.discoverTimer = 2.0;
+    this.discoveredSceneKids = scene.children.length;
+
+    // Restore anything the near-fade hid before dropping it from the list —
+    // a node that leaves the list while invisible would never come back.
+    this.clearNearFade();
+    this.discovered.length = 0;
+    this.discoveredBodies.length = 0;
+    const kids = scene.children;
+    for (let i = 0; i < kids.length && this.discovered.length < MAX_OCCLUDERS; i++) {
+      const node = kids[i];
+      if (!node.name || node.name.lastIndexOf('racer:', 0) !== 0) continue;
+      let body: Object3D | null = null;
+      for (let j = 0; j < node.children.length; j++) {
+        const c = node.children[j];
+        if (c.name && c.name.lastIndexOf('bike:', 0) === 0) {
+          body = c;
+          break;
+        }
+      }
+      this.discovered.push(node);
+      this.discoveredBodies.push(body ?? node);
+    }
+  }
+
+  /**
+   * Fill `_occPos` / `occNodes` with every rider that is NOT the subject.
+   * Zero allocation: the slots are module-scope and refilled in place.
+   */
+  private gatherOccluders(subject: BikeState, dt: number): void {
+    this.occCount = 0;
+
+    if (this.occluders) {
+      for (let i = 0; i < this.occluders.length && this.occCount < MAX_OCCLUDERS; i++) {
+        const s = this.occluders[i];
+        if (s === subject) continue;
+        _occPos[this.occCount].copy(s.position);
+        this.occNodes[this.occCount] = null;
+        this.occCount++;
+      }
+      return;
+    }
+
+    if (!this.autoDiscover) return;
+    this.discoverOccluders(dt);
+
+    for (let i = 0; i < this.discoveredBodies.length && this.occCount < MAX_OCCLUDERS; i++) {
+      const body = this.discoveredBodies[i];
+      const e = body.matrixWorld.elements;
+      // The subject is in this list too — identify it by position rather than by
+      // name, so the camera never has to know what the player's node is called.
+      const dx = e[12] - subject.position.x;
+      const dz = e[14] - subject.position.z;
+      if (dx * dx + dz * dz < 0.36) continue;
+      _occPos[this.occCount].set(e[12], e[13], e[14]);
+      this.occNodes[this.occCount] = this.discovered[i];
+      this.occCount++;
+    }
   }
 
   // ── Frame ─────────────────────────────────────────────────────────────────
@@ -312,6 +633,8 @@ export class CameraDirector implements ICameraDirector {
     const rd = clamp(realDt ?? dt, 0, 0.1);
 
     if (this.autoDetect) this.detectEvents(target, rd);
+    this.updateCrashFocus(rd);
+    this.gatherOccluders(target, rd);
 
     switch (this.mode) {
       case CameraMode.Chase:
@@ -337,7 +660,7 @@ export class CameraDirector implements ICameraDirector {
 
     this.updateFov(this.mode === CameraMode.Chase ? target : null, d);
     this.updateSlowMo(target, rd);
-    this.compose(d);
+    this.compose(target, d);
   }
 
   // ── Chase ─────────────────────────────────────────────────────────────────
@@ -366,6 +689,7 @@ export class CameraDirector implements ICameraDirector {
 
     const spd = t.speed;
     const speed01 = clamp01(spd / CAMERA_TUNING.referenceSpeed);
+    const cf = this.crashFocus;
 
     // Yaw rate from the TRUE heading, before the lag is applied — this is the
     // corner signal, and reading it off the lagged anchor would smear it.
@@ -374,19 +698,30 @@ export class CameraDirector implements ICameraDirector {
     const instRate = dt > 1e-4 ? clamp(dYaw / dt, -6, 6) : this.yawRate;
     this.yawRate = dampHL(this.yawRate, instRate, 0.09, dt);
 
-    const lagHL = lerp(CAMERA_TUNING.lagHalfLifeSlow, CAMERA_TUNING.lagHalfLifeFast, speed01);
+    // Under crash focus the lag half-life collapses: the whip is the right
+    // language for a corner and the wrong one for a wreck, where the only job
+    // is to hold the subject.
+    const lagHL =
+      lerp(CAMERA_TUNING.lagHalfLifeSlow, CAMERA_TUNING.lagHalfLifeFast, speed01) *
+      lerp(1, 0.45, cf);
     this.aimYaw = dampAngleHL(this.aimYaw, travelYaw, lagHL, dt);
 
     // Air framing: pull back and rise so the whole arc is legible.
     const airborne = t.mode === BikeMode.Airborne;
     const airH = airborne ? Math.max(t.airHeight, 0) : 0;
     const airLift = clamp(airH * 0.10, 0, 2.2);
-    const airPull = clamp(airH * 0.20, 0, 4.0);
+    const airPull = clamp(airH * 0.16, 0, 2.8);
 
     this.updateAirSwing(t, dt);
 
-    const dist = CAMERA_TUNING.chaseDistance + CAMERA_TUNING.chaseDistanceSpeedGain * speed01 + airPull;
-    const height = CAMERA_TUNING.chaseHeight + CAMERA_TUNING.chaseHeightSpeedGain * speed01 + airLift;
+    const dist =
+      (CAMERA_TUNING.chaseDistance + CAMERA_TUNING.chaseDistanceSpeedGain * speed01 + airPull) *
+      lerp(1, CAMERA_TUNING.crashFocusPull, cf);
+    const height =
+      CAMERA_TUNING.chaseHeight +
+      CAMERA_TUNING.chaseHeightSpeedGain * speed01 +
+      airLift +
+      CAMERA_TUNING.crashFocusRise * cf;
 
     const anchorYaw = this.aimYaw + this.swingAmount * this.swingDir * CAMERA_TUNING.airSwingArc;
     _dirV.set(Math.sin(anchorYaw), 0, Math.cos(anchorYaw));
@@ -397,29 +732,62 @@ export class CameraDirector implements ICameraDirector {
     // which is a LEFT turn, whose outside is +right — so the drift sign is
     // straight through with no negation.
     const latAccel = clamp(this.yawRate * spd, -34, 34);
-    const swingLat = clamp(latAccel * CAMERA_TUNING.cornerSwing, -CAMERA_TUNING.cornerSwingMax, CAMERA_TUNING.cornerSwingMax);
+    const swingLat =
+      clamp(
+        latAccel * CAMERA_TUNING.cornerSwing,
+        -CAMERA_TUNING.cornerSwingMax,
+        CAMERA_TUNING.cornerSwingMax,
+      ) * (1 - cf);
 
+    // Stiffen and damp toward critical during a crash so the rig ARRIVES.
+    const omega = CAMERA_TUNING.chaseOmega * lerp(1, 1.5, cf);
+    const zeta = lerp(CAMERA_TUNING.chaseZeta, 0.95, cf);
+
+    // VELOCITY FEED-FORWARD. A second-order spring chasing a target that moves
+    // at a constant velocity settles with a permanent lag of v·(2ζ/ω + dt) —
+    // 4.3 m at 19 m/s and 10.3 m at 47 m/s with these constants. That lag is
+    // not the whip. The whip is the TRANSIENT: the overshoot when the target
+    // changes direction, which is what makes a corner read. The steady-state
+    // stretch just parks the camera further away the faster you go, by an
+    // amount nobody chose, and it is why the rider was 7–8 m out and 12% of
+    // frame height. Feeding the target's velocity forward cancels exactly that
+    // term and leaves the transient untouched, so the standoff at speed is
+    // whatever `chaseDistanceSpeedGain` says it is and nothing else.
+    const lead = 2 * zeta / omega + dt;
+
+    const rise = height + this.swingAmount * CAMERA_TUNING.airSwingRise;
     _desired
       .copy(t.position)
       .addScaledVector(_dirV, -dist)
       .addScaledVector(_rightV, swingLat)
-      .addScaledVector(UP, height + this.swingAmount * CAMERA_TUNING.airSwingRise);
+      .addScaledVector(UP, rise)
+      .addScaledVector(t.velocity, lead);
 
-    springStepDamped(this.sx, _desired.x, CAMERA_TUNING.chaseOmega, CAMERA_TUNING.chaseZeta, dt);
-    springStepDamped(this.sy, _desired.y, CAMERA_TUNING.chaseOmega * 1.25, 0.92, dt);
-    springStepDamped(this.sz, _desired.z, CAMERA_TUNING.chaseOmega, CAMERA_TUNING.chaseZeta, dt);
+    // What the shot asked for, pivot to camera. Feeds the leash.
+    const pv = rise - CAMERA_TUNING.subjectPivotHeight;
+    this.boomDesired = Math.sqrt(dist * dist + swingLat * swingLat + pv * pv);
+
+    springStepDamped(this.sx, _desired.x, omega, zeta, dt);
+    springStepDamped(this.sy, _desired.y, omega * 1.25, lerp(0.92, 1.0, cf), dt);
+    springStepDamped(this.sz, _desired.z, omega, zeta, dt);
     this.camPos.set(this.sx.value, this.sy.value, this.sz.value);
 
     // Look point: lead the rider a little so the frame shows where they are
     // going. Airborne, drop the aim so the landing stays on screen.
+    const lookOmega = CAMERA_TUNING.lookOmega * lerp(1, 1.45, cf);
+
+    // Same story on the aim. The critically-damped look spring lags a moving
+    // target by v·(2/ω + dt); feed that forward so the reticle sits ON the
+    // rider, then add a small genuine LEAD on top so the frame shows where they
+    // are going rather than where they have been. The crash focus removes the
+    // lead — mid-wreck there is no "going".
     _lookWanted.copy(t.position);
     _lookWanted.y += 1.05;
-    _lookWanted.addScaledVector(t.velocity, 0.10);
+    _lookWanted.addScaledVector(t.velocity, 2 / lookOmega + dt + 0.06 * (1 - cf));
     if (airborne) _lookWanted.y -= clamp(airH * 0.10, 0, 1.6);
-
-    springStep(this.lx, _lookWanted.x, CAMERA_TUNING.lookOmega, dt);
-    springStep(this.ly, _lookWanted.y, CAMERA_TUNING.lookOmega, dt);
-    springStep(this.lz, _lookWanted.z, CAMERA_TUNING.lookOmega, dt);
+    springStep(this.lx, _lookWanted.x, lookOmega, dt);
+    springStep(this.ly, _lookWanted.y, lookOmega, dt);
+    springStep(this.lz, _lookWanted.z, lookOmega, dt);
     this.lookPos.set(this.lx.value, this.ly.value, this.lz.value);
 
     const targetRoll = clamp(-latAccel * CAMERA_TUNING.rollGain, -CAMERA_TUNING.rollMax, CAMERA_TUNING.rollMax);
@@ -433,16 +801,18 @@ export class CameraDirector implements ICameraDirector {
 
     const airborne = t.mode === BikeMode.Airborne;
 
-    if (
-      !this.swingActive &&
-      airborne &&
-      this.swingCooldown <= 0 &&
-      t.airTime > CAMERA_TUNING.airSwingMinAirTime &&
-      t.velocity.y > 0.4
-    ) {
+    if (!this.swingActive && airborne && this.swingCooldown <= 0 && this.crashFocus <= 0.01) {
       const rem = estimateAirRemaining(t);
-      // Only commit if there is genuinely time to go out and come back.
-      if (rem > 1.1) this.beginAirSwing(Math.min(rem * 0.85, 2.4));
+      // Big enough to be worth showing, early enough that there is genuinely
+      // time to go out and come back before the wheels touch.
+      if (
+        t.airTime > CAMERA_TUNING.airSwingMinAirTime &&
+        rem > CAMERA_TUNING.airSwingMinRemaining &&
+        t.velocity.y > -1.0 &&
+        Math.max(t.peakAirHeight, t.airHeight) > CAMERA_TUNING.airSwingMinPeak
+      ) {
+        this.beginAirSwing(Math.min(rem * 0.82, 2.4));
+      }
     }
 
     if (!this.swingActive) {
@@ -508,6 +878,10 @@ export class CameraDirector implements ICameraDirector {
       this.prevBoosting = t.boosting;
     }
 
+    // The crash push-in. Narrowing while the boom also shortens reads as the
+    // camera leaning in to look, which is the whole point of the moment.
+    target -= CAMERA_TUNING.crashFocusFov * this.crashFocus;
+
     this.kick = dampHL(this.kick, 0, 0.20, dt);
     target += this.kick;
 
@@ -535,12 +909,20 @@ export class CameraDirector implements ICameraDirector {
       this.mode === CameraMode.Chase &&
       t.mode === BikeMode.Airborne &&
       t.peakAirHeight >= CAMERA_TUNING.slowMoMinPeak &&
-      t.airTime > 0.85 &&
-      Math.abs(t.velocity.y) < 1.8
+      t.airTime > CAMERA_TUNING.slowMoMinAirTime &&
+      // At or just past apex. Detected by the SIGN of the vertical velocity, not
+      // by a stopwatch — the clock version's window was a handful of frames wide
+      // and it missed every single jump in the review set.
+      t.velocity.y < 0.8 &&
+      estimateAirRemaining(t) > CAMERA_TUNING.slowMoMinRemaining
     ) {
-      // Fires at apex (vertical velocity through zero) on a genuinely big jump.
-      this.slowActive = true;
-      this.slowT = 0;
+      this.beginSlowMo(
+        CAMERA_TUNING.slowMoScale,
+        CAMERA_TUNING.slowMoAttack,
+        CAMERA_TUNING.slowMoHold,
+        CAMERA_TUNING.slowMoRelease,
+        CAMERA_TUNING.slowMoCooldown,
+      );
     }
 
     if (!this.slowActive) {
@@ -549,9 +931,9 @@ export class CameraDirector implements ICameraDirector {
     }
 
     this.slowT += realDt;
-    const A = CAMERA_TUNING.slowMoAttack;
-    const H = CAMERA_TUNING.slowMoHold;
-    const R = CAMERA_TUNING.slowMoRelease;
+    const A = this.slowA;
+    const H = this.slowH;
+    const R = this.slowR;
 
     let s: number;
     if (this.slowT < A) s = ease.inOutCubic(this.slowT / A);
@@ -560,16 +942,67 @@ export class CameraDirector implements ICameraDirector {
 
     if (this.slowT >= A + H + R) {
       this.slowActive = false;
-      this.slowCooldown = CAMERA_TUNING.slowMoCooldown;
+      this.slowCooldown = this.slowCool;
       s = 0;
     }
-    this.timeScale = lerp(1, CAMERA_TUNING.slowMoScale, clamp01(s));
+    this.timeScale = lerp(1, this.slowScale, clamp01(s));
+  }
+
+  private beginSlowMo(scale: number, a: number, h: number, r: number, cooldown: number): void {
+    this.slowActive = true;
+    this.slowT = 0;
+    this.slowScale = scale;
+    this.slowA = a;
+    this.slowH = h;
+    this.slowR = r;
+    this.slowCool = cooldown;
   }
 
   /** Force a slow-mo hold. Ignores the trigger conditions but honours nothing else. */
   triggerSlowMo(): void {
-    this.slowActive = true;
-    this.slowT = 0;
+    this.beginSlowMo(
+      CAMERA_TUNING.slowMoScale,
+      CAMERA_TUNING.slowMoAttack,
+      CAMERA_TUNING.slowMoHold,
+      CAMERA_TUNING.slowMoRelease,
+      CAMERA_TUNING.slowMoCooldown,
+    );
+  }
+
+  // ── Crash focus ───────────────────────────────────────────────────────────
+
+  /**
+   * The 2.2s envelope that makes a wreck the best-looking thing in the game.
+   * Driven on REAL time — a crash that triggers slow-mo must not also stretch
+   * its own envelope, or the push-in outlives the moment it is punctuating.
+   */
+  private updateCrashFocus(realDt: number): void {
+    if (this.crashT < 0) {
+      if (this.crashFocus > 1e-4) this.crashFocus = dampHL(this.crashFocus, 0, 0.25, realDt);
+      else this.crashFocus = 0;
+      return;
+    }
+
+    this.crashT += realDt;
+    const A = CAMERA_TUNING.crashFocusAttack;
+    const H = CAMERA_TUNING.crashFocusHold;
+    const R = CAMERA_TUNING.crashFocusRelease;
+
+    let v: number;
+    if (this.crashT < A) v = ease.inOutCubic(this.crashT / A);
+    else if (this.crashT < A + H) v = 1;
+    else v = 1 - ease.inOutCubic((this.crashT - A - H) / R);
+
+    if (this.crashT >= A + H + R) {
+      this.crashT = -1;
+      v = 0;
+    }
+    this.crashFocus = clamp01(v);
+  }
+
+  /** Start the crash push-in by hand. Useful for scripted sequences. */
+  beginCrashFocus(): void {
+    this.crashT = 0;
   }
 
   // ── Shake ─────────────────────────────────────────────────────────────────
@@ -677,7 +1110,21 @@ export class CameraDirector implements ICameraDirector {
     _tmp.y += 0.7;
     this.shakeFrom(_tmp, 0.65 + sev * 0.85, 0.55 + sev * 0.45);
     this.swingActive = false;
-    this.slowActive = false;
+
+    // Push in and hold. A crash used to cancel the slow-mo and add nothing in
+    // its place, which is how a `switchback` capture ended up spending 60% of
+    // its length watching a 20-pixel speck from a wide aerial.
+    this.crashT = 0;
+    if (sev >= CAMERA_TUNING.crashSlowMoMinSeverity) {
+      this.slowActive = false;
+      this.beginSlowMo(
+        CAMERA_TUNING.crashSlowMoScale,
+        CAMERA_TUNING.crashSlowMoAttack,
+        CAMERA_TUNING.crashSlowMoHold,
+        CAMERA_TUNING.crashSlowMoRelease,
+        CAMERA_TUNING.crashSlowMoCooldown,
+      );
+    }
     this.onCrashEvent?.(t, sev);
   }
 
@@ -707,6 +1154,7 @@ export class CameraDirector implements ICameraDirector {
     springStep(this.ly, _lookWanted.y, 5.0, dt);
     springStep(this.lz, _lookWanted.z, 5.0, dt);
     this.lookPos.set(this.lx.value, this.ly.value, this.lz.value);
+    this.boomDesired = this.camPos.distanceTo(this.lookPos);
 
     this.roll = dampHL(this.roll, 0, 0.4, dt);
   }
@@ -745,6 +1193,7 @@ export class CameraDirector implements ICameraDirector {
 
   private updateOrbit(t: BikeState, dt: number): void {
     this.orbitYaw += this.orbitSpin * dt;
+    this.boomDesired = this.orbitDist;
     const cy = Math.cos(this.orbitPitch);
     this.lookPos.copy(t.position);
     this.lookPos.y += 1.1;
@@ -799,6 +1248,8 @@ export class CameraDirector implements ICameraDirector {
     this.lz.value = lookAt.z; this.lz.velocity = 0;
 
     this.collisionLift = 0;
+    this.boomRetract = 0;
+    this.frameBias = 0;
     this.shakeDur = 0;
     this.shakeT = 0;
     this.swingActive = false;
@@ -825,21 +1276,50 @@ export class CameraDirector implements ICameraDirector {
     if (_flatVel.lengthSq() < 1e-6) _flatVel.set(0, 0, 1);
     _flatVel.normalize();
 
+    // Seat the arm at the length this SPEED wants, not at the base length. The
+    // capture harness settles four frames and opens the shutter, so seating at
+    // the resting distance meant every sequence began with the camera 3.4 m out
+    // and spent its first 15 frames expanding — the rider filled 68% of frame
+    // one of `scree-speed` for no reason other than the reset.
+    const s01 = clamp01(target.speed / CAMERA_TUNING.referenceSpeed);
+    const d0 = CAMERA_TUNING.chaseDistance + CAMERA_TUNING.chaseDistanceSpeedGain * s01;
+    const h0 = CAMERA_TUNING.chaseHeight + CAMERA_TUNING.chaseHeightSpeedGain * s01;
     _desired
       .copy(target.position)
-      .addScaledVector(_flatVel, -CAMERA_TUNING.chaseDistance)
-      .addScaledVector(UP, CAMERA_TUNING.chaseHeight);
+      .addScaledVector(_flatVel, -d0)
+      .addScaledVector(UP, h0);
     _lookWanted.copy(target.position);
     _lookWanted.y += 1.05;
     this.snapTo(_desired, _lookWanted);
+
+    // Prime the springs with the subject's velocity. `snapTo` zeroes them,
+    // which is right for a teleport but wrong for a re-seat on a bike already
+    // doing 20 m/s: the feed-forward term puts the target a lead-time ahead
+    // immediately, and a spring starting from rest sprints to catch it and
+    // arrives too close. The capture harness opens its shutter four frames
+    // after the reset, so that transient WAS the first quarter-second of every
+    // sequence — the rider at 52% of frame height on frame one.
+    this.sx.velocity = target.velocity.x;
+    this.sy.velocity = target.velocity.y;
+    this.sz.velocity = target.velocity.z;
+    this.lx.velocity = target.velocity.x;
+    this.ly.velocity = target.velocity.y;
+    this.lz.velocity = target.velocity.z;
+
+    const pv0 = h0 - CAMERA_TUNING.subjectPivotHeight;
+    this.boomDesired = Math.sqrt(d0 * d0 + pv0 * pv0);
+    this.boomLength = this.boomDesired;
     this.subject = target;
     this.prevAirborne = target.mode === BikeMode.Airborne;
     this.prevCrashing = target.mode === BikeMode.Crashing;
     this.timeScale = 1;
     this.slowActive = false;
+    this.crashT = -1;
+    this.crashFocus = 0;
     this.kick = 0;
     this.fovS.value = this.fovBase;
     this.fovS.velocity = 0;
+    this.clearNearFade();
   }
 
   // ── Replay ────────────────────────────────────────────────────────────────
@@ -902,6 +1382,8 @@ export class CameraDirector implements ICameraDirector {
       this.replayPosition.y + height,
       this.replayPosition.z + Math.cos(yaw) * cy * dist,
     );
+    const rpv = height - CAMERA_TUNING.subjectPivotHeight;
+    this.boomDesired = Math.sqrt(dist * dist + rpv * rpv);
 
     springStepDamped(this.sx, _desired.x, 5.0, 1.0, dt);
     springStepDamped(this.sy, _desired.y, 5.0, 1.0, dt);
@@ -970,63 +1452,446 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Compose ───────────────────────────────────────────────────────────────
 
-  private compose(dt: number): void {
+  private compose(subject: BikeState, dt: number): void {
+    // Modes that hang off a moving subject and therefore get the full boom
+    // solve. Orbit and Cinematic are HAND-FRAMED — `summit-wide` is a
+    // deliberate 52 m crane and `valley-vista` a 180 m establishing shot, and
+    // shortening those to clear a ridge would destroy the shot the author
+    // asked for. They get the floors, not the arm.
+    const boomed = this.mode === CameraMode.Chase || this.mode === CameraMode.Replay;
+    const tracking =
+      boomed || this.mode === CameraMode.Orbit || this.mode === CameraMode.Cinematic;
+
+    // The pivot the boom hangs from. In Chase that is the rider's chest; in the
+    // framed modes it is whatever the shot is looking at.
+    if (this.mode === CameraMode.Chase) {
+      _pivot.copy(subject.position);
+      _pivot.y += CAMERA_TUNING.subjectPivotHeight;
+    } else if (this.mode === CameraMode.Replay) {
+      _pivot.copy(this.replayPosition);
+      _pivot.y += CAMERA_TUNING.subjectPivotHeight;
+    } else {
+      _pivot.copy(this.lookPos);
+    }
+
+    if (tracking) {
+      // Solve the arm BEFORE the shake, so the shake is a lens wobble on top of
+      // a valid shot rather than an input to the collision solver.
+      this.resolveBoom(this.camPos, _pivot, boomed, dt);
+      // Adopt the solved position into the springs. Without the write-back the
+      // springs keep integrating toward a place the solver will not allow, and
+      // the discrepancy is released as a pop the moment the constraint clears.
+      // Only the ARM is written back — the vertical escape stays a transient
+      // offset with its own release, so it never becomes permanent altitude.
+      if (boomed) {
+        this.sx.value = this.camPos.x;
+        this.sy.value = this.camPos.y;
+        this.sz.value = this.camPos.z;
+      }
+    }
+
     this.applyShake(dt);
 
     _camFinal.copy(this.camPos).add(this.shakeOffset);
+    if (tracking) _camFinal.y += this.collisionLift;
     _lookFinal.copy(this.lookPos);
+    if (tracking) _lookFinal.y += this.frameBias;
 
-    this.resolveCollision(_camFinal, _lookFinal, dt);
+    // Final unconditional floor, including the shake: whatever else happened,
+    // the camera is not inside the hillside.
+    if (this.terrain && this.mode !== CameraMode.Free && this.mode !== CameraMode.Fixed) {
+      const h = this.terrain.heightAt(_camFinal.x, _camFinal.z) + CAMERA_TUNING.terrainMargin;
+      if (_camFinal.y < h) _camFinal.y = h;
+    }
+
+    // The hard leash. That last floor is the one constraint that can still run
+    // away: if the subject ends up BELOW the ground under the camera — a rider
+    // falling into the ravine — the floor holds the camera on the lip while the
+    // rider drops, and the arm silently grows without limit. Past this bound,
+    // keeping the subject wins and the camera is allowed to graze the hillside.
+    // A frame with a 0-pixel subject is a failure; a frame with a slightly
+    // clipped foreground is a compromise.
+    if (tracking) {
+      _tmp.copy(_camFinal).sub(_pivot);
+      const L = _tmp.length();
+      const hardMax =
+        this.boomDesired + CAMERA_TUNING.boomMaxSlack + CAMERA_TUNING.liftMax;
+      if (L > hardMax && L > 1e-4) {
+        _camFinal.copy(_pivot).addScaledVector(_tmp.divideScalar(L), hardMax);
+      }
+    }
 
     this.camera.position.copy(_camFinal);
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(_lookFinal);
+    this.camera.updateMatrixWorld();
+
+    // Measure the composition on the un-rolled camera — roll is a stylistic
+    // tilt and has no business feeding the framing loop.
+    if (tracking) this.updateFraming(subject, dt);
 
     const roll = this.roll + this.shakeRoll;
-    if (Math.abs(roll) > 1e-5) this.camera.rotateZ(roll);
-    this.camera.updateMatrixWorld();
+    if (Math.abs(roll) > 1e-5) {
+      this.camera.rotateZ(roll);
+      this.camera.updateMatrixWorld();
+    }
+
+    this.updateNearFade(_camFinal, dt);
   }
 
   /**
-   * Keep the camera out of the hillside.
+   * The boom. Treats the camera as a rigid arm pivoting on the subject and
+   * solves for the longest length that is legal, then damps toward it.
    *
-   * Sampled along the segment from the look point to the camera rather than at
-   * the camera alone, because the failure that actually happens is a ridge
-   * BETWEEN the two — the camera is over open air, the rider is fine, and the
-   * shot is a wall of rock. Lifting the camera end by L raises the segment at
-   * parameter s by L*s, so the lift a violation at s demands is its depth over
-   * s; taking the max over the samples solves all of them at once.
+   * It can only ever SHORTEN. That is the whole design: a camera that answers an
+   * obstruction by climbing loses the subject, and the previous implementation
+   * did exactly that — it solved the vertical lift a violation at parameter `s`
+   * required as `depth / s`, so a ridge 20% of the way along the arm demanded
+   * five times its own depth in altitude. Measured on the review set, that put
+   * the camera 12 m above the rider on `switchback` and 32 m above on
+   * `tabletop-air`, reducing the subject to 8 and 39 pixels respectively.
+   *
+   * Constraints, in the order they are applied:
+   *   1. The LEASH — no further from the pivot than the spring solution asked
+   *      for plus `boomMaxSlack`.
+   *   2. OTHER RIDERS on the arm — park in front of them, never behind.
+   *   3. TERRAIN along the arm, with the clearance margin ramped so the ground
+   *      the rider is standing on is not mistaken for an occluder.
+   *   4. The FLOOR — `boomMin`, below which the camera would be inside the body.
+   *   5. What shortening could not fix becomes a bounded vertical escape.
    */
-  private resolveCollision(cam: Vector3, look: Vector3, dt: number): void {
-    if (!this.terrain) return;
-
-    let need = 0;
-    const N = CAMERA_TUNING.collisionSamples;
-    for (let i = 1; i <= N; i++) {
-      const s = i / N;
-      const px = look.x + (cam.x - look.x) * s;
-      const pz = look.z + (cam.z - look.z) * s;
-      const py = look.y + (cam.y - look.y) * s;
-      const h = this.terrain.heightAt(px, pz);
-      const want = h + CAMERA_TUNING.collisionMargin;
-      if (py < want) need = Math.max(need, (want - py) / s);
+  private resolveBoom(cam: Vector3, pivot: Vector3, boomed: boolean, dt: number): void {
+    if (boomed) {
+      // Two passes. The first clamps the arm; the floor may then push the
+      // camera end up out of the ground, which tilts the arm, so the second
+      // pass re-clamps along the new direction. Without the second pass a rider
+      // dropping over a cliff edge leaves the camera pinned on the plateau and
+      // the arm silently exceeds its leash — which is how `tabletop-air` ended
+      // with the subject 17 m away and 15 px tall even after the arm was added.
+      // Floor FIRST. On a steep descent the resting camera position is below
+      // the slope behind the rider — that is simple geometry, not a collision —
+      // and sweeping the arm before lifting it out of the hill made the sweep
+      // report a blockage on every single frame of a descent. Lifting first
+      // points the arm up the fall line, which is where it belongs, and the
+      // sweep then only fires on something genuinely in the way.
+      this.floorCamera(cam);
+      this.clampArm(cam, pivot, dt);
+      this.floorCamera(cam);
+      this.reclampArm(cam, pivot);
+    } else {
+      _boomDir.copy(cam).sub(pivot);
+      this.boomLength = _boomDir.length();
     }
 
-    // Asymmetric. Push out in about two frames — a camera inside a hillside is
-    // a hard failure and there is no elegant version of it. Come back over a
-    // third of a second, because a camera that drops the instant a ridge clears
-    // is a visible pop and the eye catches it every time.
+    // Vertical escape for what shortening could not fix — the camera end
+    // sitting in rising ground, or a rider passing directly under the lens.
+    // Bounded by `liftMax`, and asymmetric: out fast, back slowly. This is the
+    // ONLY vertical response in the file and it is a clamp, not the old
+    // `depth / s` amplification that sent the camera 32 m into the sky.
+    let need = 0;
+    if (this.terrain) {
+      const h = this.terrain.heightAt(cam.x, cam.z) + CAMERA_TUNING.terrainMargin;
+      if (cam.y < h) need = h - cam.y;
+    }
+    const clear = CAMERA_TUNING.occluderLiftRadius;
+    const rad = CAMERA_TUNING.occluderRadius;
+    const len = Math.max(this.boomLength, 1e-3);
+    for (let i = 0; i < this.occCount; i++) {
+      const o = _occPos[i];
+      const dx = o.x - cam.x;
+      const dz = o.z - cam.z;
+      const r2 = dx * dx + dz * dz;
+      const topY = o.y + CAMERA_TUNING.riderTop + 0.35;
+
+      // (a) At the lens. Rise over the intruder rather than through them,
+      //     faded by range so a rider drifting in does not step the camera up.
+      if (r2 <= clear * clear) {
+        const w = 1 - smoothstep(clear * 0.6, clear, Math.sqrt(r2));
+        if (cam.y < topY) need = Math.max(need, (topY - cam.y) * w);
+      }
+
+      // (b) On the arm, between the camera and the subject. Rising over them is
+      //     the composition-correct answer — it looks OVER the intruder at the
+      //     subject, where ducking in front only makes the subject enormous.
+      //     Raising the camera end by L raises the arm at fraction s by L·s, so
+      //     the demand is depth/s; unlike the old collision solver that ratio is
+      //     floored at 0.45 and the whole result is capped at `liftMax`.
+      const wx = o.x - pivot.x;
+      const wy = o.y + CAMERA_TUNING.riderTop * 0.5 - pivot.y;
+      const wz = o.z - pivot.z;
+      const along = wx * _boomDir.x + wy * _boomDir.y + wz * _boomDir.z;
+      if (along <= 0.6 || along >= len) continue;
+      const perp2 = wx * wx + wy * wy + wz * wz - along * along;
+      if (perp2 > rad * rad) continue;
+      const s = Math.max(along / len, 0.45);
+      _probe.copy(pivot).addScaledVector(_boomDir, along);
+      const depth = topY - _probe.y;
+      if (depth <= 0) continue;
+      const w = 1 - smoothstep(rad * 0.5, rad, Math.sqrt(Math.max(0, perp2)));
+      need = Math.max(need, (depth / s) * w);
+    }
+    need = Math.min(need, CAMERA_TUNING.liftMax);
+
     this.collisionLift =
       need > this.collisionLift
-        ? dampHL(this.collisionLift, need, 0.030, dt)
-        : dampHL(this.collisionLift, need, 0.30, dt);
+        ? dampHL(this.collisionLift, need, CAMERA_TUNING.liftAttackHL, dt)
+        : dampHL(this.collisionLift, need, CAMERA_TUNING.liftReleaseHL, dt);
+  }
 
-    if (this.collisionLift > 1e-4) cam.y += this.collisionLift;
+  /** Raise a point clear of the hillside. No amplification, no state. */
+  private floorCamera(cam: Vector3): void {
+    if (!this.terrain) return;
+    const h = this.terrain.heightAt(cam.x, cam.z) + CAMERA_TUNING.terrainMargin;
+    if (cam.y < h) cam.y = h;
+  }
+
+  /**
+   * Second pass. The floor may have pushed the camera end up, lengthening the
+   * arm past what the first pass allowed; re-seat it at the solved length along
+   * the NEW, tilted direction. That tilt is the desirable part — as the rider
+   * drops over an edge the arm rotates toward vertical and the camera follows
+   * him down over the void instead of staying pinned on the plateau watching
+   * him shrink.
+   */
+  private reclampArm(cam: Vector3, pivot: Vector3): void {
+    _boomDir.copy(cam).sub(pivot);
+    const len = _boomDir.length();
+    if (len < 1e-4 || len <= this.boomLength) return;
+    _boomDir.divideScalar(len);
+    this.limitBoomRise();
+    cam.copy(pivot).addScaledVector(_boomDir, this.boomLength);
+  }
+
+  /**
+   * Keep the arm off the vertical. Operates on the unit `_boomDir` in place:
+   * when the subject drops away below the camera the arm rotates toward
+   * straight-down, and a plan view of a helmet is not a shot. Tilting it back
+   * to a steep three-quarter keeps the mountain, the fall line and the rider
+   * all in the same frame.
+   */
+  private limitBoomRise(): void {
+    const maxY = CAMERA_TUNING.boomMaxRise;
+    if (_boomDir.y <= maxY) return;
+    const wantH = Math.sqrt(Math.max(1e-6, 1 - maxY * maxY));
+    const h = Math.sqrt(_boomDir.x * _boomDir.x + _boomDir.z * _boomDir.z);
+    if (h > 1e-4) {
+      const k = wantH / h;
+      _boomDir.x *= k;
+      _boomDir.z *= k;
+    } else {
+      // Perfectly overhead — there is no horizontal direction to preserve, so
+      // fall back to the chase heading and put the camera behind the rider.
+      _boomDir.x = -Math.sin(this.aimYaw) * wantH;
+      _boomDir.z = -Math.cos(this.aimYaw) * wantH;
+    }
+    _boomDir.y = maxY;
+  }
+
+  /** The arm constraint: leash, riders, terrain, floor — then damp the result. */
+  private clampArm(cam: Vector3, pivot: Vector3, dt: number): void {
+    _boomDir.copy(cam).sub(pivot);
+    let len = _boomDir.length();
+    if (len < 1e-4) {
+      // Degenerate: the solver has nothing to work with. Re-establish an arm
+      // pointing backwards and up rather than dividing by zero.
+      _boomDir.set(0, 0.45, 1).normalize();
+      len = CAMERA_TUNING.boomMin;
+    } else {
+      _boomDir.divideScalar(len);
+    }
+    this.limitBoomRise();
+
+    // 1. Leash, measured against what the shot asked for. The under-damped
+    //    spring's steady-state lag scales with speed — 4.3 m at 19 m/s, 10.3 m
+    //    at 47 m/s — so without this the camera is a different distance away at
+    //    every speed, and a crash that dumps the speed strands it at the far end.
+    let allowed = Math.min(len, this.boomDesired + CAMERA_TUNING.boomMaxSlack);
+
+    // 2. Other riders on the arm. Weighted continuously by how far inside the
+    //    body cylinder they are and faded out at both ends, because a hard
+    //    in/out test on a rider crossing the arm steps the target by a metre in
+    //    one frame and the damper turns that into a visible lurch.
+    const rad = CAMERA_TUNING.occluderRadius;
+    let occAllowed = allowed;
+    for (let i = 0; i < this.occCount; i++) {
+      const o = _occPos[i];
+      const wx = o.x - pivot.x;
+      const wy = o.y + CAMERA_TUNING.riderTop * 0.5 - pivot.y;
+      const wz = o.z - pivot.z;
+      const along = wx * _boomDir.x + wy * _boomDir.y + wz * _boomDir.z;
+      if (along <= 0.4 || along >= len + 0.9) continue;
+      const perp = Math.sqrt(Math.max(0, wx * wx + wy * wy + wz * wz - along * along));
+      if (perp > rad) continue;
+      let w = 1 - smoothstep(rad * 0.5, rad, perp);
+      w *= smoothstep(0.4, 1.3, along);
+      w *= 1 - smoothstep(len - 0.1, len + 0.9, along);
+      if (w <= 1e-3) continue;
+      const stop = occAllowed + (along - CAMERA_TUNING.occluderClearance - occAllowed) * w;
+      if (stop < occAllowed) occAllowed = stop;
+    }
+    // The occluder rule is a safety rule, not a composition rule — floor it.
+    const occFloor = Math.max(
+      CAMERA_TUNING.boomMin,
+      this.boomDesired * CAMERA_TUNING.occluderBoomFloor,
+    );
+    if (occAllowed < allowed) allowed = Math.max(occAllowed, occFloor);
+
+    // 3. Terrain sweep. Sampled from `boomClearFrom` outward with a clearance
+    //    that ramps to the full margin at the camera end — it has to ramp,
+    //    because near the pivot the "obstruction" is the ground the rider is
+    //    riding on and a uniform margin makes every descent read as a collision.
+    if (this.terrain) {
+      const N = CAMERA_TUNING.boomSamples;
+      const from = CAMERA_TUNING.boomClearFrom;
+      for (let i = 0; i < N; i++) {
+        const s = from + ((1 - from) * (i + 1)) / N;
+        const d = allowed * s;
+        _probe.copy(pivot).addScaledVector(_boomDir, d);
+        const margin = lerp(CAMERA_TUNING.boomClearNear, CAMERA_TUNING.boomClearFar, s);
+        const h = this.terrain.heightAt(_probe.x, _probe.z) + margin;
+        if (h - _probe.y > CAMERA_TUNING.boomDeadband) {
+          const stop = d - CAMERA_TUNING.boomBackoff;
+          if (stop < allowed) allowed = stop;
+          break;
+        }
+      }
+    }
+
+    // 4. The floor. Below this the camera is inside the rider.
+    const floored = Math.max(allowed, CAMERA_TUNING.boomMin);
+
+    // Damp the RETRACTION, not the length: the length itself already carries
+    // the spring's whip and smoothing it again would flatten the ride.
+    const intrusion = Math.max(0, len - floored);
+    this.boomRetract =
+      intrusion > this.boomRetract
+        ? dampHL(this.boomRetract, intrusion, CAMERA_TUNING.boomShortenHL, dt)
+        : dampHL(this.boomRetract, intrusion, CAMERA_TUNING.boomRecoverHL, dt);
+
+    const finalLen = Math.max(len - this.boomRetract, CAMERA_TUNING.boomMin);
+    this.boomLength = finalLen;
+    cam.copy(pivot).addScaledVector(_boomDir, finalLen);
+  }
+
+  /**
+   * Safe-area composition.
+   *
+   * The HUD owns roughly the top 20% and the bottom 12% of the frame. A subject
+   * composed at the geometric centre of the raster is fine; a subject that has
+   * drifted into the boost bar is not framed at all, and `tabletop-air` used to
+   * put the rider on the very bottom edge with the bar across his wheels.
+   *
+   * Measures where the subject's silhouette actually landed on screen this frame
+   * and biases the LOOK POINT (never the camera position, which would fight the
+   * boom solver) until the silhouette sits inside the band. Closed loop, damped,
+   * clamped, and it relaxes back to neutral once the shot is comfortable.
+   */
+  private updateFraming(subject: BikeState, dt: number): void {
+    const src = this.mode === CameraMode.Replay ? this.replayPosition : subject.position;
+    const tanHalf = Math.tan(this.camera.fov * DEG * 0.5);
+    if (tanHalf < 1e-4) return;
+
+    // View space, straight off the camera's inverse world matrix. Doing the
+    // maths here rather than calling Vector3.project keeps roll and the
+    // projection matrix's near/far terms out of a purely vertical question.
+    _view.set(src.x, src.y + CAMERA_TUNING.riderTop, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    if (_view.z > -0.25) return; // behind, or on, the lens — nothing to frame
+    const depth = -_view.z;
+    const fracTop = 0.5 - (_view.y / (depth * tanHalf)) * 0.5;
+
+    _view.set(src.x, src.y - 0.48, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    if (_view.z > -0.25) return;
+    const fracBot = 0.5 - (_view.y / (-_view.z * tanHalf)) * 0.5;
+
+    const top = CAMERA_TUNING.safeTop;
+    const bottom = CAMERA_TUNING.safeBottom;
+    const pad = CAMERA_TUNING.safeInnerPad;
+
+    // Screen error, in frame fractions. Positive means the subject must move UP
+    // the frame, which means the look point must move DOWN.
+    let err = 0;
+    let comfortable: boolean;
+    if (fracBot - fracTop >= bottom - top) {
+      // The subject is taller than the safe band — a close crash push-in, or a
+      // near-miss with another rider. There is no way to satisfy both edges, so
+      // stop trying: centre the silhouette on the band. Alternating between the
+      // two unsatisfiable edges is what threw the subject from the bottom of
+      // the frame to the top and back within a few frames.
+      err = (fracTop + fracBot) * 0.5 - (top + bottom) * 0.5;
+      if (Math.abs(err) < 0.02) err = 0;
+      comfortable = err === 0;
+    } else {
+      if (fracBot > bottom) err = fracBot - bottom;
+      else if (fracTop < top) err = fracTop - top;
+      comfortable = fracBot < bottom - pad && fracTop > top + pad;
+    }
+
+    let target: number;
+    if (err !== 0) {
+      // One frame fraction is `2·depth·tan(fov/2)` metres at the subject.
+      target = clamp(
+        this.frameBias - err * 2 * depth * tanHalf * CAMERA_TUNING.frameBiasGain,
+        -CAMERA_TUNING.frameBiasMax,
+        CAMERA_TUNING.frameBiasMax,
+      );
+    } else if (comfortable) {
+      target = 0;
+    } else {
+      target = this.frameBias; // inside the band but near an edge: hold.
+    }
+
+    this.frameBias = dampHL(
+      this.frameBias,
+      target,
+      err !== 0 ? CAMERA_TUNING.frameBiasCorrectHL : CAMERA_TUNING.frameBiasRelaxHL,
+      dt,
+    );
+  }
+
+  /**
+   * Near-plane treatment for other riders.
+   *
+   * The boom solver keeps opponents off the arm, but a rider overtaking beside
+   * the camera can still arrive at the lens. `userData.nearFade` (0 = normal,
+   * 1 = gone) is published for the visual layer to consume as a stipple dither;
+   * see the note in the class docs about wiring it. Until something consumes it,
+   * the only hard action taken is hiding a body that is literally inside the
+   * near plane, where no treatment would be visible anyway.
+   */
+  private updateNearFade(cam: Vector3, _dt: number): void {
+    const start = CAMERA_TUNING.nearFadeStart;
+    const full = CAMERA_TUNING.nearFadeFull;
+    for (let i = 0; i < this.occCount; i++) {
+      const node = this.occNodes[i];
+      if (!node) continue;
+      const o = _occPos[i];
+      const dx = o.x - cam.x;
+      const dy = o.y + CAMERA_TUNING.riderTop * 0.5 - cam.y;
+      const dz = o.z - cam.z;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const fade = 1 - smoothstep(full, start, d);
+      node.userData.nearFade = fade;
+      const visible = fade < 0.999;
+      if (node.visible !== visible) node.visible = visible;
+    }
+  }
+
+  private clearNearFade(): void {
+    for (let i = 0; i < this.discovered.length; i++) {
+      const n = this.discovered[i];
+      n.userData.nearFade = 0;
+      n.visible = true;
+    }
   }
 
   dispose(): void {
+    this.clearNearFade();
     this.replaySource = null;
     this.subject = null;
+    this.occluders = null;
+    this.occCount = 0;
+    this.discovered.length = 0;
+    this.discoveredBodies.length = 0;
     this.onLandingEvent = null;
     this.onCrashEvent = null;
   }

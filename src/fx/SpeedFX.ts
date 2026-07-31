@@ -103,9 +103,24 @@ export const SPEED_TUNING = {
   focusBox: { x0: 0.20, x1: 0.80, y0: 0.26, y1: 0.78 },
   /** Seconds of hold after a smear() request before it starts fading. */
   smearHold: 0.22,
-  /** Wheel spin (rad/s) at which the spin smear starts and saturates. */
-  spinStart: 26,
-  spinFull: 88,
+  /**
+   * Wheel spin (rad/s) at which the spin smear starts and saturates.
+   *
+   * These were 26 and 88, which is not a speed range this bike ever visits.
+   * 88 rad/s on a 0.33 m wheel is 105 km/h; the course is ridden at 30-80, so
+   * the effect never rose above a third and the tyre knobs stayed individually
+   * countable at 49 km/h — a 26" wheel turning 39 DEGREES between one rendered
+   * frame and the next. A knob at the rim travels 0.22 m of arc in that frame,
+   * tens of times its own width; there is no exposure, real or drawn, in which
+   * it resolves.
+   *
+   * The honest thresholds come straight from that arithmetic. 14 rad/s is
+   * ~17 km/h, where a knob first moves further than its own width per frame
+   * and the pattern starts to break up. 45 rad/s is ~53 km/h, by which point
+   * it is unambiguously a solid disc.
+   */
+  spinStart: 14,
+  spinFull: 45,
   /** Metres of tail per (m/s) of local vertex speed. */
   smearMetresPerSpeed: 0.020,
   smearMaxLength: 0.55,
@@ -129,6 +144,8 @@ const SMEAR_VERT = /* glsl */ `
   uniform float uAmount;     // 0..1 master
 
   out float vTrail;
+  /** How far this vertex actually moved, as a fraction of uMaxLength. */
+  out float vStretch;
 
   void main() {
     vec3 localPos = position;
@@ -146,6 +163,7 @@ const SMEAR_VERT = /* glsl */ `
     float len = min(speed * uMetresPerSpeed, uMaxLength) * uAmount;
 
     vTrail = 0.0;
+    vStretch = 0.0;
     if (len > 1e-4 && speed > 1e-4) {
       vec3 tdir = vel / speed;
       // Only the TRAILING half of the surface is extruded. Faces looking into
@@ -157,8 +175,14 @@ const SMEAR_VERT = /* glsl */ `
       // Squared so the tail concentrates behind the shape instead of smearing
       // the whole silhouette sideways.
       float t = trail * trail;
-      wpos -= tdir * (len * t);
+      float stretch = len * t;
+      wpos -= tdir * stretch;
       vTrail = t;
+      // The DISTANCE this vertex travelled, not just which way it faces. A
+      // vertex that did not move must contribute nothing, or the duplicate mesh
+      // sits exactly on top of the source and lays a flat translucent wash over
+      // the whole figure — which is what dissolved the rider into a pale ghost.
+      vStretch = stretch / max(uMaxLength, 1e-4);
     }
 
     gl_Position = projectionMatrix * viewMatrix * vec4(wpos, 1.0);
@@ -176,15 +200,27 @@ const SMEAR_FRAG = /* glsl */ `
   uniform float uOpacity;
 
   in float vTrail;
+  in float vStretch;
 
   void main() {
     // Kill the un-extruded shell entirely.
     float shape = smoothstep(0.10, 0.42, vTrail);
+
+    // Gate on how far the vertex actually MOVED. Facing away from travel is not
+    // enough on its own: the whole trailing half of a nearly-stationary mesh
+    // passes that test, so the clone was drawn over the body at full strength.
+    shape *= smoothstep(0.04, 0.40, vStretch);
+
     // ...and thin the very tip so the streak tapers instead of ending in a wall.
     float a = uOpacity * shape * (1.0 - vTrail * 0.42);
+
     // Three hard opacity levels. A smoothly fading ghost is a photographic
     // signal; a streak drawn at two or three flat values is an animated one.
-    a = ceil(clamp(a, 0.0, 1.0) * 3.0) / 3.0;
+    //
+    // ROUNDED, not ceiled. ceil() promotes every surviving fragment to at least
+    // 1/3 — so an alpha of 0.02 was drawn at 0.333, and the quantiser that was
+    // supposed to make the streak graphic was instead multiplying it by 16x.
+    a = floor(clamp(a, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
     if (a <= 0.001) discard;
 
     vec3 col = mix(uColorNear, uColorFar, vTrail);
@@ -623,7 +659,11 @@ export class SpeedFX {
     // across the screen than the whole bike moves down the hill.
     if (state) {
       const spin = this.omega.length();
-      const fromSpeed = clamp01((state.speed - 19) / 9) * 0.75;
+      // Onset at 15 m/s (54 km/h) rather than 19 (68 km/h). The old floor sat
+      // above almost every speed the course is actually ridden at, so the
+      // geometry smear — the one that streaks a limb during a trick — was
+      // effectively dead code outside a full-tuck sprint.
+      const fromSpeed = clamp01((state.speed - 15) / 9) * 0.68;
       const fromSpin = clamp01((spin - 4.2) / 6.5) * 0.9;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {

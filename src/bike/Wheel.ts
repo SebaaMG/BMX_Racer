@@ -208,6 +208,26 @@ export interface WheelConfig {
   compressionDampScale: number;
   /** Rebound damping multiplier — and returns under control. */
   reboundDampScale: number;
+  /**
+   * Hard ceiling on the normal force, newtons.
+   *
+   * This is not a safety clamp, it is a tuning parameter, and it is the single
+   * number that decides whether the bike pogos. The old ceiling was
+   * `stiffness * travel * 3.4` = 14.1 kN on the fork — 7.7 times the whole
+   * bike's weight, delivered for several consecutive 120 Hz steps, which is
+   * 1.3 m/s of upward velocity PER STEP. Every bottom-out fired the bike a
+   * clear half-metre into the air and it landed hard enough to bottom out
+   * again. Capping the force and letting the residual penetration be resolved
+   * inelastically (BikePhysics.applyNormalForce) turns a bottom-out from a
+   * catapult into what it should be: a thud.
+   */
+  maxForce: number;
+  /**
+   * Half-length of the tyre's contact envelope, metres. The ground query takes
+   * the HIGHEST of three samples spanning ±this along the rolling direction.
+   * See `sampleEnveloped`.
+   */
+  envelope: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,9 +246,59 @@ const _left = new Vector3();
 const _tmp = new Vector3();
 const _tmp2 = new Vector3();
 const _q = new Quaternion();
+const _roll = new Vector3();
+const _envN = new Vector3();
 
 /** Surfaces steeper than this are walls, not ground — the suspension ignores them. */
 const MAX_SUSPENSION_TILT_COS = Math.cos(1.08); // 62°
+
+/**
+ * Tyre enveloping.
+ *
+ * A 26" wheel is 534 mm across. It physically cannot fall into a 300 mm notch —
+ * the carcass bridges it and rides on the two lips. Querying the heightfield at
+ * a single point pretends otherwise, and on a 2 m-per-sample heightfield that
+ * turns every interpolation ripple into a suspension input the fork then has to
+ * answer with kilonewtons.
+ *
+ * So the ground under a wheel is the HIGHEST of three samples spanning the
+ * contact patch along the rolling direction, with the normal averaged across
+ * all three. This is the standard enveloping model from vehicle dynamics and it
+ * is the cheapest large improvement available here: it removes the entire class
+ * of sub-wheel-diameter inputs before the spring ever sees them, without
+ * smoothing anything the rider is supposed to feel.
+ *
+ * The SURFACE always comes from the centre sample, so grip and dust colour do
+ * not flicker as the envelope crosses a material boundary.
+ */
+function sampleEnveloped(
+  terrain: BikeTerrain,
+  x: number,
+  z: number,
+  rollX: number,
+  rollZ: number,
+  half: number,
+  out: TerrainSample,
+  outNormal: Vector3,
+): number {
+  const s = terrain.sampleAt(x, z, out);
+  let h = s.height;
+  outNormal.copy(s.normal);
+  // The centre sample owns `out` (and therefore the surface); the two flanking
+  // samples are height+normal only, taken through normalAt/heightAt so nothing
+  // overwrites it.
+  for (let i = -1; i <= 1; i += 2) {
+    const px = x + rollX * half * i;
+    const pz = z + rollZ * half * i;
+    const ph = terrain.heightAt(px, pz);
+    if (ph > h) h = ph;
+    terrain.normalAt(px, pz, _tmp2);
+    outNormal.add(_tmp2);
+  }
+  if (outNormal.lengthSq() < 1e-8) outNormal.set(0, 1, 0);
+  else outNormal.normalize();
+  return h;
+}
 
 export interface SuspendResult {
   /** Normal force magnitude, newtons. Zero when airborne. */
@@ -350,6 +420,13 @@ export class Wheel implements WheelState {
     _down.copy(_up).negate();
     this.mountWorld(origin, quat, _mount);
 
+    // Rolling direction, flattened into the horizontal plane — the axis the
+    // contact envelope is measured along.
+    _roll.set(-Math.sin(this.steer), 0, Math.cos(this.steer)).applyQuaternion(quat);
+    _roll.y = 0;
+    if (_roll.lengthSq() < 1e-8) _roll.set(0, 0, 1);
+    else _roll.normalize();
+
     // Two-pass ground query. The first pass samples straight below the mount,
     // which is wrong by up to `t * sin(slope)` on a steep face; the second pass
     // samples under the resulting contact point and converges.
@@ -359,10 +436,11 @@ export class Wheel implements WheelState {
     _probe.copy(_mount);
 
     for (let pass = 0; pass < 2; pass++) {
-      const s = terrain.sampleAt(_probe.x, _probe.z, this.sample);
-      _n.copy(s.normal);
-      if (_n.lengthSq() < 1e-8) _n.set(0, 1, 0);
-      else _n.normalize();
+      const height = sampleEnveloped(
+        terrain, _probe.x, _probe.z, _roll.x, _roll.z, cfg.envelope, this.sample, _envN,
+      );
+      const s = this.sample;
+      _n.copy(_envN);
 
       // Treat anything steeper than 62° as a wall. Suspension against a wall
       // launches the bike sideways; walls are handled as impacts instead.
@@ -371,7 +449,7 @@ export class Wheel implements WheelState {
         _n.normalize();
       }
 
-      _planePt.set(_probe.x, s.height, _probe.z);
+      _planePt.set(_probe.x, height, _probe.z);
       const denom = _down.dot(_n);
       if (denom > -0.2) {
         hit = false;
@@ -392,7 +470,7 @@ export class Wheel implements WheelState {
       // damping — that visible droop is what sells a jump.
       this.grounded = false;
       const target = cfg.travel;
-      const rate = 2.9; // m/s of topping-out extension
+      const rate = 4.4; // m/s of topping-out extension
       this.suspensionLength = Math.min(target, this.suspensionLength + rate * dt);
       this.compression = 1 - this.suspensionLength / cfg.travel;
       this.compressionVelocity = (this.compression - this.prevCompression) / dt;
@@ -436,30 +514,38 @@ export class Wheel implements WheelState {
     const disp = cfg.travel - len; // metres of compression
     const harsh = this.surface.harshness;
     // Rock is harsh: less damping means the hit comes through. Loam is forgiving.
-    const dampScale = 0.72 + harsh * 0.34;
+    // Deliberately milder than it looks — this rides on top of an already-tuned
+    // damping ratio, so a ±30% swing here is a ±30% swing in zeta.
+    const dampScale = 0.88 + harsh * 0.14;
     const dampCoeff =
       cfg.damping *
       dampScale *
       (compressRate > 0 ? cfg.compressionDampScale : cfg.reboundDampScale);
 
-    let force = cfg.stiffness * disp + dampCoeff * compressRate;
-
-    // Bottom-out: a progressive bumper over the last 12% of travel, plus a hard
-    // extra damper. Without this a big landing punches straight through the
-    // travel and the fork reads as a rigid stick at exactly the moment the
-    // player is looking at it.
-    const bumpStart = cfg.travel * 0.88;
-    if (disp > bumpStart) {
-      const over = disp - bumpStart;
-      force += cfg.stiffness * 9.0 * over * over / Math.max(cfg.travel - bumpStart, 1e-4);
-      if (compressRate > 0.35) {
-        force += dampCoeff * 2.4 * compressRate;
-        this.bottomedThisStep = true;
-      }
+    // Progressive spring over the last third of the travel rather than a nearly
+    // linear rate with a wall at 88%. A rising rate is what a real air spring
+    // does and it is also the numerically kind version: the force ramps over
+    // 40 mm instead of appearing over 15, so the integrator never sees a step.
+    const prog = cfg.travel * 0.66;
+    let spring = cfg.stiffness * disp;
+    if (disp > prog) {
+      const over = (disp - prog) / (cfg.travel - prog); // 0..1
+      spring += cfg.stiffness * cfg.travel * 2.2 * over * over * over;
     }
 
-    // Never pull the bike down; never explode.
-    force = clamp(force, 0, cfg.stiffness * cfg.travel * 3.4);
+    let force = spring + dampCoeff * compressRate;
+
+    // Bottom-out. Flagged for FX/audio, and given extra damping rather than
+    // extra spring, because spring energy at bottom-out is exactly the energy
+    // that comes back out and throws the bike.
+    if (disp > cfg.travel * 0.93 && compressRate > 0.3) {
+      force += dampCoeff * 1.6 * compressRate;
+      this.bottomedThisStep = true;
+    }
+
+    // Never pull the bike down; never explode. See WheelConfig.maxForce — this
+    // ceiling is a feel parameter, not a guard rail.
+    force = clamp(force, 0, cfg.maxForce);
     this.load = force;
     out.force = force;
     return out;

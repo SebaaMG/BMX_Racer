@@ -29,13 +29,31 @@
  *
  *  4. THE PUMP IS A TIMING WINDOW. Crouching stores charge; releasing spends it
  *     as an impulse along the contact normal. If the release lands within
- *     PUMP_WINDOW of leaving the ground, the stored charge is also added to the
- *     vertical velocity directly. That double payoff is deliberate — it is what
- *     makes a well-timed lip release feel categorically different from an
- *     early one rather than just slightly better.
+ *     PUMP_WINDOW of the wheels actually leaving the ground — either side of it
+ *     — the stored charge is also added to the vertical velocity directly. That
+ *     double payoff is deliberate: it is what makes a well-timed lip release
+ *     feel categorically different from an early one rather than just slightly
+ *     better.
+ *
+ *  5. THE BIKE IS HELD DOWN, NOT JUST SPRUNG DOWN. A raycast suspension is a
+ *     spring, and a spring returns what it absorbs. 92 kg on 90–130 mm of
+ *     travel, over ground that deviates 0.4 m from straight inside a 6 m
+ *     window, is a pogo stick — measured at 72% airborne on a descent that
+ *     should have been the fastest part of the course. A rider is not a spring:
+ *     they absorb with their arms and legs and push the wheels back down. So
+ *     the suspension force has a real ceiling, a bottom-out is resolved
+ *     inelastically, and while the bike is in contact its velocity along the
+ *     contact normal may not run away from the ground. See `holdGround`.
  *
  * Body space: +Y up, +Z forward, +X to the LEFT. `position` is the body origin:
  * mid-wheelbase, on the axle line, suspension topped out.
+ *
+ * SIGNS, because two of them are counter-intuitive and the comments used to be
+ * wrong about both:
+ *   • `lean`  is positive to the RIGHT, measured against the contact normal.
+ *   • `pitch` is `asin(-forward · n)`, which is POSITIVE WHEN THE NOSE IS DOWN.
+ *   • a torque about the body's LEFT axis is positive when it puts the NOSE
+ *     DOWN (right-handed rotation about +X takes +Z toward -Y).
  */
 
 import { Object3D, Quaternion, Vector3 } from 'three';
@@ -69,19 +87,62 @@ export const BODY_TUNE = {
   inertiaYaw: 23,
   inertiaRoll: 16,
 
-  /** Lean controller. omega_n = sqrt(kP); zeta = kD / (2*sqrt(kP)). */
-  leanKp: 148,
-  leanKd: 25,
+  /**
+   * Lean controller. omega_n = sqrt(kP); zeta = kD / (2*sqrt(kP)).
+   *
+   * These gains only mean that once the gravitational tipping moment has been
+   * removed — see `cancelTipMoment`. With it left in, the loop's own stiffness
+   * (inertiaRoll * leanKp = 2368 N·m/rad) was cancelled almost exactly by
+   * m·g·h (92 * 20.4 * 1.287 = 2415 N·m/rad), leaving a NET ROLL STIFFNESS OF
+   * ABOUT ZERO. That is why the bike sat at 27° of lean with the stick
+   * centred and lay all the way down (measured |lean| of 3.13 rad — inverted)
+   * in the switchbacks, the stream bed and the rock garden: roll was a free
+   * integrator and the first bump decided which way it went.
+   */
+  leanKp: 168,
+  leanKd: 27,
+  /**
+   * How much of the gravitational tipping moment the balance loop takes off the
+   * bike. 1 = the rider holds their weight perfectly over the contact line and
+   * lean is a pure servo; 0 = the bike falls over. Held slightly under 1 so a
+   * hard landing or a berm still has a little weight in it.
+   */
+  tipCancel: 0.94,
   /** How fast the bars move to the demanded angle, radians per second. */
   steerRate: 5.4,
   /** Speed at which lean fully replaces steer as the cornering mechanism. */
   leanAuthoritySpeed: 9.5,
 
-  /** Pitch: manual/endo authority and the passive stabiliser toward the slope. */
-  manualTorque: 470,
-  endoTorque: 330,
-  pitchStabiliserKp: 26,
-  pitchStabiliserKd: 7.5,
+  /**
+   * Pitch: manual/endo authority and the passive stabiliser toward the slope.
+   *
+   * The stabiliser's DAMPING is the important number and it used to be far too
+   * low. The pitch mode is a 3.6 Hz spring between the two wheels at zeta 0.55,
+   * and at 19 m/s the ground feeds it at almost exactly that frequency — the
+   * bike porpoised at 4 Hz with the wheels alternating (measured: only 14% of
+   * steps had BOTH wheels loaded, against 34% front-only and 32% rear-only).
+   * Worse, the inter-wheel damping only acts while both wheels are down, which
+   * during a porpoise is exactly when they are not. This term does not care.
+   */
+  /**
+   * Manual and endo are TARGET ANGLES, radians, reached by the stabiliser.
+   * 0.50 rad of nose-up is a proper manual and sits just under the 0.42 rad
+   * wheelie balance point where the rear contact's own moment would take over
+   * and loop the bike; 0.34 rad of nose-down is an endo you can hold.
+   */
+  manualPitch: 0.50,
+  endoPitch: 0.34,
+  pitchStabiliserKp: 34,
+  pitchStabiliserKd: 16,
+  /**
+   * What the pitch servo may spend, N·m. Neutral is weak on purpose so the
+   * ground still moves the bike around under the rider; asking for a manual or
+   * an endo buys real authority. Lifting the front wheel needs more than the
+   * 1013 N·m the loaded rear contact pushes back with, which is why the old
+   * 470 N·m `manualTorque` could not do it at all.
+   */
+  pitchNeutralTorque: 1150,
+  pitchIntentTorque: 2600,
   /** Yaw damping — kills the residual spin a two-wheeled body accumulates. */
   yawDamp: 1.6,
 
@@ -91,14 +152,23 @@ export const BODY_TUNE = {
   /** Above this the bike auto-levels toward the slope it is falling onto. */
   airAssistStart: 0.55,
   airAssist: 1.05,
+  /**
+   * Seconds of airtime over which the ground balance loop fades out. Short
+   * flights — a wheel skipping a stone — are not jumps and the rider does not
+   * stop balancing for them. See `controlAirborne`.
+   */
+  skimBalance: 0.30,
+  skimAuthority: 0.85,
 
   /** Preload and pump. */
   pumpChargeTime: 0.42,
   pumpDecayTime: 0.55,
   pumpImpulse: 3.05,      // m/s along the contact normal at full charge
-  pumpWindow: 0.14,       // s — the release-to-takeoff window worth learning
+  pumpWindow: 0.16,       // s — the release-to-takeoff window worth learning
   pumpAirBonus: 2.70,     // m/s added on top if the window is hit
   hopImpulse: 3.55,
+  /** Nose-up kick on a bunny hop, N·m — a hop is a rear-first lift. */
+  hopNoseLift: 300,
 
   /** Crash. */
   crashMinTime: 1.15,
@@ -111,9 +181,94 @@ export const BODY_TUNE = {
 
   /** Rolling resistance scale — the surface table supplies the per-surface part. */
   rollingResistance: 26,
-  /** Downforce-ish term so the bike does not float over crests at speed. */
-  crestHold: 0.34,
+
+  // ── Ground hold ───────────────────────────────────────────────────────────
+  /**
+   * Downforce as a multiple of the bike's weight, applied along the contact
+   * normal as the suspension runs out of droop. This is the rider pushing the
+   * bars and the pedals into the ground over a roller. The old value (0.34,
+   * gated on a term that measured body/ground misalignment rather than
+   * curvature) could not hold the wheels down over anything: at 19 m/s a 0.2 m
+   * roller on a 6 m wavelength needs about 4 g to follow, and gravity alone
+   * supplies 1. This does not have to supply all of it — it has to supply
+   * enough that the wheel skims instead of launching.
+   */
+  crestHold: 2.2,
+  /** Speed at which crestHold reaches full strength, m/s. */
+  crestHoldSpeed: 8,
+  /**
+   * How fast the bike may separate from the ground while in contact, m/s. The
+   * suspension may return this much of a landing on top of it (a coefficient of
+   * restitution). Above these, the bike is being thrown by its own springs, and
+   * that is the pogo. Deliberately generous enough that the suspension still
+   * visibly rebounds.
+   */
+  holdRelease: 0.62,
+  holdRestitution: 0.17,
+  /**
+   * Seconds after a hop or a pump during which the ground hold is off. Nothing
+   * else in the simulation is allowed to launch the bike, so this is exactly
+   * "the bike leaves the ground when, and only when, the rider says so, or when
+   * the ground falls away from underneath it".
+   */
+  holdGrace: 0.22,
 };
+
+/**
+ * Suspension rates, derived rather than guessed.
+ *
+ * `BIKE.forkStiffness`/`shockStiffness` in WorldConstants are 32 kN/m and
+ * 46 kN/m, which on a 92 kg bike is 19% static sag at the front and 26% at the
+ * rear, and puts BOTH ends at 4.6 Hz. The scree run's terrain, detrended over a
+ * 6 m window, is 0.215 m rms with 0.4 m peaks — at 19 m/s that is a 4.7 Hz
+ * input. The suspension was sitting exactly on resonance with the ground it
+ * spends the whole race on, with a fifth of its travel already used up before
+ * the first bump.
+ *
+ * These rates give 30% static sag at both ends (so there is travel available in
+ * BOTH directions), drop the front to 3.6 Hz, and set the damping explicitly as
+ * a ratio rather than as a raw coefficient that has to be re-derived every time
+ * a spring rate moves: 0.62 critical in compression (takes the hit), 1.15 in
+ * rebound (does not give it back).
+ *
+ * They belong in WorldConstants next to the numbers they replace; they are here
+ * because that file is shared with the AI and the terrain and is not this
+ * subsystem's to edit.
+ */
+/** Static sag as a fraction of travel. Shared by the rates and the ground hug. */
+const STATIC_SAG = 0.30;
+
+const SUSPENSION = (() => {
+  const g = BIKE.gravity;
+  const w = BIKE.mass * g;              // 1877 N total
+  const sagFraction = STATIC_SAG;
+  // Static split follows the weight distribution the contact geometry produces.
+  const frontShare = 0.42;
+  const rearShare = 0.58;
+  const kF = (w * frontShare) / (BIKE.forkTravel * sagFraction);
+  const kR = (w * rearShare) / (BIKE.shockTravel * sagFraction);
+  const mF = BIKE.mass * frontShare;
+  const mR = BIKE.mass * rearShare;
+  const critF = 2 * Math.sqrt(kF * mF);
+  const critR = 2 * Math.sqrt(kR * mR);
+  const zetaComp = 0.62;
+  const reboundRatio = 1.15 / zetaComp;
+  return {
+    frontStiffness: kF,
+    rearStiffness: kR,
+    frontDamping: critF * zetaComp,
+    rearDamping: critR * zetaComp,
+    reboundRatio,
+    /**
+     * Force ceiling per wheel. 4.6 times the bike's whole weight is enough to
+     * arrest an 8 m/s landing inside the travel; anything more than that is
+     * a catapult, not a fork.
+     */
+    maxForce: w * 4.6,
+    /** Contact envelope half-length: ~72% of the wheel radius. */
+    envelope: BIKE.wheelRadius * 0.72,
+  };
+})();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scratch
@@ -130,6 +285,8 @@ const _v2 = new Vector3();
 const _q = new Quaternion();
 const _q2 = new Quaternion();
 const _omega = new Vector3();
+const _suspF = new Vector3();
+const _att = new Vector3();
 const _susp: SuspendResult = { force: 0, penetration: 0, clearance: 0 };
 const _susp2: SuspendResult = { force: 0, penetration: 0, clearance: 0 };
 
@@ -150,6 +307,41 @@ const ZERO_INPUT: BikeInput = {
   wantHop: false,
 };
 
+/**
+ * BikeState plus monotonic event counters.
+ *
+ * `landedThisStep` and `crashedThisStep` are latched for exactly ONE 120 Hz
+ * physics step. Every consumer of them — the rider rig, the FX layer, the
+ * camera — runs in the RENDER loop, after the accumulator has already eaten one
+ * to three physics steps, so all three of them missed every event. Measured:
+ * `crashedThisStep` was false on all 30 rendered frames of the `crash` capture
+ * and `landedThisStep` false on all 45 frames of `landing`. The rig's crash
+ * entry never ran, `crashSeverity` was read as 0, and since every dynamic term
+ * in the crash pose is multiplied by severity the whole thing reached the
+ * screen as a static blend. Three subsystems had each grown their own edge
+ * detector to work around it.
+ *
+ * These counters are the fix. A consumer keeps its own last-seen value and
+ * compares: that is correct for any number of physics steps per rendered frame,
+ * it survives two events inside one frame, and there is no question about who
+ * clears it, because nobody does. The one-step flags are kept working exactly
+ * as they were so nothing that reads them breaks.
+ *
+ * The payload fields (`landingImpact`, `landingQuality`, `crashDirection`,
+ * `crashSeverity`) are only ever written when the matching counter increments,
+ * so they stay valid for as long as a late consumer needs them.
+ *
+ * These belong on BikeState in Contracts.ts. They are declared here because
+ * that file is the shared spine and is not this subsystem's to edit — see the
+ * note in this task's report.
+ */
+export interface BikeStateEx extends BikeState {
+  /** Increments once per landing. Never resets except on `reset()`. */
+  landCount: number;
+  /** Increments once per crash entry. Never resets except on `reset()`. */
+  crashCount: number;
+}
+
 export interface BikePhysicsOptions {
   terrain?: BikeTerrain;
   mass?: number;
@@ -160,7 +352,7 @@ export interface BikePhysicsOptions {
 export class BikePhysics {
   readonly front: Wheel;
   readonly rear: Wheel;
-  readonly state: BikeState;
+  readonly state: BikeStateEx;
 
   /** Where the rider rig, camera and FX read interpolated transforms from. */
   readonly object = new Object3D();
@@ -184,13 +376,41 @@ export class BikePhysics {
   private steerDemand = 0;
   private targetLean = 0;
   private crouchPrev = 0;
+  /** Seconds since the crouch was released with charge in it; <0 = not armed. */
   private pumpFired = -1e3;
   private pumpFiredCharge = 0;
+  /** Seconds since the wheels actually left the ground; <0 = still in contact. */
+  private sinceTakeoff = -1;
   private hopPrev = false;
-  private modeClock = 0;
   private crashClock = 0;
   private groundedGrace = 0;
   private lastSpeed = 0;
+  private wasGrounded = true;
+
+  /**
+   * Contact reference normal, low-pass filtered. Balance is measured against
+   * this rather than against the raw blend of the two contact normals, because
+   * the raw blend steps discontinuously every time a wheel picks up or puts
+   * down — and a step in the REFERENCE of a PD controller with kP = 168 is a
+   * torque spike that then throws the wheel it was measuring off the ground.
+   */
+  private readonly groundRef = new Vector3(0, 1, 0);
+
+  /**
+   * Roll moment the suspension normal forces put into the body this step, about
+   * the bike's own forward axis. Accumulated in `applyNormalForce` and taken
+   * back out in `cancelTipMoment` — see BODY_TUNE.tipCancel.
+   */
+  private tipRoll = 0;
+  /** Same, about the LEFT axis. Cancelled only while the rider asks for pitch. */
+  private tipPitch = 0;
+
+  /** Velocity along the contact normal at the START of the step, m/s. */
+  private normalVelPre = 0;
+  /** Seconds left of the post-hop/post-pump window where ground hold is off. */
+  private launchGrace = 0;
+  /** Speed ceiling during a crash, m/s. Ratchets down, never up. */
+  private crashSpeedCap = 0;
 
   /** Accumulators, cleared every step. */
   private force = new Vector3();
@@ -204,25 +424,29 @@ export class BikePhysics {
     this.front = new Wheel({
       mountLocal: FRONT_MOUNT.clone(),
       travel: BIKE.forkTravel,
-      stiffness: BIKE.forkStiffness,
-      damping: BIKE.forkDamping,
+      stiffness: SUSPENSION.frontStiffness,
+      damping: SUSPENSION.frontDamping,
       radius: BIKE.wheelRadius,
       isFront: true,
       tyre: FRONT_TYRE,
-      compressionDampScale: 0.86,
-      reboundDampScale: 1.34,
+      compressionDampScale: 1,
+      reboundDampScale: SUSPENSION.reboundRatio,
+      maxForce: SUSPENSION.maxForce,
+      envelope: SUSPENSION.envelope,
     });
 
     this.rear = new Wheel({
       mountLocal: REAR_MOUNT.clone(),
       travel: BIKE.shockTravel,
-      stiffness: BIKE.shockStiffness,
-      damping: BIKE.shockDamping,
+      stiffness: SUSPENSION.rearStiffness,
+      damping: SUSPENSION.rearDamping,
       radius: BIKE.wheelRadius,
       isFront: false,
       tyre: REAR_TYRE,
-      compressionDampScale: 0.92,
-      reboundDampScale: 1.42,
+      compressionDampScale: 1,
+      reboundDampScale: SUSPENSION.reboundRatio,
+      maxForce: SUSPENSION.maxForce,
+      envelope: SUSPENSION.envelope,
     });
 
     this.state = {
@@ -254,6 +478,8 @@ export class BikePhysics {
       crashedThisStep: false,
       crashDirection: new Vector3(0, 0, 1),
       crashSeverity: 0,
+      landCount: 0,
+      crashCount: 0,
     };
   }
 
@@ -279,6 +505,10 @@ export class BikePhysics {
 
     this.force.set(0, 0, 0);
     this.torque.set(0, 0, 0);
+    this.tipRoll = 0;
+    this.tipPitch = 0;
+    _suspF.set(0, 0, 0);
+    this.launchGrace = Math.max(0, this.launchGrace - dt);
 
     // ── Frames ──────────────────────────────────────────────────────────────
     _up.copy(UP).applyQuaternion(s.orientation);
@@ -320,13 +550,25 @@ export class BikePhysics {
     }
     _n.normalize();
 
+    // Filter it. In the air the reference is allowed to track the landing slope
+    // quickly; on the ground it is deliberately slower than a wheel can pick up
+    // and put down, so a single wheel crossing a stone does not move the datum
+    // the whole balance loop is measured against.
+    dampVec(this.groundRef, _n, grounded ? 0.055 : 0.12, dt).normalize();
+
     // Signed roll of the body about its own forward axis, relative to the
     // ground normal. Positive is leaning right.
-    _v.copy(_n).cross(_up);
-    s.lean = Math.atan2(_v.dot(_fwd), clamp(_n.dot(_up), -1, 1));
+    _v.copy(this.groundRef).cross(_up);
+    s.lean = Math.atan2(_v.dot(_fwd), clamp(this.groundRef.dot(_up), -1, 1));
 
-    // Signed pitch: how far the bike's forward axis is above the ground plane.
-    s.pitch = Math.asin(clamp(-_fwd.dot(_n), -1, 1));
+    // Signed pitch relative to the ground plane. POSITIVE IS NOSE DOWN: it is
+    // asin of the amount by which the forward axis points INTO the ground.
+    s.pitch = Math.asin(clamp(-_fwd.dot(this.groundRef), -1, 1));
+
+    // Closing speed against the ground at the top of the step. The ground-hold
+    // pass after integration compares against this to decide how much of an
+    // impact the springs are allowed to hand back.
+    this.normalVelPre = s.velocity.dot(_n);
 
     // ── Drive, brakes, tyres ────────────────────────────────────────────────
     this.solveDrive(input, dt);
@@ -341,26 +583,42 @@ export class BikePhysics {
       this.force.addScaledVector(s.velocity, -k * s.speed);
     }
 
-    // Crest hold. A bike cresting a roller at speed leaves the ground a frame
-    // before the geometry says it should, which reads as floaty; a small pull
-    // along the contact normal keeps the wheels down over rollers without
-    // affecting a genuine lip.
-    if (grounded && s.speed > 6) {
-      const curve = clamp01((_n.y - _up.y) * 4);
-      this.force.addScaledVector(_n, -this.mass * BIKE.gravity * BODY_TUNE.crestHold * curve);
+    // Ground hug. A wheel running out of DROOP is a wheel about to leave the
+    // ground: the ground has started falling away faster than the spring can
+    // follow it. That is the moment a rider pushes the bars and the pedals
+    // down, and this is that push. Gated on droop rather than on any measure of
+    // curvature, because droop is the thing that is actually about to run out,
+    // and it costs nothing over a flat road where the suspension is sagged.
+    if (grounded && this.launchGrace <= 0 && s.mode !== BikeMode.Crashing) {
+      // Measured from the STATIC RIDE HEIGHT, not from full compression. A bike
+      // sitting on its sag has 70% of its droop left and always will, so gating
+      // on raw droop meant a permanent 1.1 g of downforce at any speed — which
+      // doubles the bike's weight, kills the manual (the nose would not come up
+      // at all) and makes the whole thing feel welded to the floor. This is
+      // zero at normal ride height and only arrives as the wheel genuinely runs
+      // out of extension, which is the moment it is about to fly.
+      const extension = 1 - Math.max(this.front.compression, this.rear.compression);
+      const excess = clamp01((extension - (1 - STATIC_SAG)) / STATIC_SAG);
+      const fast = clamp01(s.speed / BODY_TUNE.crestHoldSpeed);
+      const hug = BODY_TUNE.crestHold * excess * excess * fast;
+      if (hug > 0) this.force.addScaledVector(_n, -this.mass * BIKE.gravity * hug);
     }
 
     // ── Attitude control ────────────────────────────────────────────────────
     if (s.mode === BikeMode.Crashing) {
       this.updateCrash(dt);
     } else if (grounded) {
-      this.controlGrounded(input, dt, _n);
+      this.controlGrounded(input, dt, this.groundRef);
     } else {
-      this.controlAirborne(input, dt, _n);
+      this.controlAirborne(input, dt, this.groundRef);
     }
 
     // ── Integrate ───────────────────────────────────────────────────────────
     this.integrate(dt);
+
+    // ── Ground hold ─────────────────────────────────────────────────────────
+    this.holdGround(grounded, _n, dt);
+    this.clampCrashSpeed(dt);
 
     // ── Mode machine ────────────────────────────────────────────────────────
     this.updateMode(grounded, wasAirborne, dt, _n);
@@ -370,6 +628,59 @@ export class BikePhysics {
     s.forwardSpeed = s.velocity.dot(_fwd);
     s.modeTime += dt;
     this.lastSpeed = s.speed;
+    this.wasGrounded = grounded;
+  }
+
+  /**
+   * Stop the springs throwing the bike off the ground.
+   *
+   * A raycast suspension hands back whatever it absorbs. On terrain that
+   * deviates further from straight than the fork has travel — which is most of
+   * this mountain — that makes a 92 kg pogo stick: land, bottom out, get fired
+   * half a metre into the air, fall, land harder. Instrumented over a 180-frame
+   * scree run the rear wheel was in contact for 51 frames and the two wheels
+   * alternated rather than both being loaded, which starved the tyre model, the
+   * drive, the dust and the rider rig all at once.
+   *
+   * The rule: while the bike is in contact, the velocity along the contact
+   * normal may not exceed `holdRelease`, plus a restitution share of whatever
+   * it arrived with. That is a coefficient-of-restitution constraint and it is
+   * the same thing a rider's arms and legs do.
+   *
+   * Three things are deliberately NOT affected:
+   *   • a lip — the velocity does not change over a lip, the GROUND falls away
+   *     from underneath it, and this only ever touches velocity;
+   *   • a ramp — on a ramp the velocity stays tangent to the surface, so the
+   *     component along the normal stays near zero however steep the kicker;
+   *   • a hop or a pump — those set `launchGrace`, and inside that window this
+   *     does nothing at all.
+   */
+  private holdGround(grounded: boolean, n: Vector3, dt: number): void {
+    if (!grounded || this.launchGrace > 0) return;
+    const s = this.state;
+    if (s.mode === BikeMode.Crashing) return;
+    const vn = s.velocity.dot(n);
+    if (vn <= 0) return;
+    // `normalVelPre` in the max is what makes this a limit on what the SPRINGS
+    // may add rather than a speed limit on the bike. Anything the bike already
+    // had at the top of the step passes through untouched: a pump impulse, a
+    // hop, the race director's collision response, and the capture harness's
+    // `launch` velocity. Without that term the hold ate all of them on the very
+    // step they were applied — a 13 m/s launch came out as 0.62.
+    // What the SUSPENSION added to the normal velocity this step. Subtracting
+    // it recovers the velocity the bike would have had without the springs, and
+    // that is the floor: the hold may take back the springs' contribution and
+    // nothing else. Anything the bike already had passes through untouched — a
+    // pump impulse, a hop, the race director's collision response, the capture
+    // harness's `launch`. Without this the hold ate all of them on the very
+    // step they were applied and a 13 m/s launch came out as 0.62.
+    const dvSusp = Math.max(0, _suspF.dot(n) * (dt / this.mass));
+    const allowed = Math.max(
+      vn - dvSusp,
+      BODY_TUNE.holdRelease,
+      -this.normalVelPre * BODY_TUNE.holdRestitution,
+    );
+    if (vn > allowed) s.velocity.addScaledVector(n, allowed - vn);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -380,22 +691,49 @@ export class BikePhysics {
     const s = this.state;
     const speed = Math.abs(s.forwardSpeed);
 
-    // Steering authority falls with speed. Without this the bars are a
-    // catastrophe at 20 m/s and useless in a switchback at 4.
-    const falloff = 1 / (1 + BIKE.steerSpeedFalloff * speed);
-    this.steerDemand = input.steer * BIKE.maxSteer * falloff;
-    s.steerAngle = moveTowards(s.steerAngle, this.steerDemand, BODY_TUNE.steerRate * dt);
-
     // Above `leanAuthoritySpeed` the turn is carried by lean, below it by the
     // bars. The crossover is what makes slow technical sections feel like
     // steering and fast sections feel like carving.
     const leanAuthority = clamp01(speed / BODY_TUNE.leanAuthoritySpeed);
     const grip = this.rear.grounded ? this.rear.surface.grip : 1;
-    this.targetLean = input.steer * BIKE.maxLean * leanAuthority * lerp(0.7, 1, grip);
 
+    // The lean is the angle a rider HOLDS for a given cornering force, and the
+    // only honest way to pick it is from the force: tan(lean) = a / g. Setting
+    // it straight from the stick instead (`steer * maxLean`) put the bike at 50°
+    // of lean while pulling 0.5 g — a rider at that angle and that force would
+    // simply be falling over, and it reads as exactly that. Deriving it from
+    // what the tyres can actually deliver also makes the SURFACES table legible
+    // without any extra code: scree at grip 0.46 tops out at 24° of lean and a
+    // much wider line, trail at 1.0 goes to 44° and turns twice as tightly.
+    const aMax = BIKE.gravity * REAR_TYRE.muLatScale * grip;
     // Braking stands the bike up — you cannot hold full lean on the brakes.
     const braking = clamp01(input.brakeRear * 0.6 + input.brakeFront);
-    this.targetLean *= 1 - braking * 0.34;
+    const aDemand = input.steer * aMax * leanAuthority * (1 - braking * 0.34);
+    this.targetLean = clamp(Math.atan(aDemand / BIKE.gravity), -BIKE.maxLean, BIKE.maxLean);
+
+    // ── The bars ────────────────────────────────────────────────────────────
+    // At speed the steer angle is not an input, it is a CONSEQUENCE of the
+    // lean: a bike leaned to θ is going round a circle of radius v²/(g·tanθ),
+    // and the bars have to be where that circle puts them, which for a 1.08 m
+    // wheelbase is atan(wheelbase / r).
+    //
+    // Scaling `maxSteer` by a speed falloff instead gets this badly wrong, and
+    // the error is not small. At 16 m/s the old falloff left 0.165 rad — 9.5°
+    // — on the bars, which is Ackermann for a 6.5 m radius, which needs 39 m/s²
+    // of lateral acceleration. The tyres can make 20. So half steer at 16 m/s
+    // did not corner, it PLOUGHED: measured 9 m/s of lateral slip at both
+    // wheels, a 4.8 m radius and 16 → 12.8 m/s of scrub, with the bike sliding
+    // the whole way. The kinematic angle for the same lean is 2.3°.
+    //
+    // Below the crossover the bars go back to being bars, because at walking
+    // pace through a switchback that is exactly what a rider uses.
+    const v = Math.max(speed, 2.0);
+    const kinematic = Math.atan(
+      (BIKE.wheelbase * BIKE.gravity * Math.tan(clamp(this.targetLean, -1.4, 1.4))) / (v * v),
+    );
+    const direct = input.steer * BIKE.maxSteer;
+    this.steerDemand = clamp(lerp(direct, kinematic, leanAuthority), -BIKE.maxSteer, BIKE.maxSteer);
+    s.steerAngle = moveTowards(s.steerAngle, this.steerDemand, BODY_TUNE.steerRate * dt);
   }
 
   private updatePreload(input: BikeInput, dt: number): void {
@@ -413,6 +751,14 @@ export class BikePhysics {
     }
 
     // Release edge: spend the charge as an impulse along the contact normal.
+    //
+    // The window is armed here and CASHED IN `updateMode`, on the step the
+    // wheels actually leave the ground. It used to be cashed on the step the
+    // MODE flipped to Airborne, which is 85 ms later (the grounded grace), so a
+    // rider releasing at the lip — the correct, natural timing — landed at
+    // 85 ms into a 140 ms window and missed it as often as they hit it. The
+    // window is now centred on the real event and works from either side of it,
+    // which is what makes it learnable: release at the lip, get paid.
     const released = this.crouchPrev > 0.6 && input.crouch < 0.35;
     if (released && s.pumpCharge > 0.12) {
       this.pumpFired = 0;
@@ -420,8 +766,15 @@ export class BikePhysics {
       if (grounded) {
         _n.copy(this.rear.grounded ? this.rear.contactNormal : this.front.contactNormal);
         s.velocity.addScaledVector(_n, BODY_TUNE.pumpImpulse * s.pumpCharge);
+        this.launchGrace = BODY_TUNE.holdGrace;
       }
       s.pumpCharge = 0;
+      // A release that lands within the window of a takeoff that ALREADY
+      // happened still counts — the rider was a fraction late off the lip, not
+      // wrong. Cash it immediately.
+      if (this.sinceTakeoff >= 0 && this.sinceTakeoff <= BODY_TUNE.pumpWindow) {
+        this.payPumpBonus();
+      }
     } else if (this.pumpFired >= 0) {
       this.pumpFired += dt;
       if (this.pumpFired > BODY_TUNE.pumpWindow) this.pumpFired = -1e3;
@@ -431,14 +784,27 @@ export class BikePhysics {
     // Bunny hop, on the button edge, from a compressed stance.
     if (input.wantHop && !this.hopPrev && grounded) {
       _n.copy(this.rear.grounded ? this.rear.contactNormal : this.front.contactNormal);
-      const scale = 0.62 + s.preload * 0.55;
+      const scale = 0.86 + s.preload * 0.46;
       s.velocity.addScaledVector(_n, BODY_TUNE.hopImpulse * scale);
       // A hop is a rear-first lift: nose up slightly so it looks like a hop and
-      // not a lift on a string.
-      _t.copy(_left).multiplyScalar(-BODY_TUNE.manualTorque * 0.6);
+      // not a lift on a string. Negative about LEFT is nose-up.
+      _t.copy(_left).multiplyScalar(-BODY_TUNE.hopNoseLift);
       this.torque.add(_t);
+      this.launchGrace = BODY_TUNE.holdGrace;
     }
     this.hopPrev = input.wantHop;
+  }
+
+  /** Spend an armed pump charge into vertical velocity. Idempotent per charge. */
+  private payPumpBonus(): void {
+    if (this.pumpFired < 0 || this.pumpFiredCharge <= 0) return;
+    this.state.velocity.addScaledVector(
+      this.groundRef,
+      BODY_TUNE.pumpAirBonus * this.pumpFiredCharge,
+    );
+    this.pumpFired = -1e3;
+    this.pumpFiredCharge = 0;
+    this.launchGrace = BODY_TUNE.holdGrace;
   }
 
   private solveDrive(input: BikeInput, dt: number): void {
@@ -482,17 +848,82 @@ export class BikePhysics {
   }
 
   private applyNormalForce(w: Wheel, out: SuspendResult): void {
-    if (out.force <= 0) return;
-    _f.copy(w.contactNormal).multiplyScalar(out.force);
-    this.force.add(_f);
-    _r.copy(w.contactPoint).sub(this.com);
-    _t.copy(_r).cross(_f);
-    this.torque.add(_t);
+    if (out.force > 0) {
+      _f.copy(w.contactNormal).multiplyScalar(out.force);
+      this.force.add(_f);
+      _r.copy(w.contactPoint).sub(this.com);
+      _t.copy(_r).cross(_f);
+      this.torque.add(_t);
+      _suspF.add(_f);
+      // Book the roll share for cancelTipMoment. Both contact points lie on the
+      // bike's own centre plane, so the entire roll component of this moment is
+      // load * lever * sin(lean) — pure destabilising gravity, nothing else.
+      this.tipRoll += _t.dot(_fwd);
+      this.tipPitch += _t.dot(_left);
+    }
 
-    // Penetration recovery: push straight out, no torque, so a wheel that ends
-    // a step buried does not also get flicked.
-    if (out.penetration > 0.001) {
-      this.state.position.addScaledVector(w.contactNormal, Math.min(out.penetration, 0.12));
+    // Penetration recovery. The wheel is through the bottom of its travel and
+    // the frame is inside the ground. Push out gently — the old code moved the
+    // body up to 0.12 m PER WHEEL PER STEP, which at 120 Hz is 14 m/s of
+    // teleport — and kill the inward normal velocity, because a chassis hitting
+    // the dirt is an inelastic event and must not bounce.
+    if (out.penetration > 0.0015) {
+      const s = this.state;
+      s.position.addScaledVector(w.contactNormal, Math.min(out.penetration * 0.45, 0.035));
+      const vn = s.velocity.dot(w.contactNormal);
+      if (vn < 0) s.velocity.addScaledVector(w.contactNormal, -vn);
+    }
+  }
+
+  /**
+   * Take the gravitational tipping moment back off the bike.
+   *
+   * Torques are taken about the centre of mass, so gravity itself contributes
+   * nothing — but the suspension's normal force does, because the contact
+   * patches sit 1.29 m below a COM that a leaned bike has moved sideways off
+   * them. That moment is exactly `load * lever * sin(lean)` about the forward
+   * axis, and it grows at m·g·h = 2415 N·m/rad.
+   *
+   * The balance loop's own stiffness is inertiaRoll * leanKp. At the values
+   * this file shipped with that was 2368 N·m/rad — within 2% of the tipping
+   * moment it was supposed to be fighting. The NET roll stiffness was
+   * approximately zero, so roll was a free integrator: it sat wherever the last
+   * bump left it (measured: 0.466 rad with the stick centred) and in anything
+   * with a berm or a rock in it, it went all the way over (measured: 3.13 rad,
+   * i.e. upside down, in the switchbacks, the stream bed and the rock garden).
+   *
+   * Cancelling it is not a cheat, it is the model: decision 1 in this file's
+   * header says the lean is SERVOED. A servo cannot work against an equal and
+   * opposite plant. `tipCancel` is held just under 1 so a landing still has
+   * some weight in it.
+   *
+   * The CORNERING force's roll moment is booked here too, and it has to be.
+   * On a real bike those two moments are what balance each other — m·g·h·sinθ
+   * against m·a·h·cosθ, which is where tanθ = a/g comes from. Cancelling the
+   * first and leaving the second is worse than cancelling neither: the tyre's
+   * lateral force, acting 1.29 m below the COM, then rolls the bike OUT of
+   * every turn with nothing opposing it. Measured with only the normal force
+   * cancelled: quarter steer at 16 m/s produced 0.88 rad/s of yaw to the RIGHT
+   * with the bike leaning 0.26 rad to the LEFT, which is a bike falling over
+   * mid-corner, not a bike cornering.
+   *
+   * With both booked, roll is a clean servo and the turn comes from the lean
+   * through camber thrust, which is decision 2 in the header.
+   */
+  private cancelTipMoment(pitchIntent: number): void {
+    if (this.tipRoll !== 0) {
+      this.torque.addScaledVector(_fwd, -this.tipRoll * BODY_TUNE.tipCancel);
+    }
+    // The pitch axis is only unloaded while the rider is ASKING for attitude.
+    // Left alone, the contacts' own pitch moment is the fore/aft weight
+    // transfer and the pitch spring between the two wheels, which is exactly
+    // the thing that should stay: it is what squats the bike under power and
+    // dives it under braking. But it is also 1013 N·m of nose-down at rest, and
+    // a rider pulling a manual is lifting against precisely that. Cancelling it
+    // in proportion to the demand is what turns the manual and the endo from a
+    // torque that loses into an attitude the rider chooses.
+    if (this.tipPitch !== 0 && pitchIntent > 0.01) {
+      this.torque.addScaledVector(_left, -this.tipPitch * pitchIntent * BODY_TUNE.tipCancel);
     }
   }
 
@@ -502,50 +933,96 @@ export class BikePhysics {
     _r.copy(w.contactPoint).sub(this.com);
     _t.copy(_r).cross(w.tyreForce);
     this.torque.add(_t);
+    // The cornering force's roll moment goes in the same book as the normal
+    // force's. See cancelTipMoment: cancelling one without the other leaves the
+    // bike leaning OUT of every corner.
+    this.tipRoll += _t.dot(_fwd);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
   // Attitude
   // ───────────────────────────────────────────────────────────────────────────
 
+  /**
+   * The part of the angular velocity that is actually changing the bike's
+   * ATTITUDE relative to the ground, with the part that is merely going round
+   * the corner removed.
+   *
+   * A bike leaned 0.34 rad and turning at 6 rad/s about the ground normal is
+   * not pitching — it is holding a steady attitude and travelling in a circle.
+   * But rotation about the world vertical, resolved onto a LEANED body's own
+   * axes, appears as `omega * sin(lean)` about the body's left axis, which
+   * looks exactly like a nose-down pitch rate. The pitch damper then fought it:
+   * measured, a half-steer corner produced 980 N·m of nose-down torque out of
+   * nothing, which drove the front suspension to 0.033 m, unloaded the rear
+   * wheel COMPLETELY, and left the bike pirouetting on its front tyre at
+   * 8 rad/s with no rear contact to stabilise the yaw. Half steer at 16 m/s
+   * ended at 1.4 m/s. That is not a corner, it is a crash with extra steps.
+   *
+   * Subtracting the component along the contact normal removes the corner and
+   * leaves the attitude. A real pitch or roll is perpendicular to the normal
+   * and passes through untouched.
+   */
+  private attitudeRate(n: Vector3): Vector3 {
+    const w = this.state.angularVelocity;
+    return _att.copy(w).addScaledVector(n, -w.dot(n));
+  }
+
   private controlGrounded(input: BikeInput, dt: number, n: Vector3): void {
     const s = this.state;
 
     // ── Roll: the balance loop ──────────────────────────────────────────────
-    const rollRate = s.angularVelocity.dot(_fwd);
+    // The plant first: without this the PD below has no net authority at all.
+    this.cancelTipMoment(clamp01(Math.abs(input.pitchLean)));
+    const rollRate = this.attitudeRate(n).dot(_fwd);
     const leanErr = this.targetLean - s.lean;
     const kp = BODY_TUNE.leanKp * (1 + this.stability * 0.5);
     const kd = BODY_TUNE.leanKd * (1 + this.stability * 0.35);
     const rollTorque = BODY_TUNE.inertiaRoll * (leanErr * kp - rollRate * kd);
     this.torque.addScaledVector(_fwd, clamp(rollTorque, -9000, 9000));
 
-    // ── Pitch: manual, endo, and a stabiliser toward the slope ──────────────
-    // pitchLean is +1 back (manual) .. -1 forward (endo / over the bars).
+    // ── Pitch: manual, endo, and the stabiliser, as ONE angle servo ─────────
+    //
+    // These used to be raw torques bolted on next to a stabiliser that switched
+    // itself off whenever the rider asked for attitude, and the numbers did not
+    // work. Lifting the front wheel means overcoming the rear contact's own
+    // nose-down moment, which at rest is 0.54 m × the whole weight = 1013 N·m.
+    // `manualTorque` was 470. The front wheel never came off the ground: with
+    // pitchLean held at 1 for a second and a half, the measured pitch was
+    // -0.012 rad and `manualAmount` was 0.00. The manual, one of the five
+    // things the brief names, did not exist. The endo had the opposite problem —
+    // no limit at all, so a front brake plus forward lean put the bike 79° over
+    // the bars and left it there.
+    //
+    // So the rider's pitch input is a TARGET ANGLE and the stabiliser is the
+    // servo that reaches it. That is what a rider actually does: they pick an
+    // attitude and hold it. It cannot loop out, it cannot fail to lift, the
+    // stabiliser never switches off (so bumps are damped even mid-manual), and
+    // the authority limits below are what keep it honest.
     const back = Math.max(0, input.pitchLean);
     const fwdLean = Math.max(0, -input.pitchLean);
 
     // A manual needs speed and a loaded rear wheel; you cannot manual a
     // stationary bike, and pretending you can is the tell of a fake one.
-    const manualAuth = clamp01((Math.abs(s.forwardSpeed) - 1.6) / 4) * clamp01(this.rear.load / 500);
-    const manualDrive = back * BODY_TUNE.manualTorque * manualAuth;
-    const endoDrive = fwdLean * BODY_TUNE.endoTorque * clamp01(this.front.load / 400);
+    const manualAuth = clamp01((Math.abs(s.forwardSpeed) - 1.6) / 4) * clamp01(this.rear.load / 400);
+    const endoAuth = clamp01(this.front.load / 350);
 
-    // Torque about the LEFT axis: positive raises the nose.
-    this.torque.addScaledVector(_left, -manualDrive + endoDrive);
+    // pitch > 0 is NOSE DOWN, so a manual target is negative.
+    const targetPitch =
+      -back * BODY_TUNE.manualPitch * manualAuth + fwdLean * BODY_TUNE.endoPitch * endoAuth;
 
-    // Passive stabiliser, only where the rider is not asking for attitude. It
-    // is what stops the bike from slowly nosing into the ground on a long
-    // descent, and it is deliberately weak so bumps still pitch the bike.
-    const authority = 1 - clamp01(Math.abs(input.pitchLean));
-    if (authority > 0.01) {
-      const pitchRate = s.angularVelocity.dot(_left);
-      const pitchErr = -s.pitch; // want the forward axis in the ground plane
-      const stab =
-        BODY_TUNE.inertiaPitch *
-        (pitchErr * BODY_TUNE.pitchStabiliserKp - pitchRate * BODY_TUNE.pitchStabiliserKd) *
-        authority;
-      this.torque.addScaledVector(_left, clamp(stab, -2600, 2600));
-    }
+    const pitchRate = this.attitudeRate(n).dot(_left);
+    const stab =
+      BODY_TUNE.inertiaPitch *
+      ((targetPitch - s.pitch) * BODY_TUNE.pitchStabiliserKp - pitchRate * BODY_TUNE.pitchStabiliserKd);
+    // Asking for attitude buys authority; holding neutral is deliberately weak
+    // so the ground still pitches the bike around underneath the rider.
+    const ceiling = lerp(
+      BODY_TUNE.pitchNeutralTorque,
+      BODY_TUNE.pitchIntentTorque,
+      clamp01(Math.abs(input.pitchLean)),
+    );
+    this.torque.addScaledVector(_left, clamp(stab, -ceiling, ceiling));
 
     // Manual readout for the rig and the trick system.
     const frontUp = !this.front.grounded && this.rear.grounded;
@@ -573,6 +1050,37 @@ export class BikePhysics {
     const s = this.state;
     s.manualling = false;
     s.manualAmount = dampHL(s.manualAmount, 0, 0.14, dt);
+
+    // ── The skim ────────────────────────────────────────────────────────────
+    // At 19 m/s down a rough face the wheels are off the ground for a tenth of
+    // a second at a time, constantly, and none of that is jumping. A rider does
+    // not stop balancing because the front wheel skipped over a stone — but
+    // this function did, and the roll rate the bike carried into each skim came
+    // straight back out the other side uncorrected. Integrated over a descent
+    // that is where 0.28 rad of standing lean with the stick centred came from.
+    //
+    // So the balance loop keeps running through a short flight, fading out over
+    // `skimBalance` seconds. It is gone long before anything a player would
+    // call a jump, and it is gone INSTANTLY if they ask for rotation, so it
+    // never fights a deliberate trick.
+    const asking = input.airPitch !== 0 || input.airRoll !== 0 || input.airYaw !== 0;
+    const skim = asking ? 0 : 1 - clamp01(s.airTime / BODY_TUNE.skimBalance);
+    if (skim > 0.001) {
+      const rollRate = this.attitudeRate(n).dot(_fwd);
+      const rollErr = this.targetLean - s.lean;
+      const roll =
+        BODY_TUNE.inertiaRoll *
+        (rollErr * BODY_TUNE.leanKp - rollRate * BODY_TUNE.leanKd) *
+        skim * skim * BODY_TUNE.skimAuthority;
+      this.torque.addScaledVector(_fwd, clamp(roll, -4000, 4000));
+
+      const pitchRate = this.attitudeRate(n).dot(_left);
+      const pitch =
+        BODY_TUNE.inertiaPitch *
+        (-s.pitch * BODY_TUNE.pitchStabiliserKp - pitchRate * BODY_TUNE.pitchStabiliserKd) *
+        skim * skim * BODY_TUNE.skimAuthority;
+      this.torque.addScaledVector(_left, clamp(pitch, -3000, 3000));
+    }
 
     // Authority, not attitude: input adds acceleration toward a target rate and
     // releasing input leaves the rotation alone (bar a whisper of damping), so
@@ -622,12 +1130,43 @@ export class BikePhysics {
     // a stop, not as a ragdoll being switched off.
     s.angularVelocity.multiplyScalar(Math.pow(0.62, dt));
 
-    // Ground friction on whatever is touching.
+    // Ground friction on whatever is touching. A tumbling bike and rider is not
+    // aerodynamic either, so there is real drag in the air as well — otherwise
+    // the only thing acting on a crash that pops the bike off the ground is
+    // GRAVITY, and the speedo climbs all the way through it.
     if (this.front.grounded || this.rear.grounded) {
       _v.copy(s.velocity);
       _v.y = 0;
-      this.force.addScaledVector(_v, -this.mass * 2.4);
+      this.force.addScaledVector(_v, -this.mass * 3.2);
+    } else {
+      this.force.addScaledVector(s.velocity, -this.mass * 0.55);
     }
+
+    // A crash that accelerates cannot read as an impact — and one that pops the
+    // bike into the air WILL accelerate, because free fall adds 20.4 m/s of
+    // speed per second and the speedo reads |velocity|. Reviewed footage had
+    // the readout going 27 → 38 → 39 km/h THROUGH the crash.
+    //
+    // So the crash carries an explicit speed ceiling that ratchets down and
+    // never up. The physics underneath is unchanged — the tumble is still a
+    // real tumble with a real axis and real contacts — but the magnitude of the
+    // velocity is not allowed to grow while the rider is on the floor. It is
+    // applied in `clampCrashSpeed`, after integration.
+  }
+
+  /**
+   * The crash speed ceiling. Runs AFTER integration, which matters: applied
+   * before it, gravity and the contact forces of the same step are added on top
+   * and the ceiling leaks. Ratchets to the current speed and then decays, so
+   * |velocity| is monotonically non-increasing for the whole time the rider is
+   * on the floor whatever the tumble does.
+   */
+  private clampCrashSpeed(dt: number): void {
+    if (this.state.mode !== BikeMode.Crashing) return;
+    const s = this.state;
+    const sp = s.velocity.length();
+    this.crashSpeedCap = Math.min(this.crashSpeedCap, sp) * Math.pow(0.55, dt);
+    if (sp > this.crashSpeedCap && sp > 1e-4) s.velocity.multiplyScalar(this.crashSpeedCap / sp);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -677,6 +1216,20 @@ export class BikePhysics {
   private updateMode(grounded: boolean, wasAirborne: boolean, dt: number, n: Vector3): void {
     const s = this.state;
 
+    // TAKEOFF — the physical event, not the state-machine event. The pump
+    // window is measured against this, because this is the thing the rider is
+    // actually timing against: the moment the wheels leave the lip.
+    if (grounded) {
+      this.sinceTakeoff = -1;
+    } else {
+      if (this.sinceTakeoff < 0 && this.wasGrounded) {
+        this.sinceTakeoff = 0;
+        if (this.pumpFired >= 0 && this.pumpFired <= BODY_TUNE.pumpWindow) this.payPumpBonus();
+      } else if (this.sinceTakeoff >= 0) {
+        this.sinceTakeoff += dt;
+      }
+    }
+
     // A one-wheel-off bump is not a jump. Both wheels have to be clear for a
     // short grace period before the bike is airborne, or the state flickers
     // through every rock garden and every FX system flickers with it.
@@ -696,14 +1249,6 @@ export class BikePhysics {
       case BikeMode.Airborne: {
         s.airTime += dt;
         s.peakAirHeight = Math.max(s.peakAirHeight, s.airHeight);
-
-        // The pump window: a release that lands within PUMP_WINDOW of takeoff
-        // pays out again, directly into vertical velocity.
-        if (this.pumpFired >= 0 && this.pumpFired <= BODY_TUNE.pumpWindow && s.airTime < dt * 2) {
-          s.velocity.addScaledVector(n, BODY_TUNE.pumpAirBonus * this.pumpFiredCharge);
-          this.pumpFired = -1e3;
-        }
-
         if (grounded) this.resolveLanding(n);
         break;
       }
@@ -750,30 +1295,57 @@ export class BikePhysics {
     const closing = Math.max(0, -s.velocity.dot(n));
     s.landingImpact = clamp01(closing / BIKE.landingSpeedTolerance);
     s.landedThisStep = true;
+    s.landCount++;
 
-    // A bad landing scrubs speed; a good one keeps almost all of it. This is
-    // the entire reward for learning to match the slope.
+    // A bad landing scrubs speed; a good one keeps almost all of it. This is the
+    // entire reward for learning to match the slope, and getting the shape of it
+    // right is most of what "landing angle matching" means as a mechanic.
     //
-    // But the penalty has to be proportional to the IMPACT, not applied at full
-    // strength to every touchdown. Speed is lost on landing because the vertical
-    // component gets absorbed, so a 0.2 m hop over a stone should cost almost
-    // nothing. Charging it the full mismatch penalty put the bike in a
-    // catastrophic loop on rough ground: hop, land a few degrees nose-down, lose
-    // 58% of the speed, hop again — 19 m/s bled to 8 m/s in four seconds of
-    // DOWNHILL. The rider never did anything wrong; the trail was simply bumpy.
-    const bite = clamp01(s.landingImpact / 0.55);
-    const keep = lerp(1.0, lerp(0.42, 0.985, s.landingQuality * s.landingQuality), bite);
+    // Two gates before the mismatch penalty is charged at all:
+    //
+    //  BITE — how hard the touchdown actually was. A 0.2 m skim over a roller
+    //  costs almost nothing however crooked it was, because nothing happened.
+    //
+    //  CONSEQUENCE — how big the flight was. On this mountain the wheels leave
+    //  the ground constantly at 19 m/s; those are not jumps and must not be
+    //  scored as jumps.
+    //
+    // And the curve itself is now flat near the top. It used to be
+    // `lerp(0.42, 0.985, q²)`, which charges 17% of the bike's speed for a FIVE
+    // DEGREE angle mismatch — a landing a rider would call clean. Combined with
+    // one micro-landing every third of a second that is where the descent's
+    // speed was going: measured 6 landings in 4 s on the scree run, each one
+    // taking 1.9 m/s, on a slope that should have been adding speed.
+    const bite = clamp01(s.landingImpact / 0.55) * clamp01(s.peakAirHeight / 0.50);
+    const miss = 1 - s.landingQuality;
+    const keep = lerp(1.0, 1 - Math.pow(miss, 1.7) * 0.70, bite);
     _v.copy(s.velocity).addScaledVector(n, -s.velocity.dot(n)); // in-plane part
     const along = _v.length();
     _v.multiplyScalar(along > 1e-5 ? (along * keep) / along : 0);
     s.velocity.copy(_v);
 
-    // Kill the rotation the air gave us; the suspension takes the rest.
-    s.angularVelocity.multiplyScalar(0.22);
+    // Kill the rotation the air gave us; the suspension takes the rest. Scaled
+    // by the same consequence gate — a skim must not stop the balance loop dead.
+    s.angularVelocity.multiplyScalar(lerp(0.86, 0.22, clamp01(s.peakAirHeight / 0.50)));
 
+    // Crashing out of a landing has to be reserved for landings that are
+    // genuinely wrong. `tooCrooked` in particular used to fire on a 30° mismatch
+    // at any impact over 0.3, which on this course meant every single big air in
+    // the review set resolved as a crash and there was no clean landing anywhere
+    // to judge absorption against. A 30° miss off a real jump is ugly and should
+    // cost most of the speed — it is not automatically a crash.
+    // ...and a landing you can crash out of has to have been a real flight.
+    // Otherwise a 40 mm skip across a steep bank — where the ground normal
+    // swings 40° in a couple of metres and "quality" collapses through no fault
+    // of the rider's — puts the bike on the floor. Measured in the stream bed:
+    // a 0.04 m hop resolved as a crash and took the run from 11.6 m/s to a
+    // dead stop. A genuine impact into a wall is a different mechanism, and it
+    // is still caught by the deceleration check in `controlGrounded`.
+    const real = s.peakAirHeight > 0.25 || s.landingImpact > 0.62;
     const tooHard = s.landingImpact > 0.94;
-    const tooCrooked = s.landingQuality < 0.16 && s.landingImpact > 0.30;
-    if (tooHard || tooCrooked) {
+    const tooCrooked = s.landingQuality < 0.05 && s.landingImpact > 0.42;
+    const inverted = _up.dot(n) < -0.1; // landed on the bars or the seat
+    if (real && (tooHard || tooCrooked || inverted)) {
       _v.copy(s.velocity).normalize();
       this.beginCrash(clamp01(Math.max(s.landingImpact, 1 - s.landingQuality)), _v);
     } else {
@@ -788,6 +1360,7 @@ export class BikePhysics {
     this.setMode(BikeMode.Crashing);
     this.crashClock = 0;
     s.crashedThisStep = true;
+    s.crashCount++;
     s.crashSeverity = clamp01(0.25 + severity * 0.75);
     s.crashDirection.copy(direction).normalize();
     if (s.crashDirection.lengthSq() < 0.5) s.crashDirection.set(0, 0, 1);
@@ -799,11 +1372,19 @@ export class BikePhysics {
     s.angularVelocity.addScaledVector(_v, 4.2 + s.crashSeverity * 6.5);
     s.angularVelocity.addScaledVector(UP, (s.crashDirection.x - s.crashDirection.z) * 2.4);
     s.velocity.multiplyScalar(lerp(0.86, 0.44, s.crashSeverity));
-    s.velocity.y += 1.4 + s.crashSeverity * 2.2;
+    // A scuff off the ground, not a launch. The old pop (up to 3.6 m/s) put the
+    // bike ballistic for the best part of a second, which is where the crash
+    // found the room to gain speed.
+    s.velocity.y += 0.7 + s.crashSeverity * 0.9;
+
+    // The ceiling the tumble decays from. Set AFTER the impact scale, so the
+    // impact itself is the last time the speed ever goes up.
+    this.crashSpeedCap = s.velocity.length();
 
     s.pumpCharge = 0;
     s.preload = 0;
     s.manualling = false;
+    this.launchGrace = 0;
   }
 
   private setMode(m: BikeMode): void {
@@ -853,10 +1434,18 @@ export class BikePhysics {
     this.targetLean = 0;
     this.crouchPrev = 0;
     this.pumpFired = -1e3;
+    this.pumpFiredCharge = 0;
+    this.sinceTakeoff = -1;
     this.hopPrev = false;
     this.crashClock = 0;
     this.groundedGrace = 0.1;
     this.lastSpeed = 0;
+    this.wasGrounded = true;
+    this.groundRef.copy(_n);
+    this.tipRoll = 0;
+    this.normalVelPre = 0;
+    this.launchGrace = 0;
+    this.crashSpeedCap = 0;
 
     this.front.reset();
     this.rear.reset();
@@ -927,6 +1516,19 @@ export class BikePhysics {
     if (this.front.grounded) return this.front.surface;
     return DEFAULT_SURFACE;
   }
+}
+
+/**
+ * Frame-rate-independent exponential filter on a direction. `halfLife` is the
+ * time to close half the gap; the result is NOT renormalised here (callers do
+ * it) so this stays allocation-free and usable on any Vector3.
+ */
+function dampVec(cur: Vector3, target: Vector3, halfLife: number, dt: number): Vector3 {
+  const k = 1 - Math.pow(2, -dt / Math.max(halfLife, 1e-5));
+  cur.x += (target.x - cur.x) * k;
+  cur.y += (target.y - cur.y) * k;
+  cur.z += (target.z - cur.z) * k;
+  return cur;
 }
 
 /**

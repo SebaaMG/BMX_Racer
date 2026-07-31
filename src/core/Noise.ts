@@ -187,10 +187,48 @@ export class TileableNoise {
   }
 
   private at(x: number, y: number): number {
+    return this.atPeriod(x, y, this.size);
+  }
+
+  /**
+   * Lattice fetch wrapped on an ARBITRARY period, then folded into the grid.
+   *
+   * This is what actually makes the noise tileable, and the original did not
+   * do it. `at` wrapped on `size`, so one octave closed over [0,1] only when
+   * its frequency was an exact multiple of the grid size. None of them ever
+   * were: the cloud mask ran freqs 5,10,20,40,80 against a 32 lattice, the
+   * detail layer 18,36,72 against 96, the warp 3,6,12 against 16 — not one
+   * closes. Every "tileable" texture in the project had a seam at u=1 and
+   * v=1, which is what guillotined the cloud blobs at the tile edge and put a
+   * hard straight line across the sky wherever the projection reached past
+   * the edge.
+   *
+   * Wrapping on the octave's OWN frequency makes index 0 and index `freq`
+   * the same lattice cell by construction, so every octave closes for any
+   * frequency. The extra `% s` only folds the period onto the stored grid and
+   * cannot break the wrap.
+   */
+  private atPeriod(x: number, y: number, period: number): number {
     const s = this.size;
-    const xi = ((x % s) + s) % s;
-    const yi = ((y % s) + s) % s;
-    return this.grid[yi * s + xi];
+    const p = period > 0 ? period : s;
+    const xi = ((x % p) + p) % p;
+    const yi = ((y % p) + p) % p;
+    return this.grid[(yi % s) * s + (xi % s)];
+  }
+
+  /** Bilinear sample wrapped on `period` grid units rather than on `size`. */
+  private sampleTiled(x: number, y: number, period: number): number {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    const a = this.atPeriod(x0, y0, period);
+    const b = this.atPeriod(x0 + 1, y0, period);
+    const c = this.atPeriod(x0, y0 + 1, period);
+    const d = this.atPeriod(x0 + 1, y0 + 1, period);
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
   }
 
   /** Bilinear + smoothstep interpolated sample. Input in grid units. */
@@ -208,14 +246,17 @@ export class TileableNoise {
     return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
   }
 
-  /** Tileable fBm over uv in [0,1]. Frequencies must be integers to wrap. */
+  /** Tileable fBm over uv. Integer frequencies close exactly, at any size. */
   fbm01(u: number, v: number, baseFreq = 4, octaves = 5, gain = 0.5): number {
     let sum = 0;
     let norm = 0;
     let amp = 1;
     let freq = baseFreq;
     for (let o = 0; o < octaves; o++) {
-      sum += amp * this.sample(u * freq, v * freq);
+      // Wrap on this octave's own frequency, so the octave closes over [0,1]
+      // whatever the grid size is. Inputs outside [0,1] wrap correctly too,
+      // which is what lets a domain warp push past the edge safely.
+      sum += amp * this.sampleTiled(u * freq, v * freq, freq);
       norm += amp;
       amp *= gain;
       freq *= 2;

@@ -219,9 +219,23 @@ export const RAMPS = {
     thresholds: [0.20, 0.55, 0.82],
     edgeSoftness: 0.006,
     specStrength: 1.0,
-    specPower: 160,
+    /**
+     * REACHABLE exponents, not physical ones.
+     *
+     * These were 160 and 4, and on this course they are unreachable: with the
+     * committed sun at 21.5 degrees and the chase camera looking down about 25,
+     * N.H on level water tops out near 0.4 — and pow(0.4, 160) is zero to every
+     * float in the machine. The Fresnel was similarly starved at N.V ~ 0.42
+     * against a 0.42 threshold. The water carried a full specular and rim
+     * declaration that could never produce a single lit pixel, which is why the
+     * stream bed rendered as a flat painted puddle.
+     *
+     * A cel highlight is a drawn shape, not a microfacet distribution. It only
+     * has to land where a painter would put it.
+     */
+    specPower: 4,
     rimStrength: 0.3,
-    rimPower: 4,
+    rimPower: 1.6,
   }),
 
   // ── Vegetation ─────────────────────────────────────────────────────────────
@@ -471,6 +485,21 @@ export const LINES = {
   sobelDepthKnee: 0.0030,
   sobelIdThreshold: 0.5,
   sobelStrength: 0.86,
+  /**
+   * CONTOUR ink — the silhouette edge, as distinct from interior creases.
+   *
+   * It needs its own fade because terrain carries no inverted hull, so the
+   * contour term is the ONLY thing that can ink a ridgeline. Sharing the
+   * interior fade (120-700 m) scaled every ridge in the game to exactly zero,
+   * since every ridgeline worth drawing is further away than that. The floor
+   * matters as much as the range: a 2 km ridge should be a LIGHTER stroke,
+   * never no stroke.
+   */
+  contourFadeStart: 700,
+  contourFadeEnd: 4200,
+  contourFloor: 0.46,
+  contourStrength: 0.98,
+
   /** Interior lines fade with distance so far geometry doesn't turn into noise. */
   sobelFadeStart: 120,
   sobelFadeEnd: 700,

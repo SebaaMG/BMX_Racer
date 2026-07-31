@@ -11,7 +11,7 @@
  *   6. sRGB encode
  *   7. LUT         the grade, in display space, where its constants live
  *   8. ink flood   a wash toward the ink colour, for crashes
- *   9. impact flash the two-value anime frame
+ *   9. impact flash an additive, keyed accent — never a repaint
  *  10. desaturate
  *  11. vignette
  *  12. grain
@@ -124,10 +124,31 @@ const FRAGMENT = /* glsl */ `
     // ── 4. Speed lines ──────────────────────────────────────────────────────
     if (uSpeedIntensity > 0.001) {
       float sl = speedLines(uv, uSpeedFocus, uSpeedIntensity, uTime, aspect);
+
+      // ── HOLD THEM OFF THE SUBJECT ───────────────────────────────────────────
+      // The helper's own header promises strokes that are "absent in the centre
+      // so the subject stays readable", and at low intensity it delivers that.
+      // At high intensity it does not: its inner radius ramps down to 0.16,
+      // which on a 16:9 frame is a fifth of the way to the side edge — the
+      // strokes start on top of the riders. That is the pale wash lying across
+      // both riders and the whole lower frame in scree-speed and ravine-gap.
+      //
+      // A speed line exists to make the frame move AROUND the subject. One
+      // drawn over the subject deletes the thing it is supposed to be
+      // accelerating, so the centre is cleared here unconditionally.
+      vec2 fd = (uv - uSpeedFocus) * vec2(aspect, 1.0);
+      float clear = smoothstep(0.34, 0.72, length(fd));
+
       // Painted, not added. A speed line in animation is a stroke of paint at
       // a flat value; adding light instead gives a glow that blows out the sky
       // and leaves nothing over dark trees.
-      col = mix(col, uSpeedColor, saturate1(sl) * 0.92);
+      //
+      // 0.58, not 0.92. The paint colour is HUD_PALETTE.paper, applied in
+      // LINEAR light and then encoded — so 0.92 of it is very close to a white
+      // frame, and at the intensities a 70 km/h descent produces that is what
+      // it was doing. This is a stroke of paint over a picture, not a fade to
+      // white.
+      col = mix(col, uSpeedColor, saturate1(sl) * clear * 0.58);
     }
 
     if (uDebug > 2.5 && uDebug < 3.5) { fragColor = vec4(linearToSrgb(col), 1.0); return; }
@@ -156,19 +177,39 @@ const FRAGMENT = /* glsl */ `
 
     // ── 9. Impact flash ─────────────────────────────────────────────────────
     if (uImpactFlash > 0.001) {
-      // The anime impact frame: the image collapses to TWO values on a hard
-      // threshold. A simple additive white flash reads as a camera artefact;
-      // this reads as a held drawing.
-      float l = luma(disp);
-      float k = smoothstep(0.33, 0.39, l);
-      vec3 hi = linearToSrgb(uImpactTint);
-      vec3 lo = linearToSrgb(uInkColor) * 0.8;
-      vec3 punch = mix(lo, hi, k);
+      // WHAT THIS USED TO DO, AND WHY IT WAS WRONG.
+      //
+      // It collapsed the frame to two values on a luma threshold and then
+      // mix()ed toward that at the full flash amount. At f = 1 — which is
+      // exactly what a landing produces — nothing of the original image
+      // survived: the sky, which sits above the threshold, was repainted flat
+      // white; the terrain, below it, was repainted flat ink; the riders were
+      // reduced to whatever line work happened to straddle 0.36. Four
+      // consecutive frames of the landing capture render as a posterised
+      // NEGATIVE of the shot at 100% of frame area. An impact frame in
+      // animation is a held DRAWING of the same composition — it is never the
+      // deletion of the composition.
+      //
+      // WHAT IT DOES NOW. A purely ADDITIVE accent, keyed into the parts of the
+      // frame that are already bright, plus a small contrast punch. Additive
+      // cannot remove anything: the sky stays sky, the riders stay riders, the
+      // silhouette reading of the shot is intact on every frame of the hit, and
+      // what you feel is a hard bloom of light rather than a channel flip.
       float f = saturate1(uImpactFlash);
-      disp = mix(disp, punch, f);
-      // A short additive lift on the very hardest hits, so a big one still
-      // blows the frame out rather than merely posterising it.
-      disp += hi * f * f * 0.30;
+      vec3 hi = linearToSrgb(uImpactTint);
+      float l = luma(disp);
+
+      // Keyed, not flat. A flat add lifts the blacks first and reads as fog;
+      // biasing into the lights makes the highlights blow and the darks hold,
+      // which is what an impact actually looks like.
+      float key = 0.30 + 0.70 * smoothstep(0.24, 0.86, l);
+      disp += hi * f * key * 0.62;
+
+      // One notch of extra contrast so the frame reads as GRAPHIC at the peak
+      // rather than merely brighter. Clamped, and at less than half strength,
+      // so no value can cross another and the drawing cannot invert.
+      vec3 punched = clamp((disp - 0.46) * 1.30 + 0.46, 0.0, 1.0);
+      disp = mix(disp, punched, f * 0.45);
     }
 
     // ── 10-12. Tail ─────────────────────────────────────────────────────────

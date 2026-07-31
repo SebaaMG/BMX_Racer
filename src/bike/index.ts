@@ -25,7 +25,7 @@ import {
   type IBike,
   type TrickState,
 } from '../game/Contracts';
-import { BikePhysics, BODY_TUNE, buildOrientation, type BikePhysicsOptions } from './BikePhysics';
+import { BikePhysics, BODY_TUNE, buildOrientation, type BikePhysicsOptions, type BikeStateEx } from './BikePhysics';
 import { BikeVisual, crankRate, type BikeVisualState } from './BikeVisual';
 import { BIKE_GEOM as G } from './BikeModel';
 import type { BikeTerrain } from './Wheel';
@@ -33,6 +33,7 @@ import { clamp01, dampHL, lerp } from '../core/MathX';
 import { ease } from '../core/MathX';
 
 export { BikePhysics, BODY_TUNE, buildOrientation } from './BikePhysics';
+export type { BikeStateEx } from './BikePhysics';
 export { BikeVisual, crankRate } from './BikeVisual';
 export type { BikeVisualState, BikeVisualOptions } from './BikeVisual';
 export { Wheel, SURFACE_TABLE, createFallbackTerrain, slipCurve } from './Wheel';
@@ -96,7 +97,14 @@ export class Bike implements IBike {
     opts.parent?.add(this.object);
   }
 
-  get state(): BikeState {
+  /**
+   * BikeStateEx, not BikeState: the extra fields are the `landCount` /
+   * `crashCount` event counters. Consumers running at RENDER rate must use
+   * those and not `landedThisStep` / `crashedThisStep`, which are latched for
+   * exactly one 120 Hz physics step and are therefore invisible to anything
+   * downstream of the accumulator. See the BikeStateEx doc comment.
+   */
+  get state(): BikeStateEx {
     return this.physics.state;
   }
 

@@ -187,6 +187,34 @@ const PERTURB_MID_M = 11;
 const SNOW_SLOPE_SHED_M = 210;
 const SNOW_ASPECT_MELT_M = 58;
 
+/**
+ * Box-blur radius, in texels, applied to the snow rule's INPUTS.
+ *
+ * The scour rule above is correct physics and it was producing leprosy: the
+ * summit rendered as hundreds of small white blotches with fringed, torn
+ * perimeters scattered over lavender scree, reading as mould rather than as
+ * drifts. The reason is that it was evaluated per texel against a per-texel
+ * height. Slope on a 2 m grid is a HIGH-FREQUENCY field — it flips several
+ * hundred metres of effective altitude between one texel and the next on any
+ * broken ground — and aspect, which comes from a raw central difference, is
+ * worse. Thresholding either produces speckle by construction, and the
+ * despeckle pass at the end can only remove islands of one and two texels; a
+ * five-texel blotch survives it intact and there were thousands of them.
+ *
+ * Blurring the INPUTS rather than the resulting mask is the difference between
+ * "is this hillside steep" and "is this texel steep", and only the first of
+ * those is a question about where snow lies. At 2 m per texel a radius of 7,
+ * twice, integrates over roughly a fifty-metre neighbourhood — a slope face,
+ * not a bump — and the boundary that falls out is a long, readable curve that
+ * the shader's own jitter can then fray.
+ *
+ * The snow test also reads a BLURRED height for the same reason. Everything
+ * else in the classifier keeps the sharp one: a snow line is a weather
+ * boundary, whereas a rock band is a fact about the specific texel.
+ */
+const SNOW_SMOOTH_RADIUS = 7;
+const SNOW_SMOOTH_PASSES = 2;
+
 /** The sun's horizontal bearing, normalised. Read once from the palette. */
 const SUN_HORIZ_LEN = Math.hypot(SUN_DIRECTION.x, SUN_DIRECTION.z) || 1;
 const SUN_HORIZ_X = SUN_DIRECTION.x / SUN_HORIZ_LEN;
@@ -235,6 +263,32 @@ export function classifyZones(o: ClassifyOptions): ZoneField {
   // about a hillside rather than about a droplet.
   const eroSmooth = boxBlur(erosion, size, 3, 2);
 
+  // ── The snow rule's low-passed inputs ──────────────────────────────────────
+  // See SNOW_SMOOTH_RADIUS. Slope has to be un-quantised into radians first;
+  // aspect is built here rather than reused from the main loop because the main
+  // loop wants the sharp version and this one must not have it.
+  const slopeRad = new Float32Array(size * size);
+  const sunFace = new Float32Array(size * size);
+  for (let iz = 0; iz < size; iz++) {
+    const row = iz * size;
+    const izm = iz > 0 ? row - size : row;
+    const izp = iz < size - 1 ? row + size : row;
+    for (let ix = 0; ix < size; ix++) {
+      slopeRad[row + ix] = slope[row + ix] * SLOPE_QUANT;
+      const ixm = ix > 0 ? ix - 1 : ix;
+      const ixp = ix < size - 1 ? ix + 1 : ix;
+      const dhdx = height[row + ixp] - height[row + ixm];
+      const dhdz = height[izp + ix] - height[izm + ix];
+      const aLen = Math.hypot(dhdx, dhdz);
+      // The horizontal component of the surface normal points DOWNHILL.
+      sunFace[row + ix] =
+        aLen > 1e-6 ? (-dhdx * SUN_HORIZ_X + -dhdz * SUN_HORIZ_Z) / aLen : 0;
+    }
+  }
+  const slopeSnow = boxBlur(slopeRad, size, SNOW_SMOOTH_RADIUS, SNOW_SMOOTH_PASSES);
+  const aspectSnow = boxBlur(sunFace, size, SNOW_SMOOTH_RADIUS, SNOW_SMOOTH_PASSES);
+  const heightSnow = boxBlur(height, size, SNOW_SMOOTH_RADIUS, SNOW_SMOOTH_PASSES);
+
   const invSpan = 1 / (size - 1);
 
   for (let iz = 0; iz < size; iz++) {
@@ -262,29 +316,21 @@ export function classifyZones(o: ClassifyOptions): ZoneField {
 
       let kind: SurfaceKind;
 
-      // Aspect: which way the ground faces, horizontally. Central differences
-      // on the height field — the slope field is a magnitude and has already
-      // thrown the direction away.
-      const ixm = ix > 0 ? ix - 1 : ix;
-      const ixp = ix < size - 1 ? ix + 1 : ix;
-      const izm = iz > 0 ? row - size : row;
-      const izp = iz < size - 1 ? row + size : row;
-      const dhdx = height[row + ixp] - height[row + ixm];
-      const dhdz = height[izp + ix] - height[izm + ix];
-      // The horizontal component of the surface normal points DOWNHILL.
-      const aLen = Math.hypot(dhdx, dhdz);
-      const sunFacing =
-        aLen > 1e-6 ? (-dhdx * SUN_HORIZ_X + -dhdz * SUN_HORIZ_Z) / aLen : 0;
-
-      // Effective altitude for the snow test only: the real (perturbed) height
-      // less whatever slope and sun have stripped off this particular face.
+      // ── The snow test, and ONLY the snow test, reads the low-passed fields ─
+      // See SNOW_SMOOTH_RADIUS. Every term here is an assertion about a
+      // hillside; every term elsewhere in this function is an assertion about a
+      // texel, and mixing the two is what turned the summit into leprosy.
       const snowScour =
-        sl * SNOW_SLOPE_SHED_M + Math.max(0, sunFacing) * SNOW_ASPECT_MELT_M;
+        slopeSnow[i] * SNOW_SLOPE_SHED_M + Math.max(0, aspectSnow[i]) * SNOW_ASPECT_MELT_M;
+      const hpSnow =
+        heightSnow[i] +
+        sampleCoarse(pLow, u, v) * PERTURB_COARSE_M +
+        sampleCoarse(pMid, u, v) * PERTURB_MID_M;
 
       if (sl > ZONE.rockSlopeRad + sampleCoarse(pRock, u, v) * 0.10) {
         // ── 2. Anything genuinely steep is bedrock, at every altitude ───────
         kind = SurfaceKind.Rock;
-      } else if (hp - snowScour > ZONE.screeTop + sampleCoarse(pSnow, u, v) * 26) {
+      } else if (hpSnow - snowScour > ZONE.screeTop + sampleCoarse(pSnow, u, v) * 26) {
         kind = SurfaceKind.Snow;
       } else if (hp > ZONE.rockTop) {
         kind = SurfaceKind.Scree;

@@ -24,9 +24,51 @@
  * get punctuation without the game stopping. That split is what lets the hold
  * stay rare.
  *
- * The flash itself decays as an explicit STAIRCASE — 1.0, 0.55, 0.22, cut —
- * rather than a curve. A smoothly fading white flash is a bloom artefact; a
- * flash that holds three discrete values and then stops is a drawn effect.
+ * The flash itself decays as an explicit STAIRCASE, in whole frames, rather
+ * than a curve. A smoothly fading white flash is a bloom artefact; a flash that
+ * holds a value and then cuts is a drawn effect.
+ *
+ * ──────────────────────────────────────────────────────────────────────────
+ * KNOWN DEFECT, DOWNSTREAM OF HERE — src/npr/passes/CompositePass.ts
+ *
+ * This module publishes only a scalar (POST_STATE.impactFlash) and a tint. How
+ * that becomes pixels is the composite's business, and the composite currently
+ * gets it wrong in a way no amount of tuning here can fully repair. Section 9
+ * of COMPOSITE_FRAG reads, in essence:
+ *
+ *     float k = smoothstep(0.33, 0.39, luma(disp));
+ *     vec3 punch = mix(inkColor * 0.8, impactTint, k);
+ *     disp = mix(disp, punch, uImpactFlash);
+ *
+ * `punch` discards the frame and rebuilds it as a two-value threshold of its
+ * own luminance. As uImpactFlash approaches 1 the ENTIRE image — sky included
+ * — is replaced by that two-tone remap: bright sky and lit rock both land on
+ * the same flat tint, shadowed riders land on flat ink, and the shot reads as
+ * a posterised negative with the sky deleted. Captured `landing` f0033-f0036,
+ * `crash` f0015-f0016, `trick-360` f0100 and `switchback` ~f0044 are all this.
+ *
+ * Two things are wrong and only the first is ours:
+ *
+ *  1. AMPLITUDE (fixed here). The peak is now capped by
+ *     IMPACT_TUNING.flashCeiling so `f` never exceeds ~0.34 and the original
+ *     image always survives the blend. This alone stops the negative.
+ *
+ *  2. THE OPERATOR (needs a change in CompositePass, which this agent does not
+ *     own). An impact accent should ADD contrast, not REPLACE the image. The
+ *     minimal correct form keeps the shot's own colour and pushes it away from
+ *     mid-grey toward the tint, instead of quantising it to two values:
+ *
+ *         float l    = luma(disp);
+ *         float f    = saturate1(uImpactFlash);
+ *         // widen the frame's existing contrast about its own mid-point...
+ *         vec3  hard = clamp((disp - 0.5) * (1.0 + f * 2.2) + 0.5, 0.0, 1.0);
+ *         // ...and tint only the part that was already bright.
+ *         disp = mix(disp, hard, f);
+ *         disp += linearToSrgb(uImpactTint) * f * f * smoothstep(0.45, 0.85, l) * 0.5;
+ *
+ *     That keeps the sky a sky, keeps the riders coloured, and still snaps the
+ *     frame to a hard graphic read for the one or two frames it is up.
+ * ──────────────────────────────────────────────────────────────────────────
  */
 
 import { Color } from 'three';
@@ -49,14 +91,44 @@ export const IMPACT_TUNING = {
   recoverTime: 0.10,
   recoverScale: 0.34,
   /**
-   * Staircase step duration, seconds. Three steps then cut.
+   * Staircase length, in RENDERED FRAMES. Not seconds.
    *
-   * 0.055 gave a 165 ms flash — 10 frames at 60fps against a brief that asks
-   * for a 1-2 frame hold. At that length it stops reading as an impact accent
-   * and starts reading as a broken post-process. 0.018 puts the full-strength
-   * step on one frame and the two decay steps on one each.
+   * This was a duration (0.055 s, then 0.018 s) and that was the whole bug.
+   * The convention is "one or two frames" — the unit is a frame, and the
+   * moment you express it in seconds you are betting on the frame rate. 0.055
+   * gave a ten-frame flash at 60fps; even 0.018 gives three, and would give
+   * six on a 120 Hz display for identical code. Counting frames makes the hold
+   * exactly as long as the spec says on every machine, which is the only
+   * reason the effect reads as punctuation rather than as a hitch.
+   *
+   * 2 for a hold (full strength, then one step out), 1 for a flash-only.
    */
-  flashStep: 0.018,
+  flashFrames: 2,
+  flashOnlyFrames: 1,
+  /**
+   * CEILING ON THE FLASH. This is the number that stops the composite from
+   * eating the frame, and it is worth being explicit about why it is so low.
+   *
+   * CompositePass applies `uImpactFlash` as `mix(disp, punch, f)` where
+   * `punch` is a TWO-VALUE posterisation of the frame's own luminance —
+   * everything under 0.33 luma becomes ink, everything over becomes the tint.
+   * At f near 1 that is not an accent, it is a full-frame replacement: the sky
+   * and the lit terrain collapse to the same flat highlight, the riders
+   * collapse to solid black, and the result reads as a photographic negative
+   * with the sky deleted. Which is precisely what four consecutive frames of
+   * `landing` showed.
+   *
+   * The composite's blend is the thing that should be fixed (see the note in
+   * ImpactFrames' class comment), but the amplitude is ours, and holding the
+   * peak at 0.34 keeps enough of the original image alive that the effect
+   * reads as a hard high-contrast accent laid OVER the shot rather than
+   * instead of it.
+   */
+  flashCeiling: 0.34,
+  /** Ceiling on the edge-in ink wash. Above ~0.3 it closes over the frame. */
+  inkCeiling: 0.30,
+  /** Ceiling on the desaturation. Above this the shot simply goes monochrome. */
+  desatCeiling: 0.16,
 } as const;
 
 const _tint = new Color();
@@ -74,7 +146,9 @@ export class ImpactFrames {
   private cooldown = 0;
   private recover = 0;
 
-  private flashT = -1;
+  /** Rendered frames of flash remaining. -1 = idle. Counted, never timed. */
+  private flashFramesLeft = -1;
+  private flashSpan = 1;
   private flashPeak = 0;
   private inkPeak = 0;
   private flashTint = new Color(1, 1, 1);
@@ -113,12 +187,13 @@ export class ImpactFrames {
     this.recent[this.recentHead] = this.clock;
     this.recentHead = (this.recentHead + 1) % this.recent.length;
 
-    this.flashT = 0;
-    this.flashPeak = 0.55 + 0.45 * s;
+    this.flashSpan = IMPACT_TUNING.flashFrames;
+    this.flashFramesLeft = this.flashSpan;
+    this.flashPeak = (0.55 + 0.45 * s) * IMPACT_TUNING.flashCeiling;
     // Ink flood is the other half of the convention: the frame collapses toward
     // the ink colour at the same moment it blows out, which is what gives the
     // held drawing its poster-like contrast instead of just making it bright.
-    this.inkPeak = 0.30 + 0.55 * s * (isCrash ? 1.0 : 0.7);
+    this.inkPeak = (0.30 + 0.55 * s * (isCrash ? 1.0 : 0.7)) * IMPACT_TUNING.inkCeiling;
     this.setTint(tint, isCrash);
     return true;
   }
@@ -131,11 +206,12 @@ export class ImpactFrames {
     const s = clamp01(intensity);
     if (s <= 0.01) return;
     // Never let a small flash stomp a big one that is still playing.
-    const peak = s * 0.7;
-    if (this.flashT >= 0 && peak <= this.flashPeak * this.staircase(this.flashT)) return;
-    this.flashT = 0;
+    const peak = s * 0.7 * IMPACT_TUNING.flashCeiling;
+    if (this.flashFramesLeft > 0 && peak <= this.flashPeak * this.staircase()) return;
+    this.flashSpan = IMPACT_TUNING.flashOnlyFrames;
+    this.flashFramesLeft = this.flashSpan;
     this.flashPeak = peak;
-    this.inkPeak = s * 0.18;
+    this.inkPeak = s * 0.18 * IMPACT_TUNING.inkCeiling;
     this.setTint(tint, false);
   }
 
@@ -160,16 +236,15 @@ export class ImpactFrames {
   }
 
   /**
-   * The three-step staircase. Values held flat for `flashStep` seconds each,
-   * then cut to zero. Returns a multiplier in {1, 0.55, 0.22, 0}.
+   * The staircase, in frames. The first frame is full strength and each
+   * subsequent frame drops a hard step; there is never an in-between value,
+   * because the whole point of the convention is that the accent is CUT, not
+   * faded. A two-frame hold reads {1, 0.5}; a one-frame flash reads {1}.
    */
-  private staircase(t: number): number {
-    if (t < 0) return 0;
-    const step = Math.floor(t / IMPACT_TUNING.flashStep);
-    if (step === 0) return 1;
-    if (step === 1) return 0.55;
-    if (step === 2) return 0.22;
-    return 0;
+  private staircase(offset = 0): number {
+    const left = this.flashFramesLeft - offset;
+    if (left <= 0) return 0;
+    return left / this.flashSpan;
   }
 
   /**
@@ -199,23 +274,26 @@ export class ImpactFrames {
       this.timeScale = 1;
     }
 
-    if (this.flashT >= 0) {
-      this.flashT += dt;
-      const s = this.staircase(this.flashT);
-      if (s <= 0) {
-        this.flashT = -1;
-        POST_STATE.impactFlash = 0;
-        POST_STATE.inkFlood = 0;
-        POST_STATE.desaturate = 0;
-      } else {
-        POST_STATE.impactFlash = this.flashPeak * s;
-        POST_STATE.impactTint.copy(this.flashTint);
-        // Ink flood decays one step faster than the flash so the frame goes
-        // white-hot first and graphic second, which is the order the eye reads.
-        POST_STATE.inkFlood = this.inkPeak * this.staircase(this.flashT + IMPACT_TUNING.flashStep);
-        // The blown-out frame loses colour before it loses brightness.
-        POST_STATE.desaturate = this.flashPeak * s * 0.45;
-      }
+    if (this.flashFramesLeft > 0) {
+      const s = this.staircase();
+      POST_STATE.impactFlash = this.flashPeak * s;
+      POST_STATE.impactTint.copy(this.flashTint);
+      // Ink flood decays one step faster than the flash so the frame goes
+      // white-hot first and graphic second, which is the order the eye reads.
+      POST_STATE.inkFlood = this.inkPeak * this.staircase(1);
+      // The blown-out frame loses colour before it loses brightness.
+      POST_STATE.desaturate = Math.min(this.flashPeak * s * 0.45, IMPACT_TUNING.desatCeiling);
+      // Decrement AFTER publishing, and clear on the following update rather
+      // than this one — a one-frame flash that zeroed itself in the same call
+      // that raised it would never survive to be composited at all.
+      this.flashFramesLeft--;
+    } else if (this.flashFramesLeft === 0) {
+      this.flashFramesLeft = -1;
+      // Hand the dials straight back rather than leaving them latched — the
+      // accent is over on the frame it is over.
+      POST_STATE.impactFlash = 0;
+      POST_STATE.inkFlood = 0;
+      POST_STATE.desaturate = 0;
     }
   }
 
@@ -224,7 +302,7 @@ export class ImpactFrames {
     this.framesLeft = 0;
     this.cooldown = 0;
     this.recover = 0;
-    this.flashT = -1;
+    this.flashFramesLeft = -1;
     this.timeScale = 1;
     this.recent.fill(-1e6);
     this.recentHead = 0;
