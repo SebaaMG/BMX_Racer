@@ -577,9 +577,18 @@ export class RouteProfileWidget extends Widget {
       this.invalidate();
     }
 
-    this.progress = clamp01(m.routeProgress);
-    // The marker eases toward the true progress so it glides instead of
-    // stepping — progress arrives quantised by the physics step.
+    const target = clamp01(m.routeProgress);
+    // Snap on a teleport, ease within a run. The easing is there because
+    // progress arrives quantised by the physics step and a marker that steps
+    // reads as a dropped frame — but easing a JUMP is a different thing
+    // entirely: after a restart or a capture-harness reposition the marker
+    // spends a fifth of a second somewhere the header's percentage says it is
+    // not, and a still caught in that window shows the panel disagreeing with
+    // itself. Same threshold and same reasoning as the corner call's guard: one
+    // frame at racing speed moves about 8e-5 of the course, so 0.01 cannot fire
+    // in play.
+    if (Math.abs(target - this.progress) > 0.01) this.markerT = target;
+    this.progress = target;
     this.markerT = dampHL(this.markerT, this.progress, 0.05, dt);
     this.pulse = time;
 

@@ -17,7 +17,7 @@ await p.evaluate(() => {
   g.capture.setPose('rider-closeup');
   for (let i = 0; i < 14; i++) g.capture.step(1 / 60);
 });
-const CLIP = { x: 300, y: 690, width: 500, height: 80 };
+const CLIP = { x: 700, y: 690, width: 500, height: 110 };
 const shoot = async (n) => {
   await p.evaluate(() => window.__DESCENT__.game.capture.step(1e-6));
   await p.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));

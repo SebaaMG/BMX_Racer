@@ -685,11 +685,38 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
         celCol = mix(celCol, uBandColor[3] * 1.04, bandStep(lipM, 0.30, 0.05) * 0.72);
       }
 
-      // The inked trail edge. The plan-view irregularity lives in the geometry;
-      // this is the value break that turns a boundary into a drawn line, with a
+      // ── The trail edge: a SHOULDER first, then the line on top of it ──────
+      //
+      // The review logged this as a "hard horizontal terrain LOD seam, full
+      // frame width, where the near clipmap ring meets the next". It is not the
+      // clipmap. Hiding the ribbon in rider-closeup removes the line and hiding
+      // the terrain does not, and neither the id nor the depth channel of the
+      // outline pass has anything at that pixel — so it is this block, drawn on
+      // the geometry, and nothing else.
+      //
+      // What made it read as a seam rather than as a trail edge is that there
+      // was nothing on either side of it. The ribbon and the ground it is cut
+      // into are both painted from RAMPS.trail and now carry the same plate
+      // ladder and the same world-space tonal shapes, so the two surfaces meet
+      // at the same value; and the inked band is a fixed FRACTION of the
+      // half-width, which on a trail seen almost edge-on from a chase camera is
+      // one device pixel. A one-pixel dark line running the width of the frame
+      // through a field of one flat colour is a scratch on the cel, whatever
+      // drew it.
+      //
+      // A background painter draws a trail edge as a BAND: the outer third of
+      // the tread is looser, scuffed and a shade darker, and the line sits at
+      // the outside of that band. The shoulder is a third of the half-width —
+      // about a metre — so it survives any viewing angle, and it is quantised
+      // because everything on this surface is.
+      float wob = fbm2(vec2(dAlong * 0.85, 3.1), 3);
+      float shoulder = bandStep(abs(across), 0.70 + (wob - 0.5) * 0.10, 0.012);
+      celCol *= mix(1.0, 0.945, shoulder);
+
+      // The line itself. The plan-view irregularity lives in the geometry; this
+      // is the value break that turns a boundary into a drawn stroke, with a
       // little wander in the threshold so it never runs perfectly parallel to
       // the spline.
-      float wob = fbm2(vec2(dAlong * 0.85, 3.1), 3);
       float edgeT = bandStep(abs(across), 0.895 + (wob - 0.5) * 0.055, 0.008);
       celCol = mix(celCol, mix(celCol, uBandColor[0], 0.62), edgeT);
 

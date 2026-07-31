@@ -776,10 +776,42 @@ export class RaceDirector {
    */
   private updateCornerPreview(distance: number): HudModel['cornerPreview'] {
     const step = 8;
-    for (let d = 10; d <= CORNER_PREVIEW_RANGE; d += step) {
-      const s = this.track.sampleAtDistance(Math.min(distance + d, this.track.length), this.scratchSample);
-      if (Math.abs(s.curvature) > 2.6e-3) {
-        this.cornerPreview.curvature = clamp(s.curvature * 320, -1, 1);
+    const kThreshold = 2.6e-3;
+    const curvAt = (d: number): number => {
+      const s = this.track.sampleAtDistance(
+        Math.min(distance + d, this.track.length),
+        this.scratchSample,
+      );
+      return s.curvature;
+    };
+
+    // Announce the NEXT corner, not the one you are already riding.
+    //
+    // The scan used to start at 10 m and return the first sample past
+    // threshold, so a rider mid-corner was told "10 M" about the corner their
+    // front wheel was already in — a preview of the present, which is the one
+    // thing a preview cannot be. If the track is already turning here, walk
+    // forward to the exit first and only then start looking.
+    let d = 0;
+    if (Math.abs(curvAt(0)) > kThreshold) {
+      // Two consecutive straight samples to call it an exit, so a brief
+      // slackening in the middle of a long bend does not split it in two and
+      // re-announce the same corner.
+      let straightRun = 0;
+      while (d <= CORNER_PREVIEW_RANGE) {
+        d += step;
+        if (Math.abs(curvAt(d)) <= kThreshold) {
+          if (++straightRun >= 2) break;
+        } else {
+          straightRun = 0;
+        }
+      }
+    }
+
+    for (d = Math.max(d, 10); d <= CORNER_PREVIEW_RANGE; d += step) {
+      const k = curvAt(d);
+      if (Math.abs(k) > kThreshold) {
+        this.cornerPreview.curvature = clamp(k * 320, -1, 1);
         this.cornerPreview.distance = d;
         return this.cornerPreview;
       }
