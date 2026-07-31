@@ -86,8 +86,23 @@ export const FOG_BANDS = {
    * a separate sheet of paper laid behind the one in front of it.
    */
   colors: [c(0xa9bed6), c(0xb4cbe0), c(0xc0d7e8), c(0xcce2ef)],
-  /** How much each band flattens toward its colour: 0 = clear, 1 = fully hazed. */
-  strengths: [0.16, 0.44, 0.72, 0.94],
+  /**
+   * How much each band flattens toward its colour: 0 = clear, 1 = fully hazed.
+   *
+   * BAND 0 MUST BE ZERO. It is the plateau that covers everything from the
+   * lens to the first boundary, so any strength in it is haze applied at point
+   * blank. It used to be 0.16, and the continuous `t` multiply in
+   * applyQuantizedFog hid that by fading it out near the camera — but that
+   * multiply also swept the four plateaus back into a gradient, which is the
+   * bug it was removed for. Removing it exposed the real one: 16% of a cool
+   * blue was being laid over ground three metres from the camera.
+   *
+   * Measured on the bike-detail trail with fog forced off versus on: hue 359
+   * and 24% saturation became hue 20 and 47%, against an authored 27 and 45%.
+   * The entire "the palette has rotated to dusk-pink" finding across four
+   * critic passes was this one number.
+   */
+  strengths: [0.0, 0.34, 0.66, 0.92],
   /** Extra warmth injected on the sun side of each band. */
   sunTint: c(0xffd5a3),
   sunTintStrength: 0.35,

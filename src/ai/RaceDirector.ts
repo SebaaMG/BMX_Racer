@@ -226,7 +226,17 @@ export class RaceDirector {
 
       const spec: RacerSpec = {
         id: isPlayer ? 'player' : `ai${aiIndex}`,
-        name: isPlayer ? colors.name : personality!.name,
+        // Name AND colours both come from RIDER_COLORS, always.
+        //
+        // The name used to come from the PERSONALITY while the chip colour came
+        // from RIDER_COLORS[1 + aiIndex] — two independent lists that only
+        // agree by coincidence. DEFAULT_GRID is [Clean, Aggressive, Erratic]
+        // and the colour table is [player, kestrel, mags, okoye], so the first
+        // AI took Clean's name with kestrel's blue chip: the leaderboard drew
+        // MAGS in blue and KESTREL in yellow in every single frame of the
+        // review set. A rider's identity is one thing; personality supplies
+        // behaviour and nothing else.
+        name: colors.name,
         colorIndex,
         isPlayer,
         isGhost: false,

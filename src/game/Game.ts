@@ -116,6 +116,14 @@ interface Situation {
   input?: Partial<BikeInput>;
   /** Put the bike down on the first step, deterministically. */
   crash?: boolean;
+  /**
+   * Where the pack goes. Rivals used to spawn 3.5 m behind the player, which
+   * is inside the chase boom, so an opponent filled a screen quadrant. Moving
+   * them to 12 m+ behind fixed that and created the opposite failure: a
+   * sequence named `pack-race` with no rival in a single frame of it, because
+   * behind the player is exactly where a chase camera cannot see.
+   */
+  pack?: 'behind' | 'ahead';
 }
 
 // Section boundaries as a fraction of the 3839 m course, measured from the
@@ -140,7 +148,7 @@ const SITUATIONS: Record<string, Situation> = {
   'rockgarden-low':     { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
   // Genuinely ballistic off the table, not parked in the air above it.
   // Placed on the run-in and ridden off the lip. No impulse.
-  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 145, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
+  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 271, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
   // Placed just short of the hole (0.675) and launched, so the rider is
   // arcing OVER the ravine rather than standing next to it.
   // The harness settles 12 frames (0.2 s) before the shutter, which carries the
@@ -157,21 +165,41 @@ const SITUATIONS: Record<string, Situation> = {
   'finish-sprint':      { t: 0.955, speed: 20, camera: CameraMode.Chase, input: { pedal: 1 } },
   crash:                { t: 0.559, speed: 17, camera: CameraMode.Orbit, orbit: { yaw: 1.25, pitch: 0.18, dist: 8 }, crash: true },
   'valley-vista':       { t: 0.300, speed: 0,  camera: CameraMode.Orbit, orbit: { yaw: 0.0, pitch: 0.06, dist: 180, spin: 0 } },
+  // The player hunting the pack, so the rivals are in the chase frustum.
+  'pack-race':          { t: 0.205, speed: 19, camera: CameraMode.Chase, pack: 'ahead', input: { pedal: 1 } },
 };
 
 /** Motion setups: a situation plus the input held for the whole sequence. */
-const SEQUENCES: Record<string, { from: string; input?: Partial<BikeInput> }> = {
+/**
+ * Motion setups. Each is a DISTINCT run that contains its own event.
+ *
+ * They previously all pointed at a handful of shared situations and differed
+ * only by an `input` field, which for the air sequences was inert because the
+ * rider was never airborne. A motion review found the result: `landing`,
+ * `tabletop-air` and `trick-360` were byte-for-intent the same capture (mean
+ * absolute pixel difference 1.18 on 0-255), and so were `scree-speed` and
+ * `pack-race`. Five of eight sequences were two runs.
+ *
+ * `preroll` is in 120 Hz physics steps and is the whole game here. Measured on
+ * the tabletop: takeoff is 127 steps after the preroll finishes and the flight
+ * lasts 46. A sequence settles 4 render frames (8 steps) before its first
+ * shutter, so a preroll of 248 puts the takeoff about 8 captured frames in —
+ * inside the window a reviewer is looking at, rather than before it.
+ */
+const SEQUENCES: Record<string, { from: string; input?: Partial<BikeInput>; preroll?: number }> = {
   launch:         { from: 'summit-rider', input: { pedal: 1 } },
   switchback:     { from: 'switchback-lean', input: { steer: 0.9, pedal: 0.5 } },
-  'tabletop-air': { from: 'tabletop-air', input: { airPitch: 0.35 } },
-  // Chase, not the ravine-gap orbit: at dist 19 the rider is 45-73 px and a
-  // landing cannot be judged at that size. This sequence exists to review the
-  // absorption chain, so it has to be close enough to see a knee bend.
-  landing:        { from: 'tabletop-air', input: { airPitch: 0.15 } },
+  // Takeoff ~8 frames in, apex ~20, touchdown ~31.
+  'tabletop-air': { from: 'tabletop-air', preroll: 248, input: { airPitch: 0.28 } },
+  // Starts in the air so the whole capture is the descent, the touchdown and
+  // the absorption chain that follows it.
+  landing:        { from: 'tabletop-air', preroll: 286, input: { airPitch: 0.1 } },
   crash:          { from: 'crash' },
   'scree-speed':  { from: 'scree-speed', input: { pedal: 1 } },
-  'trick-360':    { from: 'tabletop-air', input: { airYaw: 1 } },
-  'pack-race':    { from: 'scree-speed', input: { pedal: 1 } },
+  // Same launch, full yaw authority held — airYaw is inert on the ground and
+  // takes hold the moment the wheels leave it.
+  'trick-360':    { from: 'tabletop-air', preroll: 248, input: { airYaw: 1 } },
+  'pack-race':    { from: 'pack-race', input: { pedal: 1 } },
 };
 
 const _v = new Vector3();
@@ -234,7 +262,7 @@ export class Game {
       setSequence: (name: string) => {
         const s = SEQUENCES[name];
         if (!s) return false;
-        if (!this.applySituation(s.from)) return false;
+        if (!this.applySituation(s.from, s.preroll)) return false;
         if (s.input) this.setScripted(s.input);
         return true;
       },
@@ -468,7 +496,7 @@ export class Game {
   // Capture
   // ───────────────────────────────────────────────────────────────────────────
 
-  private applySituation(name: string): boolean {
+  private applySituation(name: string, prerollOverride?: number): boolean {
     const s = SITUATIONS[name];
     if (!s || !this.race) return false;
 
@@ -495,7 +523,8 @@ export class Game {
       // cannot help: there is nowhere for a 4.8 m boom to go that is not inside
       // a rider standing 3.5 m away. Real race spacing is metres, not
       // centimetres, and the review set has to show the race the player sees.
-      const back = isPlayer ? 0 : 12 + i * 6.5;
+      const ahead = s.pack === 'ahead';
+      const back = isPlayer ? 0 : (ahead ? -(9 + i * 7) : 12 + i * 6.5);
       const d = Math.max(1, Math.min(total - 2, s.t * total - back));
       const sample = this.track.sampleAtDistance(d);
 
@@ -551,9 +580,8 @@ export class Game {
     this.effects.reset();
 
     // Ride into the situation rather than being dropped into it.
-    if (s.preroll) {
-      for (let i = 0; i < s.preroll; i++) this.race.fixedUpdate(1 / 120);
-    }
+    const preroll = prerollOverride ?? s.preroll ?? 0;
+    for (let i = 0; i < preroll; i++) this.race.fixedUpdate(1 / 120);
 
     // Swallow the checkpoint splits the teleport just crossed, and wipe any
     // popup already on screen from the previous pose.

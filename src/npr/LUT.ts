@@ -142,8 +142,23 @@ export function gradeLutTexture(size = 32): Data3DTexture {
 
         // Split tone by luminance.
         const l = LUMA_R * cr + LUMA_G * cg + LUMA_B * cb;
-        const sw = Math.max(0, 1 - l * 1.6);
-        const hw = Math.max(0, (l - 0.55) * 2.2);
+        // THE CROSSOVER, and it was the palette rotation.
+        //
+        // These were `1 - l*1.6` and `(l - 0.55)*2.2`: the shadow tint reached
+        // all the way to luma 0.625 while the gold did not begin until 0.55.
+        // A sunlit dirt trail sits at roughly 0.50-0.55 — below the gold, still
+        // inside the violet. And shadowTint - 0.5 is (-0.143, -0.210, +0.025),
+        // which cuts green hardest and adds blue, so applied to an orange it
+        // rotates it toward magenta. Measured across the review set, the lit
+        // trail read hue 6 at 26% saturation against an authored 27-33 at
+        // 44-45%, with two frames past red into magenta at 348 and 358. The
+        // committed dawn-gold was being turned into dusk-pink by its own grade.
+        //
+        // Now the two weights hand over at ~0.35 with a small overlap: shadows
+        // get the violet, mid and up get the gold, and no luminance is left in
+        // a gap where only the cool tint applies.
+        const sw = Math.max(0, 1 - l * 2.8);
+        const hw = Math.max(0, (l - 0.34) * 1.6);
         cr += (sh.r - 0.5) * sw * split + (hi.r - 0.5) * hw * split;
         cg += (sh.g - 0.5) * sw * split + (hi.g - 0.5) * hw * split;
         cb += (sh.b - 0.5) * sw * split + (hi.b - 0.5) * hw * split;
