@@ -134,8 +134,8 @@ export class ShadowCascades {
       depth.magFilter = NearestFilter;
       depth.name = `shadowDepth${i}`;
       const rt = new WebGLRenderTarget(size, size, {
-        // The colour attachment is never read. R8 keeps it to 4MB instead of
-        // the 16MB an RGBA8 would cost, twice over.
+        // The colour attachment is never read. At 4096 square, R8 keeps it to
+        // 16MB instead of the 64MB an RGBA8 would cost, twice over.
         format: RedFormat,
         type: UnsignedByteType,
         minFilter: NearestFilter,
@@ -290,7 +290,7 @@ export class ShadowCascades {
       // White = far. The colour buffer is unused, but clearing it is what
       // gives the driver permission to discard the previous contents rather
       // than load them, which on a tiler is the difference between free and
-      // a full 4MB read per cascade.
+      // a full 16MB read per cascade.
       renderer.setClearColor(0xffffff, 1);
       for (let i = 0; i < 2; i++) {
         this.fit(i, camera);

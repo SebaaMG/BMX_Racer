@@ -110,16 +110,32 @@ export class Hud implements IHud {
     // clears the horizon in every pose in the set. It also ends at design x 608,
     // which puts 117 units of clean air between it and the clock's TIME label —
     // the second half of the header-collision fix.
-    // 572 x 158 at (24, 16). The 600 x 164 that replaced the original
+    // 572 x 184 at (24, 16). The 600 x 164 that replaced the original
     // 880 x 210 was already clear of the horizon in all sixteen review poses —
     // verified, not assumed: the panel's bottom edge lands at design y 182 and
-    // the highest horizon in the set is at y 300. So this pass is a trim rather
-    // than a rescue: 8% off the area, 30 design units pulled back from the
-    // right, and the slab is now sized so its SHEARED top-right corner lands
-    // inside the backing store instead of 15 units outside it, which is what
-    // was flattening that corner in every frame.
+    // the highest horizon in the set is at y 300. So the width trim was that:
+    // a trim rather than a rescue. 8% off the area, 30 design units pulled back
+    // from the right, and the slab is now sized so its SHEARED top-right corner
+    // lands inside the backing store instead of 15 units outside it, which is
+    // what was flattening that corner in every frame.
+    //
+    // The HEIGHT then went back UP, from 158 to 184, and that is a fix rather
+    // than a relapse. The plot has to hold three things at once — the ridge,
+    // the player's chevron riding on it, and three rival triangles above it —
+    // and at 158 there was not room for all three between the title and the
+    // checkpoint digits. The markers were not being clipped, they were being
+    // drawn straight through the type: swept over the route, the chevron's ink
+    // crossed the `7` digit at 94% and hung eight units below the baseline
+    // rule at 98%. Reserving the band they need (see PROFILE_MARK_* in
+    // Widgets.ts) inside 158 would have left the silhouette 41 units of relief
+    // out of 72 — a flat line pretending to be a mountain. 184 gives it 71.
+    //
+    // The cost is 26 design units, 2.4% of the frame's height. The panel's
+    // bottom edge lands at design y 200 against a highest-in-set horizon of
+    // 300, so it is still furniture in the corner and still nowhere near the
+    // one line in a downhill shot that has to stay readable.
     this.profile = this.mount(new RouteProfileWidget(
-      new HudLayer('profile', place('top-left', 24, 16, 572, 158)),
+      new HudLayer('profile', place('top-left', 24, 16, 572, 184)),
     ));
     this.clock = this.mount(new ClockWidget(
       new HudLayer('clock', place('top', 0, 22, 470, 200)),
@@ -143,8 +159,19 @@ export class Hud implements IHud {
     this.boost = this.mount(new BoostWidget(
       new HudLayer('boost', place('bottom', 0, 26, 680, 120)),
     ));
+    // 620 x 600, grown UPWARD from the 620 x 520 it was. The column now stacks
+    // four things whose heights are derived from their own type rather than
+    // guessed (see the POPUP_/SCORE_/TRICK_ block in Widgets.ts), and six
+    // simultaneous popups plus the trick plate plus the score block do not fit
+    // in 520 — the top two bars were being drawn off the backing store.
+    //
+    // The 80 units are taken off the TOP, not the bottom: `dy` moves with the
+    // height so the layer's bottom edge stays on design y 720. That edge is
+    // load-bearing. The score readout hangs 30 units off it, and the speed
+    // block's dial starts at design y 704 — grow this layer downward instead
+    // and the running score is set on top of the speedometer.
     this.popups = this.mount(new PopupWidget(
-      new HudLayer('popups', place('right', 24, -80, 620, 520)),
+      new HudLayer('popups', place('right', 24, -120, 620, 600)),
     ));
     this.warning = this.mount(new WarningWidget(
       new HudLayer('warn', place('center', 0, -200, 1040, 200)),

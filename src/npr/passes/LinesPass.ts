@@ -80,8 +80,7 @@ import { FullscreenPass } from './Fullscreen';
  * as SMOOTH. Belongs in Palette.LINES beside the other line constants; that
  * file is owned elsewhere this pass, so it lives here.
  */
-const CREASE_RADIUS = 0.22;
-
+const CREASE_RADIUS = LINES.creaseRadius;
 /**
  * How many half-float ulps of depth the second-difference detector treats as
  * noise. One ulp is what a single sample can be off by; two adjacent samples
@@ -89,8 +88,7 @@ const CREASE_RADIUS = 0.22;
  * Measured floor on flat ground is 1.0 ulp for the max-form response, so 2.2
  * is a little over double the observed worst case.
  */
-const DEPTH_QUANT_ULPS = 2.2;
-
+const DEPTH_QUANT_ULPS = LINES.depthQuantUlps;
 /**
  * The furthest the contour's ink may be mixed toward the haze colour. The
  * interior lines still take the full fog strength (0.94 in the far band) and
@@ -112,8 +110,7 @@ const DEPTH_QUANT_ULPS = 2.2;
  * its 0.46 floor. Fading the alpha and holding the hue is the drawn behaviour;
  * fading the hue toward the background is the photographic one.
  */
-const CONTOUR_FOG_CAP = 0.12;
-
+const CONTOUR_FOG_CAP = LINES.contourFogCap;
 export const LINE_DEBUG = {
   off: 0,
   field: 1,

@@ -499,6 +499,29 @@ export const LINES = {
   contourFadeEnd: 4200,
   contourFloor: 0.46,
   contourStrength: 0.98,
+  /**
+   * How much haze is allowed to wash out the silhouette stroke.
+   *
+   * At the previous 0.30 a fully detected ridge arrived at sRGB luminance 85
+   * against skies of 160-170 — a 33-point contrast that reads as a hairline
+   * dropping in and out rather than as a drawn edge. Distance must lighten the
+   * stroke through PRESSURE (contourFloor), which is what a pen does, not
+   * through hue, which is what a photograph does.
+   */
+  contourFogCap: 0.12,
+  /**
+   * Crease-detector scale invariance, in normal-difference per unit of
+   * world-space span across a pixel. The normal Sobel had no scale invariance
+   * at all: at a raking angle one pixel covers metres of ground, so a perfectly
+   * flat plane produced a large normal difference and the detector inked
+   * concentric arcs across uncreased terrain.
+   */
+  creaseRadius: 0.22,
+  /**
+   * Depth-comparison slack in half-float ulps. Below this the depth detector is
+   * measuring quantisation noise rather than geometry.
+   */
+  depthQuantUlps: 2.2,
 
   /** Interior lines fade with distance so far geometry doesn't turn into noise. */
   sobelFadeStart: 120,

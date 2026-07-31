@@ -216,6 +216,43 @@ const SNOW_ASPECT_MELT_M = 58;
 const SNOW_SMOOTH_RADIUS = 7;
 const SNOW_SMOOTH_PASSES = 2;
 
+/**
+ * The same argument, one step further — and the sentence above about a rock
+ * band being "a fact about the specific texel" was the last place this bug
+ * was still living.
+ *
+ * A character map of the zone field over the far wall of the valley, one
+ * glyph per texel, came back as a fifty-fifty INTERLEAVE of rock and scree
+ * covering thousands of texels:
+ *
+ *     RRRRssRRRsRssRsRsRsRsssRsRRssssssRRRRRRRss
+ *     RRRRRRRsRRRsRRsRssssssssssRRsRsRssRsRsRRRR
+ *
+ * That is not a material boundary. It is a threshold being applied to a field
+ * that is noisier than the threshold's own margin: `slope` comes from a
+ * central difference on a 2 m grid, so on any face whose average gradient
+ * happens to sit near the scree angle it crosses back and forth between every
+ * adjacent pair of texels. Both kinds then paint almost the same lavender at
+ * 300 m, so the FILL is invisible — but the outline pass inks every one of
+ * those thousands of tiny islands, and the far slopes rendered as a maze of
+ * hairline polygons laid over flat snow. Disabling the zone ID channel in the
+ * prepass removed the maze completely and left a clean painted hillside,
+ * which is what identified it.
+ *
+ * Despeckle cannot fix this: it removes islands of one and two texels, and a
+ * dither field is made of islands that each have a neighbour of their own
+ * kind. The threshold has to stop being asked a question the data cannot
+ * answer. A radius of 4 twice integrates over about a twenty-five metre
+ * neighbourhood — big enough to be a slope face, small enough that a genuine
+ * cliff band twenty metres wide still clears the angle.
+ *
+ * The PERTURBATION stays sharp-edged and is what keeps the resulting boundary
+ * from looking smoothed: pSlope is a coarse field, so it displaces the whole
+ * boundary in long wanders rather than fraying it per texel.
+ */
+const FORM_SMOOTH_RADIUS = 4;
+const FORM_SMOOTH_PASSES = 2;
+
 /** The sun's horizontal bearing, normalised. Read once from the palette. */
 const SUN_HORIZ_LEN = Math.hypot(SUN_DIRECTION.x, SUN_DIRECTION.z) || 1;
 const SUN_HORIZ_X = SUN_DIRECTION.x / SUN_HORIZ_LEN;
@@ -290,6 +327,11 @@ export function classifyZones(o: ClassifyOptions): ZoneField {
   const aspectSnow = boxBlur(sunFace, size, SNOW_SMOOTH_RADIUS, SNOW_SMOOTH_PASSES);
   const heightSnow = boxBlur(height, size, SNOW_SMOOTH_RADIUS, SNOW_SMOOTH_PASSES);
 
+  // The slope every OTHER rule reads. See FORM_SMOOTH_RADIUS: the raw field is
+  // noisier than the margin of the angles being tested against it, which turned
+  // the rock/scree boundary into a dither instead of an edge.
+  const slopeForm = boxBlur(slopeRad, size, FORM_SMOOTH_RADIUS, FORM_SMOOTH_PASSES);
+
   const invSpan = 1 / (size - 1);
 
   for (let iz = 0; iz < size; iz++) {
@@ -307,7 +349,9 @@ export function classifyZones(o: ClassifyOptions): ZoneField {
 
       const u = ix * invSpan;
       const h = height[i];
-      const sl = slope[i] * SLOPE_QUANT + sampleCoarse(pSlope, u, v) * PERTURB_SLOPE_RAD;
+      // slopeForm, not slope[i]: the low-passed field. The perturbation on top
+      // is coarse and is what keeps the boundary irregular.
+      const sl = slopeForm[i] + sampleCoarse(pSlope, u, v) * PERTURB_SLOPE_RAD;
       const ero = eroSmooth[i];
 
       // Effective altitude: the real height plus two octaves of wander. Every

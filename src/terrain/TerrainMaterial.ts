@@ -280,6 +280,36 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
   }
 
   /**
+   * A fetch off the terrain's own fields at a LOD chosen from the screen, so
+   * that one texel is guaranteed to cover a stated number of PIXELS.
+   *
+   * isoSample answers "do not under-sample this texture". This answers a
+   * different question: "how big is the smallest mark this surface is allowed
+   * to carry". They are not the same, and conflating them is what put a field
+   * of one-pixel white sparks over every distant rock face. The normal map is
+   * 2 m per texel; at three hundred metres that is fifteen screen pixels, so
+   * every wrinkle of the eroded surface is still fully resolved and is still
+   * being fed to a specular whose band threshold needs N.H above 0.9668. The
+   * term therefore flips on and off between neighbouring pixels — which is a
+   * correct evaluation of a highlight nobody asked for.
+   *
+   * A background painter's highlight is a SHAPE, drawn on the large form. The
+   * floor is what makes it one: even under the wheels the lighting reads a
+   * normal averaged over several metres, so a highlight cannot be finer than
+   * the landform it sits on.
+   *
+   *   extra    = how many octaves coarser than one-texel-per-pixel
+   *   minLevel = the floor, in mip levels, i.e. in doublings of 2 m
+   */
+  vec4 formSample(sampler2D tex, vec2 uv, float extra, float minLevel) {
+    float texels = uHeightParams.z;
+    vec2 dtx = dFdx(uv) * texels;
+    vec2 dty = dFdy(uv) * texels;
+    float fp = max(max(length(dtx), length(dty)), 1e-5);
+    return textureLod(tex, uv, max(log2(fp) + extra, minLevel));
+  }
+
+  /**
    * How much of a detail layer survives at this pixel, in THREE HARD STEPS.
    *
    * Mip-correct sampling stops a detail texture aliasing, but it does not stop
@@ -514,9 +544,19 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // the input to a HARD ramp, so half a texel of anisotropic under-sampling
     // is not a softness artefact, it is a whole band flipping between adjacent
     // pixels — the alternating scanlines that covered every oblique slope.
-    vec4 nx = isoSample(uNormalTex, uvT);
+    // formSample, not isoSample. isoSample stops the fetch under-sampling; it
+    // does not stop the RESULT carrying detail finer than a pixel, and a hard
+    // ramp fed a per-pixel normal produces a per-pixel band flip. One texel per
+    // two pixels is the coarsest this can be without visibly rounding a ridge.
+    vec4 nx = formSample(uNormalTex, uvT, 1.0, 0.0);
     vec3 N = normalize(nx.xyz * 2.0 - 1.0);
     float erosion = nx.w * 2.0 - 1.0;
+
+    // The LARGE FORM of the same surface, at eight pixels a texel and never
+    // finer than 8 m of ground. Everything that draws a SHAPE rather than a
+    // tone reads this: the highlight, the rim, and the terminator stroke. See
+    // formSample for why the alternative is a field of sparks.
+    vec3 Nform = normalize(formSample(uNormalTex, uvT, 3.0, 2.0).xyz * 2.0 - 1.0);
 
     // ── Zone lookup ────────────────────────────────────────────────────────
     // Two problems, opposite ends of the distance range, one lookup.
@@ -620,7 +660,17 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // See zoneTerminatorInk. This is the stroke that turns a band boundary
     // into a drawn edge instead of a raw colour step, and it is the only line
     // system in the project that can see one.
-    col = mix(col, col * 0.58, zoneTerminatorInk(zone, lit) * 0.0);
+    //
+    // AND IT RETIRES AT RANGE. terminatorInk fires wherever lit crosses a ramp
+    // threshold, with a width of a pixel and a half. That is a drawn stroke on
+    // a foreground form; on a hillside four hundred metres away, whose average
+    // lit happens to sit near a threshold, it is a contour map — a mesh of
+    // hairlines wandering over what should be one flat plate of paper. A
+    // painter puts a line on the terminator of the shape they are drawing, not
+    // on every fold of the mountain behind it. Quantised, like every other fade
+    // in this file.
+    float inkFade = floor((1.0 - smoothstep(70.0, 260.0, s.viewDist)) * 3.0 + 0.5) / 3.0;
+    col = mix(col, col * 0.58, zoneTerminatorInk(zone, lit) * 0.80 * inkFade);
 
     // ── Aerial plates ──────────────────────────────────────────────────────
     // The defect this exists to kill, stated exactly: on flat ground lit is
@@ -660,12 +710,20 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // start until five. The nearest boundary has to be nearer than the nearest
     // ground.
     //
-    // 2.2 m to 420 m in nine steps of 1.83x: boundaries at 3.0, 5.4, 9.9, 18.2,
-    // 33.2, 60.7, 111, 203 and 371 m. Two land in the first six metres, five
-    // inside the first thirty-five, and the last three carry the middle
-    // distance up to where the fog bands take over at 223 m.
+    // SEVEN STEPS, NOT NINE, and that is a size decision rather than a spacing
+    // one. Nine steps over the same range is 4.2% of value each; measured
+    // through the grade at the far end of the scale, where the tone curve is
+    // compressing hardest, a plate boundary on the treeline dune came out at
+    // 3.2 levels of 255 — a 1.7% change, which is under the threshold at which
+    // anyone can point at it. Spreading the same total range over seven puts
+    // 7.0% between plates and roughly doubles what survives the curve.
+    //
+    // Boundaries at 4.7, 10.0, 21.3, 45.3, 96.5 and 205 m. Two inside eleven
+    // metres, four inside fifty — the band that receding ground occupies in a
+    // chase or orbit shot — and the last two carry the middle distance up to
+    // where the fog bands take over at 223 m.
     float aerialT = saturate1(log2(clamp(s.viewDist, 2.2, 420.0) / 2.2) / 7.577);
-    float plate   = floor(aerialT * 9.0 + 0.5) / 9.0;
+    float plate   = floor(aerialT * 7.0 + 0.5) / 7.0;
 
     float hazeSun = saturate1(dot(normalize(-V), uSunDir));
     hazeSun = hazeSun * hazeSun;
@@ -849,12 +907,22 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // ── Hatch, specular, rim — all per zone ────────────────────────────────
     col = terrainHatch(col, bIdx, s.fragCoord, uZoneMiscB[zone].x, uZoneMiscB[zone].y);
 
-    float spec = bandedSpecular(N, V, L, uZoneMiscA[zone].w);
+    // Nform, NOT N. RAMPS.snow asks for specPower 90 and rock for 48, and
+    // bandedSpecular's halo tier fires at pow(N.H, p) > 0.20 — which for 90 is
+    // N.H > 0.9823, a window four hundredths of a radian wide. Handed a normal
+    // that still resolves the 2 m heightfield at three hundred metres, that
+    // window opens and closes between neighbouring pixels for as far as the
+    // slope runs. The result measured as a dense one-pixel splatter of near
+    // white over the far snowfields, and it is the whole of the "fine white
+    // stipple" in the review. On the eight-pixel form normal the same term
+    // draws what it was always meant to draw: a few solid glints on the parts
+    // of the hillside actually turned to the sun.
+    float spec = bandedSpecular(Nform, V, L, uZoneMiscA[zone].w);
     col += uSpecColor * spec * uZoneMiscA[zone].z * (1.0 - isWater) * shadow
          * saturate1(ndlRaw * 2.0) * mix(0.12, 1.0, farFade);
 
-    float rim = celRim(N, V, uZoneMiscB[zone].w);
-    float sunSide = saturate1(dot(normalize(N + L * 0.35), V) * 0.5 + 0.75);
+    float rim = celRim(Nform, V, uZoneMiscB[zone].w);
+    float sunSide = saturate1(dot(normalize(Nform + L * 0.35), V) * 0.5 + 0.75);
     col += uRimColor * rim * uZoneMiscB[zone].z * (1.0 - isWater) * mix(0.35, 1.0, sunSide);
 
     // ── Water ──────────────────────────────────────────────────────────────
@@ -1150,7 +1218,7 @@ function createTerrainPrepassMaterial(
         // prepass read a sharper normal than the paint, the Sobel would ink
         // creases the shading does not have — a mesh of hairline scratches over
         // a surface the main pass is drawing as one flat plane.
-        vec3 n = normalize(isoSample(uNormalTex, uvT).xyz * 2.0 - 1.0);
+        vec3 n = normalize(formSample(uNormalTex, uvT, 1.0, 0.0).xyz * 2.0 - 1.0);
         vec3 vn = normalize((viewMatrix * vec4(n, 0.0)).xyz);
 
         int zone = sampleZone(vWorld.xz, uvT, ${ZONE_KIND_COUNT});

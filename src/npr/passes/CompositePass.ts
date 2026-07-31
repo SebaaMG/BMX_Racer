@@ -236,12 +236,21 @@ const FRAGMENT = /* glsl */ `
       // rings on the way out, which is a drawn border closing on the shot
       // rather than a photographic vignette darkening it. The subject is never
       // touched, on any frame, at any flood value.
+      //
+      // AND IT IS HALF THE WEIGHT IT WAS. tools/capture/_impactmax.mjs forces
+      // each dial to the ceiling IMPACT_TUNING can publish and measures the
+      // frame against itself with the dial at zero. At the previous weights the
+      // ink flood ALONE took 18.3% of finish-sprint's chroma and 21.8% of the
+      // sky's, at a mean luma of -14.7% — which is a photographic darkening of
+      // the whole outer frame however hard its rings are. The peak is now 0.255
+      // instead of 0.52: enough for a drawn border to close on the shot, not
+      // enough to be the reason the picture lost its colour.
       vec2 d = (uv - 0.5) * vec2(aspect, 1.0);
       float r = saturate1(length(d) * 1.35);
       float rw = max(fwidth(r) * 0.8, 0.006);
-      float ring1 = smoothstep(0.46 - rw, 0.46 + rw, r);
-      float ring2 = smoothstep(0.74 - rw, 0.74 + rw, r);
-      float flood = saturate1(uInkFlood * (0.45 * ring1 + 0.75 * ring2) * 1.45);
+      float ring1 = smoothstep(0.50 - rw, 0.50 + rw, r);
+      float ring2 = smoothstep(0.76 - rw, 0.76 + rw, r);
+      float flood = saturate1(uInkFlood * (0.30 * ring1 + 0.55 * ring2));
       float keep = smoothstep(0.70, 0.96, luma(disp)) * 0.80;
       disp = mix(disp, linearToSrgb(uInkColor), flood * (1.0 - keep));
     }
@@ -266,36 +275,50 @@ const FRAGMENT = /* glsl */ `
       // cannot remove anything: the sky stays sky, the riders stay riders, the
       // silhouette reading of the shot is intact on every frame of the hit, and
       // what you feel is a hard bloom of light rather than a channel flip.
-      // MEASURED, NOT ASSERTED. tools/capture/_flashprobe.mjs walks a captured
-      // sequence and reports mean chroma, mean luma and the luma spread per
-      // frame against the sequence median — the three numbers a wash destroys
-      // together. On the crash sequence the accent is f0055-f0056 and nothing
-      // else: two frames, luma +13% and +10%, luma SPREAD +16% and +12%. The
-      // spread going UP is the whole test. A wash flattens the picture toward
-      // one value and the spread collapses; this widens it, which is what a
-      // held high-contrast drawing does. trick-360 shows a single flagged
-      // frame with chroma going UP 23%, not down.
+      // AND WHY IT WAS STILL WRONG. "Additive" was necessary and not
+      // sufficient. tools/capture/_impactmax.mjs forces uImpactFlash to the
+      // 0.34 ceiling IMPACT_TUNING publishes and measures the frame against
+      // itself unflashed. The additive form measured, on finish-sprint:
+      //
+      //     mean chroma  -24.3%     sky chroma  -23.9%
+      //     mean luma    +20.1%     luma spread +15.4%
+      //
+      // The spread going up is right. Losing a quarter of the frame's chroma,
+      // and a quarter of the SKY's, is exactly the "the blue sky band, cloud
+      // shapes, tree greens and jersey colours are all gone" the motion critic
+      // measured, and it is a structural property of adding light rather than a
+      // matter of amplitude: every channel moves toward the tint by the same
+      // absolute amount, and every channel that is already near 1.0 — which in
+      // this palette means the whole sky — clips against the ceiling instead.
+      // Adding light to a bright picture IS desaturating it.
+      //
+      // WHAT IT DOES NOW: the punch comes from CONTRAST ABOUT THE FRAME'S OWN
+      // PIVOT, which is the one operator here that moves chroma UP rather than
+      // down. Pushing every channel away from 0.46 pulls the channels of a
+      // pixel APART, so a blue sky gets bluer and a red jersey gets redder at
+      // the same moment the frame snaps to a hard graphic read. The tint is
+      // then added only as a small core in the top luminance band, where an
+      // animator would put the hot spot, at a seventh of its previous weight.
       float f = saturate1(uImpactFlash);
       vec3 hi = linearToSrgb(uImpactTint);
       float l = luma(disp);
 
-      // Keyed, not flat, and keyed in HARD STEPS. A flat add lifts the blacks
-      // first and reads as fog; biasing into the lights makes the highlights
-      // blow and the darks hold, which is what an impact looks like. Stepping
-      // the key rather than ramping it keeps the accent inside the same
-      // quantised language as everything else in the frame — a smooth key over
-      // a banded picture reads as an exposure change rather than as a drawing.
+      // Keyed in HARD STEPS, for the tinted core below. Stepping the key rather
+      // than ramping it keeps the accent inside the same quantised language as
+      // everything else in the frame — a smooth key over a banded picture reads
+      // as an exposure change rather than as a drawing.
       float kw = max(fwidth(l) * 0.8, 0.02);
       float k1 = smoothstep(0.30 - kw, 0.30 + kw, l);
       float k2 = smoothstep(0.62 - kw, 0.62 + kw, l);
-      float key = 0.28 + 0.34 * k1 + 0.38 * k2;
-      disp += hi * f * key * 0.62;
 
-      // One notch of extra contrast so the frame reads as GRAPHIC at the peak
-      // rather than merely brighter. Clamped, and at less than half strength,
-      // so no value can cross another and the drawing cannot invert.
-      vec3 punched = clamp((disp - 0.46) * 1.30 + 0.46, 0.0, 1.0);
-      disp = mix(disp, punched, f * 0.45);
+      // 1. THE PUNCH. Gain scales with f, so at f = 0 this is the identity and
+      //    there is no discontinuity when the accent fires or clears.
+      vec3 hard = clamp((disp - 0.46) * (1.0 + f * 1.70) + 0.46, 0.0, 1.0);
+      disp = mix(disp, hard, 0.88);
+
+      // 2. THE HOT CORE. Small, and biased hard into the top band so it lands
+      //    on the sunlit edges and the highlights rather than on the sky field.
+      disp += hi * f * (0.06 + 0.16 * k1 + 0.30 * k2) * 0.42;
     }
 
     // ── 10-12. Tail ─────────────────────────────────────────────────────────
@@ -315,12 +338,24 @@ const FRAGMENT = /* glsl */ `
       // middle of the frame, so the rider and the bike keep their colour on
       // every single frame of a hit and the composition stays readable
       // throughout, which is the requirement.
+      //
+      // AND THIRD, IT IS NOW CONFINED TO THE SHADOWS. _impactmax measured this
+      // term alone at -9.6% mean chroma and -9.9% SKY chroma at the 0.16
+      // ceiling, and the sky number is the damning one: a wash that reaches the
+      // sky is a wash, however gently it is applied. Pulling shadows toward a
+      // warm monochrome is a cel convention; pulling a lit blue sky toward one
+      // is a photographic desaturation. The cut is quantised on the same
+      // one-pixel fwidth rule the rest of the frame uses, so the boundary is a
+      // drawn edge rather than a ramp.
       vec3 tint = linearToSrgb(uImpactTint);
       float tl = max(luma(tint), 1e-3);
-      vec3 mono = vec3(luma(disp)) * mix(vec3(1.0), tint / tl, 0.75);
+      float lm = luma(disp);
+      vec3 mono = vec3(lm) * mix(vec3(1.0), tint / tl, 0.75);
       vec2 dd = (uv - 0.5) * vec2(aspect, 1.0);
       float hold = 1.0 - smoothstep(0.16, 0.50, length(dd));
-      disp = mix(disp, mono, saturate1(uDesaturate) * (1.0 - hold * 0.85));
+      float dw = max(fwidth(lm) * 0.8, 0.02);
+      float darks = 1.0 - smoothstep(0.44 - dw, 0.44 + dw, lm);
+      disp = mix(disp, mono, saturate1(uDesaturate) * (1.0 - hold * 0.85) * darks);
     }
     disp = applyVignette(disp, uv, aspect);
     disp = applyGrain(disp, gl_FragCoord.xy);

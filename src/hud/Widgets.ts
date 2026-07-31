@@ -413,9 +413,12 @@ export class RouteProfileWidget extends Widget {
 
     this.skyTop = titleInk + PROFILE_MARK_GAP + reachUp;
     // The rule is furniture too: a marker that hangs across it reads as a
-    // chart that has broken its own axis, so the band stops short of that as
-    // well as of the digits.
-    this.skyBot = Math.min(digitCapTop - PROFILE_MARK_GAP - markDown, this.ruleY - 1);
+    // chart that has broken its own axis, so the band clears that as well as
+    // the digits, and with the rows as they are it is the rule that binds.
+    this.skyBot = Math.min(
+      digitCapTop - PROFILE_MARK_GAP - markDown,
+      this.ruleY - 1 - markDown,
+    );
 
     // The slab leans: its left wall at height y is SHEAR*h*(1 − y/h) in from
     // the layer edge, widest at the top. The plot starts clear of that wall
@@ -610,21 +613,27 @@ export class RouteProfileWidget extends Widget {
       if (a.player) continue;
       const ax = this.plotX + a.t * this.plotW;
       const ay = this.yAt(a.t);
-      tri(ctx, ax, ay - 13, 8, Math.PI * 0.5, a.color, P.ink, 2.0);
+      tri(ctx, ax, ay - PROFILE_RIVAL_LIFT, PROFILE_RIVAL_R, Math.PI * 0.5, a.color, P.ink, PROFILE_RIVAL_INK);
     }
 
     // The player: a drop line to the baseline, then the chevron on the skyline.
-    tick(ctx, px, py, px, this.plotY + this.plotH, 2.4, cssA(HUD_PALETTE.goldHot, 0.75));
+    tick(ctx, px, py, px, this.ruleY, 2.4, cssA(HUD_PALETTE.goldHot, 0.75));
     // Point it along the local downhill so it reads as travelling, not parked.
     const y2 = this.yAt(Math.min(1, this.markerT + 0.02));
     const dir = Math.atan2(y2 - py, this.plotW * 0.02);
-    chevron(ctx, px + 2, py - 2, 15, 5, dir, P.goldHot, P.ink, 2.6);
+    // A fatter tail than the old 15/5: at this size the ink halo was closing
+    // over the notch and the marker delivered as a black scribble rather than
+    // as a gold arrow. Fewer units, more of them gold.
+    chevron(
+      ctx, px + PROFILE_MARK_DX, py - PROFILE_MARK_LIFT,
+      PROFILE_MARK_R, PROFILE_MARK_W, dir, P.goldHot, P.ink, PROFILE_MARK_INK,
+    );
 
     // Header row: section name after the title, percentage hard right. Both on
     // the title's baseline, both at fixed anchors. See PROFILE_TITLE_ST.
     const pct = `${Math.round(this.progress * 100)}%`;
     const pctR = this.plotX + this.plotW;
-    drawText(ctx, pct, pctR, 30, PROFILE_PCT_ST);
+    drawText(ctx, pct, pctR, PROFILE_HEAD_BASE, PROFILE_PCT_ST);
     // The section name is clipped to the space between the title and the
     // percentage rather than allowed to run under either. Every real section
     // name fits with room to spare; the clip is here so a longer one added
@@ -634,7 +643,7 @@ export class RouteProfileWidget extends Widget {
     ctx.beginPath();
     ctx.rect(this.sectionX - 4, 6, (pctR - pctW - 18) - this.sectionX + 4, 32);
     ctx.clip();
-    drawText(ctx, this.sectionName, this.sectionX, 30, PROFILE_SECTION_ST);
+    drawText(ctx, this.sectionName, this.sectionX, PROFILE_HEAD_BASE, PROFILE_SECTION_ST);
     ctx.restore();
   }
 }
@@ -1351,6 +1360,46 @@ interface Popup {
 
 const POPUP_POOL = 6;
 
+// ── THE POPUP COLUMN IS A STACK OF FOUR THINGS, NOT THREE ────────────────────
+//
+// Bottom to top: the running SCORE block, the live trick plate, then the popup
+// bars climbing away from them. Every one of those three was positioned with a
+// literal measured against one screenshot, and two of the three joints were
+// touching. Both are now solved from the type's own ink extents:
+//
+//   `SCORE_TOP` is the highest the score block can reach — at FULL punch, with
+//   the number's ink halo included — so the trick plate above it is placed at
+//   `SCORE_TOP + clear + its own height` rather than at a number that looked
+//   right while the punch happened to be decayed.
+//
+//   The trick plate was 46 tall for a 30-unit cap whose ink reaches 4.1 past
+//   the cap line in both directions. 38.2 of ink in 46 of plate is 3.9 either
+//   side, and the ink is 1.3 of that, so BARSPIN was set with its caps in the
+//   plate's own border. 52, with the baseline centred, gives it 6.9.
+const SCORE_NUM_SIZE = 44;
+const SCORE_LABEL_SIZE = 15;
+/** How much the score block swells when points land. */
+const SCORE_PUNCH = 0.18;
+/** Ink past the cap line, em: half the stroke plus the halo. */
+const SCORE_NUM_INK = 0.17 * 0.5 + 0.052;
+const SCORE_LABEL_INK = SCORE_LABEL_SIZE * (0.18 * 0.5 + 0.052);
+/** Right anchor, in from the layer edge — sized for the sheared corner of a
+ *  five-figure score at full punch. */
+const SCORE_RIGHT = 30;
+/** The score block's total reach above the layer's bottom edge, at full punch. */
+const SCORE_TOP =
+  30
+  + SCORE_NUM_SIZE * (1 + SCORE_PUNCH) * (1 + SCORE_NUM_INK)
+  + SCORE_LABEL_INK + 8
+  + SCORE_LABEL_SIZE + SCORE_LABEL_INK;
+const TRICK_BAR_H = 52;
+/** Trick plate top, up from the layer's bottom edge. */
+const TRICK_BAR_Y = Math.ceil(SCORE_TOP + 6 + TRICK_BAR_H + 2);
+/** Popup stack: bottom bar's top edge, and the pitch between bars. */
+const POPUP_BASE = TRICK_BAR_Y + 62;
+const POPUP_PITCH = 62;
+const POPUP_BAR_H = 50;
+
 export class PopupWidget extends Widget {
   private pool: Popup[] = [];
   private live = 0;
@@ -1423,28 +1472,48 @@ export class PopupWidget extends Widget {
   }
 
   override draw(ctx: CanvasRenderingContext2D, w: number, h: number): void {
-    // Running score tag, pinned to the bottom of the stack.
+    // ── Running score tag, pinned to the bottom of the stack ─────────────────
+    //
+    // SCORE used to be set at a flat −50 from the number's baseline, inside the
+    // same `scale(k, k)` as the number. Both of those are wrong. The number is
+    // 44 tall and its ink reaches 6.0 above its own cap line, and SCORE's ink
+    // reaches 2.1 below its baseline, so −50 leaves −0.1 units of air: at rest
+    // the two are exactly touching, and every punch scaled the whole block so
+    // they stayed touching all the way up. On top of that the punch drove
+    // SCORE's cap line THROUGH the trick plate above it at k > 1.13, and drove
+    // the number's sheared top-right corner to within 2.5 units of the layer
+    // edge.
+    //
+    // So: the punch scales the NUMBER only, about its own baseline; SCORE is
+    // set unscaled at a baseline derived from the number's largest possible
+    // ink extent; and the whole block is anchored far enough in that the
+    // biggest reading at full punch still clears the backing store.
     if (this.trickScore > 0) {
-      const k = 1 + ease.outQuart(clamp01(this.scorePunch)) * 0.18;
+      const k = 1 + ease.outQuart(clamp01(this.scorePunch)) * SCORE_PUNCH;
+      const numTop = SCORE_NUM_SIZE * (1 + SCORE_PUNCH) * (1 + SCORE_NUM_INK);
       ctx.save();
-      ctx.translate(w - 20, h - 30);
+      ctx.translate(w - SCORE_RIGHT, h - 30);
+      ctx.save();
       ctx.scale(k, k);
       drawText(ctx, String(Math.round(this.trickScore)), 0, 0, {
-        size: 44, weight: 0.17, fill: P.goldHot, ink: P.ink, tracking: 0.04, align: 'right', tabular: true, skew: SHEAR,
+        size: SCORE_NUM_SIZE, weight: 0.17, fill: P.goldHot, ink: P.ink, tracking: 0.04, align: 'right', tabular: true, skew: SHEAR,
       });
-      drawText(ctx, 'SCORE', 0, -50, {
-        size: 15, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.26, align: 'right', skew: SHEAR,
+      ctx.restore();
+      drawText(ctx, 'SCORE', 0, -(numTop + SCORE_LABEL_INK + 8), {
+        size: SCORE_LABEL_SIZE, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.26, align: 'right', skew: SHEAR,
       });
       ctx.restore();
     }
 
-    // Live trick name while it is being thrown.
+    // Live trick name while it is being thrown. Its plate sits clear of the
+    // SCORE label's cap line by construction — SCORE_TOP is what that block
+    // reaches up to at full punch, and the plate starts above it.
     if (this.activeTrick) {
       const t = this.activeTrick.toUpperCase();
       const st: TextStyle = { size: 30, weight: 0.17, fill: P.paper, ink: P.ink, tracking: 0.12, align: 'right', skew: SHEAR };
       const tw = measureText(t, st);
-      bar(ctx, w - 34 - tw - 26, h - 152, tw + 40, 46, cssA(HUD_PALETTE.violet, 0.7), P.paper, 2.6);
-      drawText(ctx, t, w - 46, h - 118, st);
+      bar(ctx, w - 34 - tw - 26, h - TRICK_BAR_Y, tw + 40, TRICK_BAR_H, cssA(HUD_PALETTE.violet, 0.7), P.paper, 2.6);
+      drawText(ctx, t, w - 46, h - TRICK_BAR_Y + (TRICK_BAR_H + st.size) * 0.5, st);
     }
 
     // The stack. Newest at the bottom, older ones pushed up the frame.
@@ -1452,9 +1521,12 @@ export class PopupWidget extends Widget {
     const ordered = this.pool.filter((p) => p.active).sort((a, b) => b.age - a.age);
     for (const p of ordered) {
       const k = ease.snap(clamp01(p.age / 0.20));
-      const y = h - 210 - slot * 62;
+      const y = h - POPUP_BASE - slot * POPUP_PITCH;
       slot++;
-      if (y < -60) continue;
+      // A bar that cannot fit whole in the backing store is not drawn at all.
+      // The old guard let one through at y = −60, which is a bar clipped to
+      // nothing — the same "failed draw" the corner call used to be.
+      if (y < 4) continue;
 
       // A split's value is a DELTA in seconds and it is routinely negative —
       // which is the good one. `value > 0` therefore printed a bare `SPLIT`
@@ -1483,11 +1555,12 @@ export class PopupWidget extends Widget {
       // Slide in from the right AND scale up: the snap ease overshoots by ~6%,
       // which is the tiny bit of impact that separates "appeared" from "landed".
       ctx.globalAlpha = clamp01(k * 1.6);
-      bar(ctx, x, y, bw, 50, P.panelDeep, col, 3.0);
+      bar(ctx, x, y, bw, POPUP_BAR_H, P.panelDeep, col, 3.0);
       if (k > 0.5) {
-        drawText(ctx, p.text, x + 20, y + 36, st);
+        const base = y + (POPUP_BAR_H + st.size) * 0.5 + 1;
+        drawText(ctx, p.text, x + 20, base, st);
         if (vs) {
-          drawText(ctx, vs, w - 34, y + 36, { ...st, fill: col, align: 'right', tabular: true });
+          drawText(ctx, vs, w - 34, base, { ...st, fill: col, align: 'right', tabular: true });
         }
       }
       ctx.restore();

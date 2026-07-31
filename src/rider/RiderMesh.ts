@@ -652,34 +652,46 @@ function head(x: number, y: number, z: number): Vector3 {
 /**
  * The face.
  *
- * At `rider-closeup` the head is 180 device pixels tall and a review called
- * everything else in that frame publishable and the face the one thing letting
- * it down: under the goggles there was a nose sphere (buried BEHIND the goggle
- * band, so invisible) on an otherwise untouched flesh plane. No jaw, no mouth,
- * no cheek, no chin.
+ * At a close crop the head is the only part of this rider a viewer looks at,
+ * and a review called everything else in that frame publishable and the face
+ * the one thing letting it down. Two rebuilds later, this is what the frames
+ * actually taught:
  *
- * Three constraints shaped what is here:
+ *  1. ADDITIVE BLOBS EACH EARN THEIR OWN SILHOUETTE. A skull sphere plus a jaw
+ *     sphere plus two cheeks plus a chin is six closed solids, and the inverted
+ *     hull inks a stroke around every one of them. At 180 px that read as a
+ *     bunch of grapes. So the skull, cheek, jaw and chin are ONE loft with a
+ *     varying cross-section — one solid, one silhouette, one stroke.
  *
- *  1. THERE IS ALMOST NO FACE TO WORK WITH. The helmet shell reaches down to
- *     head-local y = -0.066 and the goggle band occupies y = -0.062 to +0.016
- *     standing proud of it. Everything a viewer can actually see lives in the
- *     54 mm between the goggle's lower edge and the point of the chin — which
- *     is 45 px at this crop. So the detail is all mouth, jaw and chin, and the
- *     eye structure is expressed as the lower orbit ridge that meets the
- *     goggle rather than as anything behind it.
+ *  2. BUT A LOFT ALONE IS A SNOUT. The first single-loft attempt tapered the
+ *     half-width and the forward offset monotonically from the cheekbone to
+ *     the chin, and a monotonic taper is a cone: measured off the mesh, the
+ *     front profile ran 0.097 → 0.087 → 0.071 → 0.052 → 0.028 with no
+ *     inflection anywhere. A face has TWO inflections in that profile and they
+ *     are the entire read — the front surface must step BACK under the lip and
+ *     then FORWARD again at the chin. Without them there is no mouth and no
+ *     chin, only a muzzle, which is exactly what the captures showed.
  *
- *  2. EVERY LINE HAS TO BE GEOMETRY. There are no textures in this project, so
- *     a mouth is not a drawn line, it is two lip forms meeting at an angle
- *     steep enough for the Sobel normal pass to ink (LINES.sobelNormalThreshold
- *     is 0.32, about 19 degrees). Parts here are deliberately NOT normal-welded
- *     to each other — see the file header — so each of these forms shades as a
- *     hard edge against its neighbour, which is exactly what a cel ramp needs.
+ *  3. WHAT IS VISIBLE IS ONLY THE LOWER FACE. The goggle lens occupies
+ *     head-local y = -0.062 to +0.016 and stands proud at z = 0.137, so the
+ *     brow, the orbits and the upper nose are all BEHIND it. Every millimetre
+ *     of detail spent above y = -0.062 is spent on geometry no camera in this
+ *     game can see. The face is therefore authored entirely in the 71 mm from
+ *     the goggle's lower edge to the point of the jaw.
  *
- *  3. IT MUST COST NOTHING SMALL. All of it is rigid-bound to the head bone
+ *  4. EVERY LINE HAS TO BE GEOMETRY. There are no textures in this project, so
+ *     a mouth is not a drawn line — it is a step in the surface steep enough
+ *     for the Sobel normal pass to ink (LINES.sobelNormalThreshold is 0.32,
+ *     about 19 degrees). The mouth crease below swings the surface slope from
+ *     6 degrees to 45 degrees across one row, and the chin swings it back the
+ *     other way; both are far past the threshold, so both are inked.
+ *
+ *  5. IT MUST COST NOTHING SMALL. All of it is rigid-bound to the head bone
  *     and merged into the existing skin geometry, so it adds triangles and not
- *     a single draw call, a material, or a bone. At 40 px the whole face is
- *     six pixels tall, every crease is sub-pixel, and the Sobel simply has no
- *     gradient to find — the detail costs nothing because it stops existing.
+ *     a single draw call, material or bone. At 40 px the whole face is six
+ *     pixels tall, every crease is sub-pixel, the Sobel has no gradient to find
+ *     and the ramp has one band to give it — the detail costs nothing because
+ *     at that size it stops existing.
  */
 function buildFaceParts(): BufferGeometry[] {
   const parts: BufferGeometry[] = [];
@@ -690,37 +702,40 @@ function buildFaceParts(): BufferGeometry[] {
   const localX = new Vector3(1, 0, 0).transformDirection(HEAD_BASIS);
   const localY = new Vector3(0, 1, 0).transformDirection(HEAD_BASIS);
 
-  // ── ONE head, not a pile of balls ──────────────────────────────────────────
-  //
-  // The first attempt at this face was additive: a skull sphere, a jaw sphere,
-  // two gonial spheres, two cheek ellipsoids, a chin, two lip tubes. Every one
-  // of those is a separate closed solid, every intersection between two of
-  // them is a silhouette, and the inverted hull inks a silhouette wherever it
-  // finds one. The result at a 180 px crop was a bunch of grapes: five or six
-  // outlined sausages with 2 px of ink around each. It is the exact failure
-  // the jersey sleeve was rebuilt to fix (see buildJerseyParts) and it has to
-  // be avoided the same way.
-  //
-  // So the skull, the cheek, the jaw and the chin are ONE loft with a varying
-  // cross-section and a varying forward offset. One solid, one silhouette, one
-  // stroke. The cheekbone and the jaw line come from where the ellipse changes
-  // shape, which the hard ramp turns into a terminator and the Sobel normal
-  // pass turns into an interior line — drawn marks, not extra outlines.
+  // ── The head: one loft, from crown to jaw ─────────────────────────────────
   //
   // rows: [y, halfWidth, halfDepth, forward offset]
+  //
+  // The column that matters is `offset + halfDepth` — the FRONT profile, which
+  // is the drawing a viewer reads in three-quarter and in profile:
+  //
+  //     brow  -0.020  0.098
+  //     cheek -0.054  0.092    widest half-width: the cheekbone terminator
+  //     lip   -0.090  0.080    the muzzle holds forward
+  //     mouth -0.099  0.071    ← steps BACK 9 mm in 9 mm of height
+  //     chin  -0.107  0.075    ← steps FORWARD 4 mm again: this IS the chin
+  //     jaw   -0.125  0.051
+  //
+  // The offsets themselves move at most 3 mm per row on purpose. `ringsAlongPath`
+  // derives each ring's plane from the path tangent, so a large jump in the
+  // offset tilts the ring hard enough to fold the surface; the profile shape is
+  // carried by the half-depth instead, where it is free.
   const skull: [number, number, number, number][] = [
-    [ 0.098, 0.028, 0.032, -0.008],
-    [ 0.076, 0.058, 0.064, -0.006],
-    [ 0.044, 0.080, 0.088, -0.003],
-    [ 0.008, 0.089, 0.097,  0.000],
-    [-0.026, 0.088, 0.096,  0.003],   // brow / goggle line
-    [-0.050, 0.083, 0.092,  0.008],   // upper cheek — widest forward push
-    [-0.064, 0.077, 0.087,  0.010],   // cheekbone
-    [-0.080, 0.066, 0.079,  0.008],   // the cheek falling into the jaw
-    [-0.094, 0.054, 0.068,  0.003],   // jaw line
-    [-0.108, 0.041, 0.055, -0.003],
-    [-0.120, 0.026, 0.038, -0.010],   // chin
-    [-0.129, 0.012, 0.022, -0.017],
+    [ 0.098, 0.028, 0.030, -0.010],
+    [ 0.070, 0.060, 0.066, -0.008],
+    [ 0.040, 0.079, 0.086, -0.004],
+    [ 0.010, 0.088, 0.095, -0.001],
+    [-0.020, 0.090, 0.097,  0.001],   // brow — behind the lens, sets its seat
+    [-0.038, 0.088, 0.094,  0.002],   // eye line
+    [-0.054, 0.084, 0.089,  0.003],   // cheekbone: the widest ring on the head
+    [-0.070, 0.078, 0.081,  0.004],   // cheek falling toward the jaw
+    [-0.081, 0.071, 0.074,  0.007],   // above the lip
+    [-0.090, 0.065, 0.070,  0.010],   // upper lip level
+    [-0.099, 0.060, 0.061,  0.010],   // mouth line — the concave crease
+    [-0.107, 0.056, 0.062,  0.013],   // chin — convex again
+    [-0.116, 0.048, 0.055,  0.013],
+    [-0.125, 0.035, 0.041,  0.010],   // under the jaw
+    [-0.133, 0.020, 0.024,  0.004],
   ];
   add(
     buildLoft(
@@ -730,77 +745,73 @@ function buildFaceParts(): BufferGeometry[] {
         skull.map((r) => r[2]),
         localX,
       ),
-      18,
+      22,
       true,
       true,
     ),
   );
 
-  // Everything below is SHALLOW. Each of these protrudes 2-9 mm from the loft,
-  // so the stroke it earns is a line across the face rather than an outline
-  // around a lump — which is the whole difference between a drawn feature and
-  // a stuck-on ball.
+  // Everything below is a SEPARATE solid and therefore earns its own stroke.
+  // That is correct for a nose and for a pair of lips — an animator inks those
+  // — and catastrophic for anything larger, which is why the cheeks, the jaw
+  // and the chin are in the loft above and not here.
 
-  // ── Brow ───────────────────────────────────────────────────────────────────
-  // The ridge the goggle strap is pulled over. Protrudes ~3 mm.
+  // ── Nose ──────────────────────────────────────────────────────────────────
+  // Starts tucked under the goggle's lower edge (y = -0.062) and runs to the
+  // lip. Four rings: bridge, ball, and a flared base. Projects 24 mm past the
+  // face at the tip, which is a stylised nose on a 230 mm head and reads at
+  // a 60 px crop; a literal 15 mm one does not.
   add(
-    loftLimb(
-      [head(-0.070, -0.030, 0.056), head(-0.038, -0.026, 0.082), head(0, -0.024, 0.090), head(0.038, -0.026, 0.082), head(0.070, -0.030, 0.056)],
-      [0.008, 0.009, 0.009, 0.009, 0.008],
-      [0.009, 0.011, 0.011, 0.011, 0.009],
-      6,
-      1,
-      1,
-      localY,
+    buildLoft(
+      ringsAlongPath(
+        [head(0, -0.050, 0.084), head(0, -0.062, 0.091), head(0, -0.073, 0.093), head(0, -0.083, 0.086)],
+        [0.007, 0.011, 0.015, 0.017],
+        [0.009, 0.012, 0.014, 0.010],
+        localX,
+      ),
+      10,
+      true,
+      true,
     ),
   );
 
-  // ── Nose ───────────────────────────────────────────────────────────────────
-  // The old nose sat at head-local y = -0.020, which is inside the goggle
-  // band's own y span (-0.062 to +0.016) and 3 cm behind its front face — so
-  // it was drawn entirely behind the lens and the rider had, functionally, no
-  // nose at all. It now starts at the goggle's lower edge and runs to the lip.
-  add(
-    loftLimb(
-      [head(0, -0.052, 0.086), head(0, -0.066, 0.098), head(0, -0.078, 0.092)],
-      [0.009, 0.013, 0.015],
-      [0.010, 0.013, 0.012],
-      8,
-      1,
-      1,
-      localX,
-    ),
-  );
-
-  // ── Mouth ──────────────────────────────────────────────────────────────────
-  // Two wide, shallow lip ridges with a 4 mm gap. The gap is the mouth: the
-  // surface normal swings through most of a right angle across it, far past
-  // LINES.sobelNormalThreshold, so the interior-line pass inks a line there.
-  // No texture, no decal and no extra material exists anywhere in this project
-  // to draw one with, so the line has to be earned geometrically.
+  // ── Mouth ─────────────────────────────────────────────────────────────────
+  // The loft already carries the mouth LINE as a 9 mm concave step. These two
+  // give it width and a shape: a wide upper lip and a fuller lower one, with
+  // the corners curling back into the cheek so the mark tapers instead of
+  // ending square.
   //
-  // 2.5 mm of protrusion, 46 mm wide. A mouth modelled as a deep slot reads as
-  // a wound at this crop; two low ridges read as a mouth.
+  // THEY TOUCH, and that is the whole point. The first pass made them 12-17 mm
+  // tall standing 7 mm proud with a gap between, and each one is a separate
+  // closed solid, so the hull inked FOUR horizontal lines across the face and
+  // the mouth read as a grille. Sunk to 9-11 mm tall standing 4 mm proud, with
+  // their surfaces in contact, the two hulls merge into a single mark: one
+  // stroke around the mouth and one line through it, which is how a mouth is
+  // drawn. In profile they now sit on the muzzle instead of hanging off it.
+  //
+  // Ring X is head-local UP here, so the first radius is the lip's HEIGHT and
+  // the second is how far it stands out from the face.
+  const lipArc = (y: number, z: number, halfWidth: number, backCurl: number): Vector3[] => [
+    head(-halfWidth, y - 0.004, z - backCurl),
+    head(-halfWidth * 0.55, y - 0.001, z - backCurl * 0.28),
+    head(0, y, z),
+    head(halfWidth * 0.55, y - 0.001, z - backCurl * 0.28),
+    head(halfWidth, y - 0.004, z - backCurl),
+  ];
   add(
     loftLimb(
-      [head(-0.023, -0.089, 0.062), head(0, -0.087, 0.076), head(0.023, -0.089, 0.062)],
-      [0.005, 0.006, 0.005],
-      [0.006, 0.007, 0.006],
-      6,
-      1,
-      1,
-      localY,
+      lipArc(-0.0945, 0.0765, 0.026, 0.017),
+      [0.0042, 0.0050, 0.0054, 0.0050, 0.0042],
+      [0.0026, 0.0034, 0.0038, 0.0034, 0.0026],
+      8, 1, 1, localY,
     ),
   );
   add(
     loftLimb(
-      [head(-0.020, -0.100, 0.059), head(0, -0.099, 0.073), head(0.020, -0.100, 0.059)],
-      [0.005, 0.006, 0.005],
-      [0.005, 0.007, 0.005],
-      6,
-      1,
-      1,
-      localY,
+      lipArc(-0.1045, 0.0745, 0.022, 0.014),
+      [0.0046, 0.0056, 0.0060, 0.0056, 0.0046],
+      [0.0030, 0.0038, 0.0044, 0.0038, 0.0030],
+      8, 1, 1, localY,
     ),
   );
 
@@ -1328,19 +1339,62 @@ function buildHelmetParts(): BufferGeometry[] {
   const backCentre = new Vector3(0, -0.030, -0.052).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
   parts.push(rigidPart(sphereForm(backCentre, R * 0.86, R * 0.72, R * 0.80, 12, 10, Math.PI * 0.72, HEAD_BASIS), 'head'));
 
-  // Ear/temple pads: they close the gap between the shell edge and the jaw, and
-  // they are what stops the lid reading as a bowl balanced on a head.
+  // ── Ear cup + retention strap ─────────────────────────────────────────────
   //
-  // Moved BACK and DOWN, and slimmed. At the old size and position the pad's
-  // surface reached 0.134 out along X while the goggle band ends at 0.096, so
-  // from any three-quarter angle a 6 cm helmet-coloured ball sat proud of the
-  // lens directly over the eye — which is what the close crop was actually
-  // showing when it reported a featureless face. An ear pad belongs behind the
-  // goggle strap and under the shell edge, not in front of both.
+  // This was two spheres. A sphere sitting on the side of a head is a closed
+  // solid whose silhouette the inverted hull inks in full, so at a close crop
+  // the rider wore two outlined brown BALLS over his ears — the single loudest
+  // defect in the head, and the same "additive blobs each earn their own
+  // stroke" failure the face itself was rebuilt to escape.
+  //
+  // A helmet does not have a ball over the ear. It has a cup that follows the
+  // skull and a strap that runs from that cup down under the jaw, and that
+  // strap is the detail that makes a lid read as a HELMET rather than as a
+  // painted scalp. So the pad and the strap are ONE loft per side, running from
+  // under the shell edge, around the ear, down to the chin — one solid, one
+  // silhouette, and a genuinely helmet-shaped one.
+  //
+  // The ring's X axis is head-local X, so the FIRST radius is how far the form
+  // stands out sideways from the skull (thin — this is a pad, not a ball) and
+  // the second is its fore-and-aft extent (wide, so it covers an ear).
   for (const side of [1, -1]) {
-    const pad = new Vector3(side * (R * 0.84), -0.064, -0.034).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-    parts.push(rigidPart(sphereForm(pad, 0.024, 0.034, 0.042, 10, 8, Math.PI, HEAD_BASIS), 'head'));
+    const localX = new Vector3(1, 0, 0).transformDirection(HEAD_BASIS);
+    const s = side;
+    const cup = [
+      head(s * 0.082, -0.036, -0.028),
+      head(s * 0.086, -0.064, -0.024),
+      head(s * 0.081, -0.092, -0.014),
+      head(s * 0.068, -0.118,  0.008),
+      head(s * 0.046, -0.138,  0.030),
+      head(s * 0.014, -0.147,  0.048),
+    ];
+    parts.push(
+      rigidPart(
+        loftLimb(
+          cup,
+          [0.013, 0.016, 0.012, 0.0080, 0.0060, 0.0045],
+          [0.036, 0.040, 0.028, 0.0150, 0.0110, 0.0085],
+          10,
+          1,
+          1,
+          localX,
+        ),
+        'head',
+      ),
+    );
   }
+
+  // Buckle. Two straps that stop 28 mm apart under the chin read as two loose
+  // ends dangling; one small block joining them reads as a fastened helmet, and
+  // it is the mark that tells the eye the straps are a SYSTEM rather than two
+  // decorations. 18 mm across — one pixel at race distance, a deliberate
+  // punctuation mark at a close crop.
+  parts.push(
+    rigidPart(
+      boxForm(0.018, 0.011, 0.013, head(0, -0.148, 0.049), _q.setFromRotationMatrix(HEAD_BASIS), 0.35),
+      'head',
+    ),
+  );
 
   // Peak / visor: a swept plate tilted down over the goggles.
   const peakCentre = new Vector3(0, 0.044, 0.014).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
