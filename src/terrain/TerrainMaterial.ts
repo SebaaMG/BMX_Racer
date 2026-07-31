@@ -718,10 +718,11 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // anyone can point at it. Spreading the same total range over seven puts
     // 7.0% between plates and roughly doubles what survives the curve.
     //
-    // Boundaries at 4.7, 10.0, 21.3, 45.3, 96.5 and 205 m. Two inside eleven
-    // metres, four inside fifty — the band that receding ground occupies in a
-    // chase or orbit shot — and the last two carry the middle distance up to
-    // where the fog bands take over at 223 m.
+    // Boundaries — the distances at which the rounding flips, not the plate
+    // centres — land at 3.2, 6.8, 14.4, 30.4, 64.4, 136 and 289 m. Three inside
+    // fifteen metres, which is where an orbit or chase camera puts the ground it
+    // is looking over, four inside sixty-five, and the last two carry the middle
+    // distance up to where the fog bands take over at 223 m.
     float aerialT = saturate1(log2(clamp(s.viewDist, 2.2, 420.0) / 2.2) / 7.577);
     float plate   = floor(aerialT * 7.0 + 0.5) / 7.0;
 
@@ -746,12 +747,16 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // exactly as the fog does, because at a 21.5 degree sun the air between you
     // and a ridge you are looking INTO is gold, not blue.
     //
-    // 38% of value spread over nine steps is 4.2% a step, which at a band value
-    // of 175 is a jump of seven or eight levels across a hard boundary — an
-    // unmistakable terrace, and about what separates two adjacent greys on a
-    // painted background plate.
+    // Measured, twice, on the trail in summit-rider at the 6.8 m boundary:
+    // nine steps of 4.2% arrived as 3.2 levels out of 255 and seven steps of
+    // 6.5% arrived as 6.1. The grade's shoulder is giving back a little under
+    // half of whatever is asked for up at a value of 195, so the ask has to be
+    // roughly twice the wanted step. 7.6% a step lands it at seven or eight
+    // levels, which is what separates two adjacent greys on a painted
+    // background plate. The total 1.67x sounds large and is not: plate 7 does
+    // not start until 289 m, by which point the fog bands own the pixel.
     col = mix(col, hazeCol, plate * 0.18);
-    col *= mix(0.92, 1.30, plate);
+    col *= mix(0.85, 1.42, plate);
 
     // ── Ground shapes: the third value system, and the only one that works ──
     // ── on the surface that defeats the other two ──────────────────────────
@@ -772,20 +777,68 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // or the air, so it has to come from a spatial field, and this is the only
     // term in the file that does.
     //
-    // Two octaves, 34 m and 130 m, each cut into THREE flat levels by a pair of
-    // hard thresholds. At the distance a dune is normally seen the small octave
-    // gives it two or three shapes across its face and the large one gives the
-    // whole hillside two — which is the count a painter would use. Nothing here
-    // is continuous, so nothing here can put a gradient back on the mountain.
+    // THREE octaves, and the shortest one is the one that matters, because the
+    // 34 m and 130 m octaves below do not touch the surface the review actually
+    // measured. A distance trace down the treeline frame settles it: at the
+    // camera heights this game uses, the bottom FORTY PER CENT of every frame
+    // is ground between six and nine metres away, and it spans about two metres
+    // of world from the bottom edge of the picture to the crest of the near
+    // dune. Four hundred and forty rows of pixels over two metres of ground.
+    //
+    // Nothing keyed on distance can put a boundary in there — the whole swath
+    // is inside one aerial plate by construction, and it always will be. Nothing
+    // keyed on the normal can either, because it is flat. And a 34 m noise
+    // octave is constant across two metres. Every system in this shader was
+    // returning one answer for four hundred and forty rows, and the measured
+    // result was a 443-row column with no step in it anywhere.
+    //
+    // FOUR octaves — 1.05 m, 4.8 m, 34 m and 130 m — because they have to
+    // ladder the same way the plates do: whatever distance the ground in front
+    // of the camera happens to be at, one of them is at the size a painter
+    // would have blocked in at that distance, and the two either side of it are
+    // too big to see and too small to resolve. One octave leaves a hole, and
+    // the hole was at a metre, which is exactly where the frame needed it.
+    //
+    // Each is cut into THREE flat levels by a pair of hard thresholds, and the
+    // SOFTNESS FLOOR is the whole difference between a drawn shape and a
+    // bruise. At 0.02 the two smoothsteps overlap across most of the noise's
+    // own slope, the field never reaches its outer levels at all, and a 5.5%
+    // shape arrived on screen as two levels. At 0.006 it reached them but spent
+    // six rows getting there, which measures as a ramp rather than as a step.
+    // At 0.0015 the floor is below the field's own per-pixel change nearly
+    // everywhere, so bandStep's fwidth term takes over and the edge is one
+    // pixel wide and correctly antialiased — a boundary, drawn.
+    //
+    // The amplitudes are MEASURED, not guessed. Driving one octave up to 0.30
+    // and scanning a row across its boundary in the resulting still gave 20
+    // levels of 255 for a 30% multiply — about 67 levels per unit, after the
+    // grade has taken its cut. So 0.10 buys a boundary of seven levels, which
+    // is the size the review asked to be able to point at, and the four of them
+    // together give a hillside a range of about a quarter of its own value:
+    // roughly what a background painter spends blocking one in.
+    //
+    // Nothing here is continuous, so nothing here can put a gradient back on
+    // the mountain — which is the whole reason the shapes are quantised rather
+    // than simply added as noise.
+    float shpN = fbm2(w * 1.70 + 61.7, 2);
+    float shpM = fbm2(w * 0.21 + 8.3, 2);
     float shpA = fbm2(w * 0.029 + 5.1, 2);
     float shpB = fbm2(w * 0.0077 + 91.3, 2);
-    float shapeA = bandStep(shpA, 0.455, 0.02) + bandStep(shpA, 0.552, 0.02) - 1.0;
-    float shapeB = bandStep(shpB, 0.455, 0.02) + bandStep(shpB, 0.552, 0.02) - 1.0;
-    // Both retire once their own wavelength stops resolving, or they would
-    // become the far field's noise floor instead of its drawing. Quantised, as
-    // everything that fades in this shader must be.
+    float shapeN = bandStep(shpN, 0.430, 0.0015) + bandStep(shpN, 0.575, 0.0015) - 1.0;
+    float shapeM = bandStep(shpM, 0.452, 0.0015) + bandStep(shpM, 0.556, 0.0015) - 1.0;
+    float shapeA = bandStep(shpA, 0.455, 0.0015) + bandStep(shpA, 0.552, 0.0015) - 1.0;
+    float shapeB = bandStep(shpB, 0.455, 0.0015) + bandStep(shpB, 0.552, 0.0015) - 1.0;
+    // Each retires once its own wavelength stops resolving, or it would become
+    // the far field's noise floor instead of its drawing. Quantised, as
+    // everything that fades in this shader must be. The two long octaves never
+    // stop resolving inside the draw distance and so carry no fade.
+    float nearFade = detailFade(w * 1.70, 40.0);
+    float midFade  = detailFade(w * 0.21, 60.0);
     float shapeFade = detailFade(w * 0.029, 3.0);
-    col *= 1.0 + (shapeA * 0.034 * shapeFade + shapeB * 0.046) * (1.0 - isWater);
+    col *= 1.0 + (shapeN * 0.100 * nearFade
+                + shapeM * 0.085 * midFade
+                + shapeA * 0.075 * shapeFade
+                + shapeB * 0.065) * (1.0 - isWater);
 
     // ── Surface detail ─────────────────────────────────────────────────────
     // Two vertical projections plus a horizontal one, blended by how the face

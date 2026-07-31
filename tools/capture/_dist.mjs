@@ -78,7 +78,7 @@ const rows = await page.evaluate(
       const zone = T.zoneAt(wx, wz);
       // The shader's ladder, evaluated exactly as written in TerrainMaterial.
       const aerialT = Math.min(1, Math.max(0, Math.log2(Math.min(420, Math.max(2.2, hit)) / 2.2) / 7.577));
-      const plate = Math.floor(aerialT * 9 + 0.5) / 9;
+      const plate = Math.floor(aerialT * 7 + 0.5) / 7;
       const n = T.normalAt(wx, wz);
       out.push([y, hit, wx, wy, wz, zone, plate, n.y]);
     }
@@ -95,6 +95,6 @@ for (const r of rows.out) {
   if (r[1] === null) { console.log(`${String(r[0]).padStart(5)}     ---`); continue; }
   const [y, d, wx, wy, wz, zone, plate, ny] = r;
   const mark = prevPlate !== null && plate !== prevPlate ? '  <== PLATE STEP' : '';
-  console.log(`${String(y).padStart(5)} ${d.toFixed(2).padStart(8)} ${(plate * 9).toFixed(0).padStart(6)} ${String(zone).padStart(5)} ${ny.toFixed(3).padStart(6)}   ${wx.toFixed(1)},${wy.toFixed(1)},${wz.toFixed(1)}${mark}`);
+  console.log(`${String(y).padStart(5)} ${d.toFixed(2).padStart(8)} ${(plate * 7).toFixed(0).padStart(6)} ${String(zone).padStart(5)} ${ny.toFixed(3).padStart(6)}   ${wx.toFixed(1)},${wy.toFixed(1)},${wz.toFixed(1)}${mark}`);
   prevPlate = plate;
 }

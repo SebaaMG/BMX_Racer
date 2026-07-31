@@ -1580,20 +1580,36 @@ function celOptionsFor(part: RiderPart, identityColor: Color): CelOptions {
     // rider-closeup: 140 gives a 4 px bump peaking at luma 182; a reachable
     // exponent gives a flat plateau with a single-pixel step on each side.
     //
-    // 16, not 9, and 0.34 rather than the preset's 0.95: once the highlight
-    // is actually reachable the declared strength is enormous. At 0.9 the
-    // core clears the bloom threshold across a third of the crown and the
-    // helmet goes white — a hard-edged blowout is no better than a soft one.
-    // The shape has to be a MARK on the shell, not a second light source.
+    // 16, not 9, and 0.26 rather than the preset's 0.95: once the highlight
+    // is actually reachable the declared strength is enormous, and there is a
+    // hard ceiling on it that has nothing to do with taste. GRADE.bloomThreshold
+    // is 0.82; the helmet's lit band sits near 0.55 and bandedSpecular's core
+    // tier contributes 0.75 of whatever strength is declared, so anything above
+    // ~0.33 pushes the core over the threshold and the bloom pass turns the
+    // drawn shape back into the soft glow it was built to replace. Measured on
+    // the crown at 0.42 the core is a blown white blob with a smooth interior;
+    // at 0.26 it is a flat plateau. The shape has to be a MARK on the shell,
+    // not a second light source.
     o.specPower = 16;
-    o.specStrength = 0.34;
-    // ...and posterise, because the highlight was only half the story: see
-    // CelOptions.valueSteps. Seven tiers is enough to carry a 4-band ramp, a
-    // two-tier specular and a rim without any of them running into each other.
-    o.valueSteps = 7;
+    o.specStrength = 0.26;
+    // ...and DRAW the highlight, which is the half of the job a reachable
+    // exponent alone does not do. A scanline across the crown proved the shell
+    // was already resolving to flat plateaus and still reading as gloss,
+    // because nothing put a line round the glint. See CelOptions.specInk.
+    o.specInk = 0.90;
     // ...and less matcap, because with a real highlight present the matcap is
-    // no longer carrying the gloss and its own soft content is just haze.
-    o.matcapMix = 0.10;
+    // no longer carrying the gloss and its own soft content is just haze. The
+    // matcap is sampled by the VIEW-space normal, so its features are pinned to
+    // the screen and slide across the shell as the head turns — the one term
+    // here that cannot be made to read as a drawn mark on the object.
+    o.matcapMix = 0.0;
+    // The preset asks for 0.85 of rim on a helmet. At a close crop that is a
+    // 10 px cream halo all the way round the lid — the single most bloom-like
+    // thing left on the rider once the specular was fixed. The rim exists to
+    // separate a rider from the terrain, and at a 180 px crop separation is not
+    // in question; the identity rim floor puts it back automatically once the
+    // rider is small enough to need it.
+    o.rimStrength = 0.42;
   }
   return o;
 }

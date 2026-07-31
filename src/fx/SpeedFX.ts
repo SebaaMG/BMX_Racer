@@ -168,6 +168,30 @@ export const SPEED_TUNING = {
   smearMinPixels: 9,
   /** Ceiling on the streak, device pixels. Past this it stops being a smear. */
   smearMaxPixels: 110,
+  /**
+   * How far BEHIND the subject the tail is pushed, in metres.
+   *
+   * The screen-plane projection guarantees the tail leaves at the same depth
+   * it started at, which stops it being drawn over the vertex it came from —
+   * but it does nothing about the vertex NEXT DOOR. A head streaking left
+   * still lays its tail over the shoulder behind it, and every one of those
+   * marks is a translucent film over the character. Measured at `crash`, that
+   * was the whole of what was left: the wheel's streak was clean and correct,
+   * and the rider was wearing a pale wash across the chest, the near arm and
+   * the face.
+   *
+   * So the whole clone sinks away from the lens, by the subject's own half
+   * depth, in proportion to how far down the tail the vertex sits. The root of
+   * the streak stays welded to the surface it came off; the deep tail sits a
+   * third of a metre further away, where the opaque body's own depth buffer
+   * rejects it. The mark can then only ever appear OUTSIDE the silhouette,
+   * which is the definition of a smear behind a moving figure.
+   *
+   * It is capped as a fraction of view distance so a 1.2 m close-up does not
+   * push the tail through the far side of the rider.
+   */
+  smearDepthPush: 0.34,
+  smearDepthPushMaxFrac: 0.11,
 
   // ── Sanity limits on the quantities the smear is derived from ─────────────
   /**
@@ -209,11 +233,17 @@ const SMEAR_VERT = /* glsl */ `
   uniform float uMinPixels;
   uniform float uMaxPixels;
   uniform float uAmount;     // 0..1 master
+  uniform float uDepthPush;  // metres the tail sinks away from the lens
+  uniform float uDepthPushFrac;
 
   /** 0 at the leading edge of the streak, 1 at the deepest part of the tail. */
   out float vTrail;
   /** Device pixels this vertex was actually displaced by. */
   out float vPixels;
+  /** World normal, so the fragment stage can ink the mark's own contour. */
+  out vec3  vNrmW;
+  /** Surface -> camera, for the same reason. */
+  out vec3  vViewW;
 
   void main() {
     vec3 localPos = position;
@@ -261,10 +291,15 @@ const SMEAR_VERT = /* glsl */ `
       // the whole silhouette sideways.
       float t = trail * trail;
       wpos -= tdir * (pixels * t * pxToWorld);
+      // ...and AWAY from the lens, so the mark can only ever land outside the
+      // body's silhouette. See SPEED_TUNING.smearDepthPush.
+      wpos -= viewRay * (min(uDepthPush, camDist * uDepthPushFrac) * t);
       vTrail = t;
       vPixels = pixels * t;
     }
 
+    vNrmW  = normalize(wnrm);
+    vViewW = normalize(uCameraPos - wpos);
     gl_Position = projectionMatrix * viewMatrix * vec4(wpos, 1.0);
   }
 `;
@@ -284,6 +319,8 @@ const SMEAR_FRAG = /* glsl */ `
 
   in float vTrail;
   in float vPixels;
+  in vec3  vNrmW;
+  in vec3  vViewW;
 
   void main() {
     // Kill the un-extruded shell entirely. Everything below this contour is
@@ -314,7 +351,21 @@ const SMEAR_FRAG = /* glsl */ `
     float wt = max(fwidth(vTrail), 1e-5);
     float inkEdge = 1.0 - smoothstep(wt * 0.6, wt * 2.0, abs(vTrail - EDGE));
 
-    float ink = max(inkBand, inkEdge);
+    // ...and the mark's SIDES. The two lines above run ACROSS the tail; on
+    // their own they draw a ladder with no rails, and a mark with no closed
+    // contour is a wash. This is the same silhouette test the inverted hull
+    // makes — the surface turning away from the lens — evaluated here because
+    // an FX clone has no hull of its own and cannot afford one.
+    //
+    // It is what makes the streak a DRAWING. DustSystem's puff holds its ring
+    // at 0.78 while the fill drops away; below, this contour holds at 0.76
+    // while the fill steps down in thirds. Both marks stay drawn as they
+    // dissolve, which is the whole difference between an animator's smear and
+    // a lighting bloom.
+    float ndv = abs(dot(normalize(vNrmW), normalize(vViewW)));
+    float inkSide = 1.0 - smoothstep(0.06, 0.30, ndv);
+
+    float ink = max(max(inkBand, inkEdge), inkSide);
 
     // The fill steps DOWN along the tail in hard thirds and never fades
     // smoothly. Intensity is carried by how LONG the streak is, not by how
@@ -352,6 +403,8 @@ function createSmearMaterial(colorNear: Color, colorFar: Color): ShaderMaterial 
       uMinPixels: { value: SPEED_TUNING.smearMinPixels },
       uMaxPixels: { value: SPEED_TUNING.smearMaxPixels },
       uAmount: { value: 0 },
+      uDepthPush: { value: SPEED_TUNING.smearDepthPush },
+      uDepthPushFrac: { value: SPEED_TUNING.smearDepthPushMaxFrac },
       uColorNear: { value: colorNear.clone() },
       uColorFar: { value: colorFar.clone() },
       uInkColor: { value: INK.clone() },
@@ -614,9 +667,31 @@ class VelocityTracker {
 interface SmearEntry {
   target: Object3D;
   parts: SmearPart[];
+  /** The largest amount requested THIS frame. Cleared at the end of every update. */
+  pending: number;
+  /** True when this frame's request came from a ONE-SHOT smear() rather than
+   *  from the per-frame automatic driver. Only a one-shot arms the hold. */
+  oneShot: boolean;
+  /** The amount being driven toward. Only latches while `hold` is running. */
   request: number;
   hold: number;
   current: number;
+}
+
+/**
+ * A mesh's committed band colour, if it is a cel surface.
+ *
+ * Deliberately duck-typed rather than importing CelMaterial: SpeedFX must be
+ * able to smear anything that is handed to it, including a mesh built by a
+ * subsystem that has nothing to do with the NPR material factory.
+ */
+function readRampColor(mesh: Mesh, band: number): Color | null {
+  const mat = mesh.material as ShaderMaterial | ShaderMaterial[] | undefined;
+  const m = Array.isArray(mat) ? mat[0] : mat;
+  const u = m?.uniforms?.uBandColor?.value as Color[] | undefined;
+  if (!u || !u.length) return null;
+  const c = u[Math.min(band, u.length - 1)];
+  return c && (c as Color).isColor ? (c as Color).clone() : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -695,6 +770,18 @@ export class SpeedFX {
    * smear deforms in lockstep with the rider without the rig knowing we exist.
    */
   smear(target: Object3D, amount: number): void {
+    this.request(target, amount, true);
+  }
+
+  /**
+   * Request smear for THIS FRAME ONLY, with no hold.
+   *
+   * The automatic driver calls this every frame from the subject's own state,
+   * so it must not arm the hold — a hold on a per-frame driver is a latch, and
+   * that latch is what put a translucent copy of the rider over the rider in
+   * a third of the shipped stills. Only the public one-shot `smear()` arms it.
+   */
+  private request(target: Object3D, amount: number, oneShot: boolean): void {
     const a = clamp01(amount);
     if (a <= 0.005) return;
 
@@ -706,8 +793,8 @@ export class SpeedFX {
       e = built;
       this.entries.set(target, e);
     }
-    if (a > e.request) e.request = a;
-    e.hold = SPEED_TUNING.smearHold;
+    if (a > e.pending) e.pending = a;
+    if (oneShot) e.oneShot = true;
   }
 
   /**
@@ -734,7 +821,19 @@ export class SpeedFX {
       // Never smear a hull — it would double every outline into the tail —
       // and never smear another FX surface.
       if (o.userData?.isHull || o.userData?.fxTransparent) return;
-      const material = createSmearMaterial(this.colorNear, this.colorFar);
+      // THE STREAK IS THE PART'S OWN COLOUR, not one shared FX colour.
+      //
+      // Every smear in the game used to be drawn in cloth-grey shading to
+      // sun-rim cream, because `setSmearColors` exists and nothing ever calls
+      // it. At `crash` that put a pale wash where the jersey should have
+      // streaked red and the tyre black — one more reason the mark read as a
+      // glow rather than as the rider. Every surface here is a CelMaterial and
+      // already carries its committed ramp; band 2 is the lit body colour and
+      // band 0 the shadow, so the streak can simply be drawn in the same two
+      // values as the thing that made it. Read once, at build time.
+      const near = readRampColor(m, 2) ?? this.colorNear;
+      const far = readRampColor(m, 0) ?? this.colorFar;
+      const material = createSmearMaterial(near, far);
       const mesh = this.cloneFor(m, material);
       const vel = new VelocityTracker();
       m.getWorldPosition(_wp);
@@ -753,7 +852,7 @@ export class SpeedFX {
     if (parts.length === 0) return null;
     for (const p of parts) this.object.add(p.mesh);
 
-    return { target, parts, request: 0, hold: 0, current: 0 };
+    return { target, parts, pending: 0, oneShot: false, request: 0, hold: 0, current: 0 };
   }
 
   private cloneFor(src: Mesh, material: ShaderMaterial): Mesh {
@@ -854,7 +953,7 @@ export class SpeedFX {
       const fromSpin = whipping ? clamp01((spin - 4.2) / 6.5) * 0.9 : 0;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {
-        for (const o of this.autoTargets) this.smear(o, amount);
+        for (const o of this.autoTargets) this.request(o, amount, false);
       }
     }
 
@@ -867,13 +966,45 @@ export class SpeedFX {
     }
 
     for (const e of this.entries.values()) {
-      if (e.hold > 0) {
+      // ── THE LATCH BUG ─────────────────────────────────────────────────────
+      // `request` used to be a running MAXIMUM, raised by every smear() call
+      // and cleared only when `hold` ran out — while `hold` was refreshed to
+      // its full 0.22 s by any call at all, however small. So one frame with a
+      // big amount pinned the effect at that amount FOR AS LONG AS ANYTHING
+      // KEPT ASKING. Above about 15 m/s the auto driver asks every single
+      // frame, so the pin never released.
+      //
+      // That is the entire state-dependence in "the smear dissolves the rider
+      // in 5 of 16 frames": the harness shoots all sixteen poses in one page,
+      // and the failing five are the ones that FOLLOW a pose with a spike.
+      // Measured across the shipped pose order: `crash` (spin 9.6 rad/s, amount
+      // 0.9) was followed by `rider-closeup` at 12.5 m/s, which asks for
+      // exactly 0.0 — and it rendered at 0.821, higher than the crash that
+      // caused it. `ravine-gap` falls into the hole at 150 km/h and hands the
+      // same pin to `ridge-exposure` and `streambed` behind it.
+      //
+      // The fix is to make the drive follow THIS frame. `pending` is the max
+      // asked for during the frame just gone; if anything asked, that is the
+      // request and the hold restarts. The hold now only does the job it was
+      // written for — carrying a one-shot event request across the ~0.2 s after
+      // the caller stops calling — and can no longer outlive the state that
+      // produced it.
+      if (e.pending > 0.005) {
+        e.request = e.pending;
+        // ONLY a one-shot arms the hold. The automatic driver runs every frame
+        // and must therefore track the state exactly, with no memory at all.
+        if (e.oneShot) e.hold = SPEED_TUNING.smearHold;
+      } else if (e.hold > 0) {
+        // ...and even a one-shot's hold DECAYS rather than plateauing, so no
+        // path through this function can ever hold a value flat.
         e.hold -= dt;
-        e.current = dampHL(e.current, e.request, 0.035, dt);
+        e.request = dampHL(e.request, 0, 0.07, dt);
       } else {
         e.request = 0;
-        e.current = dampHL(e.current, 0, 0.05, dt);
       }
+      e.pending = 0;
+      e.oneShot = false;
+      e.current = dampHL(e.current, e.request, e.request > e.current ? 0.035 : 0.05, dt);
       const active = e.current > 0.03;
 
       for (const p of e.parts) {

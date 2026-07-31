@@ -9,7 +9,7 @@
  */
 import { chromium } from 'playwright';
 
-const MARK_R = 13, MARK_W = 6, MARK_INK = 2.2, MARK_LIFT = 2, MARK_DX = 2;
+const MARK_R = 11, MARK_INK = 2.2, MARK_LIFT = 2, MARK_DX = 2;
 const RIVAL_R = 8, RIVAL_INK = 2.0, RIVAL_LIFT = 13;
 const SHEAR = 0.20;
 const TITLE_SIZE = 16, TITLE_WEIGHT = 0.17;
@@ -29,9 +29,9 @@ const r = await p.evaluate(async (K) => {
   const mod = await import('/src/game/WorldConstants.ts');
   const CP = mod.CHECKPOINT_TS;
 
+  // Player marker is `tri`: tip a full radius along dir, base 0.7 back, ±0.78.
   const pts = [
-    [K.MARK_R, 0], [-K.MARK_R * 0.35, K.MARK_R * 0.92], [-K.MARK_R * 0.35 + K.MARK_W * 1.5, K.MARK_R * 0.92],
-    [K.MARK_R - K.MARK_W * 1.7, 0], [-K.MARK_R * 0.35 + K.MARK_W * 1.5, -K.MARK_R * 0.92], [-K.MARK_R * 0.35, -K.MARK_R * 0.92],
+    [K.MARK_R, 0], [-K.MARK_R * 0.7, K.MARK_R * 0.78], [-K.MARK_R * 0.7, -K.MARK_R * 0.78],
   ];
   const titleInkBottom = 30 + K.TITLE_SIZE * (K.TITLE_WEIGHT * 0.5 + 0.052);
   const digitCapTop = w.cpBaseY - 10 - 10 * 0.20 * 0.5;
@@ -83,7 +83,7 @@ const r = await p.evaluate(async (K) => {
     worst('rival_vs_rule', w.ruleY - rBot, t);
   }
   return res;
-}, { MARK_R, MARK_W, MARK_INK, MARK_LIFT, MARK_DX, RIVAL_R, RIVAL_INK, RIVAL_LIFT, SHEAR, TITLE_SIZE, TITLE_WEIGHT });
+}, { MARK_R, MARK_INK, MARK_LIFT, MARK_DX, RIVAL_R, RIVAL_INK, RIVAL_LIFT, SHEAR, TITLE_SIZE, TITLE_WEIGHT });
 
 console.log(JSON.stringify(r, null, 1));
 const bad = Object.entries(r.clearance).filter(([, v]) => v[0] <= 0);

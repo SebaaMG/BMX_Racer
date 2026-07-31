@@ -605,6 +605,18 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
         dy *= max(1.0, need / ly);
         return textureGrad(tex, uv, dx, dy);
       }
+
+      /**
+       * How much of a world-space marking survives at this pixel, in THREE
+       * HARD STEPS. The twin of detailFade in TerrainMaterial, and it has to
+       * behave identically: the near-field tonal shapes cross the trail edge,
+       * so if the two sides retired them at different distances the boundary
+       * between ribbon and ground would draw itself a second time.
+       */
+      float ribbonDetailFade(vec2 uv, float texSize) {
+        float fp = max(length(dFdx(uv)), length(dFdy(uv))) * texSize;
+        return floor(clamp(1.85 - fp * 0.55, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
+      }
     `,
     fragmentBody: /* glsl */ `
       // ── Trail surface detail ─────────────────────────────────────────────
@@ -690,11 +702,12 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       // varying along it and renders as one continuous wash — the largest
       // single shape in most frames in this game, painted as a gradient.
       //
-      // THE SAME NINE-STEP LADDER THE TERRAIN USES, and it has to be the same
+      // THE SAME SEVEN-STEP LADDER THE TERRAIN USES, and it has to be the same
       // one: the ribbon and the ground it is cut into meet along a line that
       // runs the whole height of the frame, and two plate stacks with different
       // boundaries would draw a value step on one side of that line and not the
-      // other. Boundaries at 3.0, 5.4, 9.9, 18.2, 33.2, 60.7, 111, 203, 371 m.
+      // other. Boundaries at 4.7, 10.0, 21.3, 45.3, 96.5 and 205 m. Every
+      // constant below is copied from TerrainMaterial and has to stay copied.
       //
       // What is NOT shared is the old strength. This block used to cap at 0.43
       // and then mix 62% of THAT — 26.6% of a pure cool SKY_BOUNCE — into every
@@ -705,11 +718,40 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       // instead, because it moves lightness without touching hue or chroma, and
       // the haze mix left on top is a sixth of what it was.
       float aerialT = saturate1(log2(clamp(vViewDist, 2.2, 420.0) / 2.2) / 7.577);
-      float plate = floor(aerialT * 9.0 + 0.5) / 9.0;
+      float plate = floor(aerialT * 7.0 + 0.5) / 7.0;
       float hazeSun = saturate1(dot(normalize(-V), uSunDir));
       hazeSun = hazeSun * hazeSun;
       celCol = mix(celCol, mix(uSkyBounce * 1.30, uFogSunTint * 1.10, hazeSun * 0.72), plate * 0.18);
-      celCol *= mix(0.92, 1.30, plate);
+      celCol *= mix(0.85, 1.42, plate);
+
+      // ── Ground shapes ────────────────────────────────────────────────────
+      // The plate ladder cannot help the near field and never will. A distance
+      // trace down a chase frame puts the bottom forty per cent of the picture
+      // on ground six to nine metres away spanning about two metres of world:
+      // one plate, one lit value, one of everything. The measured column was
+      // 259 rows without a step of even three levels.
+      //
+      // These are the SAME three quantised world-space octaves TerrainMaterial
+      // draws, sampled in WORLD space rather than in ribbon uv so that a shape
+      // running off the side of the trail continues across the ground beside
+      // it. A shape that stopped dead at the trail edge would draw the edge
+      // twice.
+      vec2 gw = vWorldPos.xz;
+      float shpN = fbm2(gw * 1.70 + 61.7, 2);
+      float shpM = fbm2(gw * 0.21 + 8.3, 2);
+      float shpA = fbm2(gw * 0.029 + 5.1, 2);
+      float shpB = fbm2(gw * 0.0077 + 91.3, 2);
+      float shapeN = bandStep(shpN, 0.430, 0.0015) + bandStep(shpN, 0.575, 0.0015) - 1.0;
+      float shapeM = bandStep(shpM, 0.452, 0.0015) + bandStep(shpM, 0.556, 0.0015) - 1.0;
+      float shapeA = bandStep(shpA, 0.455, 0.0015) + bandStep(shpA, 0.552, 0.0015) - 1.0;
+      float shapeB = bandStep(shpB, 0.455, 0.0015) + bandStep(shpB, 0.552, 0.0015) - 1.0;
+      float nearFade = ribbonDetailFade(gw * 1.70, 40.0);
+      float midFade  = ribbonDetailFade(gw * 0.21, 60.0);
+      float shapeFade = ribbonDetailFade(gw * 0.029, 3.0);
+      celCol *= 1.0 + shapeN * 0.100 * nearFade
+                    + shapeM * 0.085 * midFade
+                    + shapeA * 0.075 * shapeFade
+                    + shapeB * 0.065;
     `,
   });
   // CelMaterial sets the NPR_VERTEX_COLOR define but three only declares the

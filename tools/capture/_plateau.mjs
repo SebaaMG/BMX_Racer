@@ -50,23 +50,46 @@ if (process.env.DUMP) {
 const distinct = new Set(vals.map((v) => `${v[1]},${v[2]},${v[3]}`));
 console.log(`${file}  ${mode} ${a}  ${b0}..${b1}   n=${vals.length}  distinct RGB triples=${distinct.size}`);
 
-// Hard steps: an adjacent-sample jump. Report position, size, and the flat run
-// that preceded it.
-const steps = [];
-let runStart = b0;
-for (let i = 1; i < vals.length; i++) {
-  const d = Math.abs(lum(vals[i]) - lum(vals[i - 1]));
-  if (d >= minStep) {
-    steps.push({ at: vals[i][0], jump: d.toFixed(1), runBefore: vals[i][0] - runStart,
-                 from: vals[i - 1].slice(1).join(','), to: vals[i].slice(1).join(',') });
-    runStart = vals[i][0];
+// ── PLATEAU SEGMENTATION ─────────────────────────────────────────────────────
+// The critic's own vocabulary: a plateau is a run that holds its value, and a
+// boundary is the short transition between two of them. Counting only
+// adjacent-sample jumps misses a real terrace whose edge is antialiased across
+// four rows — the jump is there, it is just spread — so the run is segmented
+// first and the boundaries are measured between the plateaus, not within them.
+const FLAT = 1.6;        // luma levels a plateau may wander over its length
+const MAXEDGE = 10;      // samples a boundary may take and still be a boundary
+const plateaus = [];
+{
+  let i = 0;
+  while (i < vals.length) {
+    let j = i;
+    let lo = lum(vals[i]), hi = lo;
+    while (j + 1 < vals.length) {
+      const v = lum(vals[j + 1]);
+      if (Math.max(hi, v) - Math.min(lo, v) > FLAT) break;
+      lo = Math.min(lo, v); hi = Math.max(hi, v); j++;
+    }
+    plateaus.push({ from: vals[i][0], to: vals[j][0], len: j - i + 1, val: (lo + hi) / 2,
+                    rgb: vals[Math.floor((i + j) / 2)].slice(1).join(',') });
+    i = j + 1;
   }
 }
-console.log(`hard steps (>= ${minStep} luma levels between adjacent rows): ${steps.length}`);
-for (const s of steps) {
-  console.log(`   at ${String(s.at).padStart(5)}  jump ${String(s.jump).padStart(6)}  run before ${String(s.runBefore).padStart(4)}  (${s.from}) -> (${s.to})`);
+const kept = plateaus.filter((p) => p.len >= 6);
+console.log(`plateaus (>= 6 samples, holding within ${FLAT} luma): ${kept.length}`);
+let prev = null;
+let boundaries = 0;
+for (const p of kept) {
+  let note = '';
+  if (prev) {
+    const gap = p.from - prev.to;
+    const jump = Math.abs(p.val - prev.val);
+    if (gap <= MAXEDGE && jump >= minStep) { note = `   <== BOUNDARY  ${jump.toFixed(1)} levels over ${gap} rows`; boundaries++; }
+    else if (jump >= minStep) note = `   (drift ${jump.toFixed(1)} over ${gap} rows — not a boundary)`;
+  }
+  console.log(`   ${String(p.from).padStart(5)}..${String(p.to).padStart(5)}  len ${String(p.len).padStart(4)}  luma ${p.val.toFixed(1).padStart(6)}  (${p.rgb})${note}`);
+  prev = p;
 }
-console.log(`   final run ${b1 - runStart}`);
+console.log(`hard boundaries (>= ${minStep} levels across <= ${MAXEDGE} rows, between plateaus of >= 6): ${boundaries}`);
 
 // Total drift and the largest single jump, so a "smooth drift" can be told
 // apart from a terrace with the same endpoints.

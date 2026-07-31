@@ -179,9 +179,24 @@ const PROFILE_CUT = 20;
  * be a mountain. At 184 it gets 71, marginally MORE than the 68 it had while
  * colliding.
  */
-/** Player chevron: reach from its centre, tail thickness, ink, and offsets. */
-const PROFILE_MARK_R = 13;
-const PROFILE_MARK_W = 6;
+/**
+ * The player's marker is a SOLID triangle, not the stroked chevron it was.
+ *
+ * `chevron()` is an outline shape: an arrowhead with a notched tail, so its
+ * coloured core is the gap between two strokes. At the size this panel can
+ * afford that gap is 4.2 units wide and the ink halo either side of it is
+ * 2.6 — the marker was delivered with 1.6 units of gold inside 5.2 of ink and
+ * read as a black scribble on the ridge, which is also why it was easy to miss
+ * that it was scribbling over the `7`. A filled triangle has no such failure
+ * mode: it is gold all the way through at any size, it is the same idiom as the
+ * rival markers and the standings chips, and pointing it along the local
+ * downhill keeps the "travelling, not parked" read the chevron was there for.
+ *
+ * `tri` puts its tip a full radius along `dir` and its base corners at
+ * 1.048 R, so that factor — not R — is its true reach.
+ */
+const PROFILE_MARK_R = 11;
+const PROFILE_MARK_REACH = 1.048;
 const PROFILE_MARK_INK = 2.2;
 /** Drawn this far above / right of the skyline point it marks. */
 const PROFILE_MARK_LIFT = 2;
@@ -337,7 +352,15 @@ export class RouteProfileWidget extends Widget {
 
   private progress = 0;
   private markerT = 0;
+  /**
+   * Rival marker slots. POOLED, not rebuilt: this is filled in `update()`,
+   * which runs every frame whether or not anything is redrawn, and
+   * `push({ ... })` there was allocating one object per racer per frame — four
+   * objects a frame, 240 a second, for a list whose length never changes.
+   * `aiCount` is how many of the slots are live.
+   */
   private ai: { t: number; color: string; player: boolean }[] = [];
+  private aiCount = 0;
   private trackLen = 0;
   private sectionName = '';
   private pulse = 0;
@@ -399,7 +422,7 @@ export class RouteProfileWidget extends Widget {
     // `tri` puts its tip a full radius along `dir` and its base 0.7 back, so a
     // rival lifted clear of the ridge reaches further UP than the player's
     // chevron does and is what sets the top of the band.
-    const markSide = PROFILE_MARK_R + PROFILE_MARK_INK * 0.5;
+    const markSide = PROFILE_MARK_R * PROFILE_MARK_REACH + PROFILE_MARK_INK * 0.5;
     const markUp = markSide + PROFILE_MARK_LIFT;
     const markDown = markSide - PROFILE_MARK_LIFT;
     const rivalUp = PROFILE_RIVAL_R * 0.7 + PROFILE_RIVAL_INK * 0.5 + PROFILE_RIVAL_LIFT;
@@ -570,12 +593,21 @@ export class RouteProfileWidget extends Widget {
       if (isFinite(est) && est > 100) this.trackLen = this.trackLen === 0 ? est : dampHL(this.trackLen, est, 1.0, dt);
     }
 
-    this.ai.length = 0;
+    // Refill the pooled slots in place. A slot is only constructed the first
+    // time the field is that big; after that this is three stores per racer.
+    this.aiCount = 0;
     if (this.trackLen > 0) {
-      for (const r of m.standings) {
-        const t = clamp01(r.distance / this.trackLen);
-        const c = RIDER_CSS[r.colorIndex % RIDER_CSS.length];
-        this.ai.push({ t, color: c.jersey, player: r.isPlayer });
+      for (let i = 0; i < m.standings.length; i++) {
+        const r = m.standings[i];
+        let slot = this.ai[this.aiCount];
+        if (!slot) {
+          slot = { t: 0, color: '', player: false };
+          this.ai.push(slot);
+        }
+        slot.t = clamp01(r.distance / this.trackLen);
+        slot.color = RIDER_CSS[r.colorIndex % RIDER_CSS.length].jersey;
+        slot.player = r.isPlayer;
+        this.aiCount++;
       }
     }
 
@@ -585,7 +617,7 @@ export class RouteProfileWidget extends Widget {
     // screen changes and a redraw would be pure cost.
     const q = Math.round(this.markerT * this.plotW * 2);
     let s = `${q}|${this.sectionName}`;
-    for (const a of this.ai) s += '|' + Math.round(a.t * 400);
+    for (let i = 0; i < this.aiCount; i++) s += '|' + Math.round(this.ai[i].t * 400);
     this.sig(s);
   }
 
@@ -609,7 +641,8 @@ export class RouteProfileWidget extends Widget {
     ctx.restore();
 
     // Rival markers first so the player always sits on top of them.
-    for (const a of this.ai) {
+    for (let i = 0; i < this.aiCount; i++) {
+      const a = this.ai[i];
       if (a.player) continue;
       const ax = this.plotX + a.t * this.plotW;
       const ay = this.yAt(a.t);
@@ -621,12 +654,9 @@ export class RouteProfileWidget extends Widget {
     // Point it along the local downhill so it reads as travelling, not parked.
     const y2 = this.yAt(Math.min(1, this.markerT + 0.02));
     const dir = Math.atan2(y2 - py, this.plotW * 0.02);
-    // A fatter tail than the old 15/5: at this size the ink halo was closing
-    // over the notch and the marker delivered as a black scribble rather than
-    // as a gold arrow. Fewer units, more of them gold.
-    chevron(
+    tri(
       ctx, px + PROFILE_MARK_DX, py - PROFILE_MARK_LIFT,
-      PROFILE_MARK_R, PROFILE_MARK_W, dir, P.goldHot, P.ink, PROFILE_MARK_INK,
+      PROFILE_MARK_R, dir, P.goldHot, P.ink, PROFILE_MARK_INK,
     );
 
     // Header row: section name after the title, percentage hard right. Both on
@@ -1395,13 +1425,25 @@ const SCORE_TOP =
 const TRICK_BAR_H = 52;
 /** Trick plate top, up from the layer's bottom edge. */
 const TRICK_BAR_Y = Math.ceil(SCORE_TOP + 6 + TRICK_BAR_H + 2);
-/** Popup stack: bottom bar's top edge, and the pitch between bars. */
+/**
+ * Popup stack: the bottom bar's top edge, and the pitch between bars.
+ *
+ * The pitch is 58 rather than the 62 it was, and that is not a taste change.
+ * Six bars at 62 reach design y 294 measured from the layer's bottom edge, and
+ * the standings board's bottom edge is at design y 304 — so the fourth bar of a
+ * six-popup pile printed across the last row of the standings. At 58 the stack
+ * is the same six bars in 20 fewer units and the fourth one clears the board.
+ * Bars five and six still reach past it; see the sort note in `draw()` for why
+ * that is now the right ones being covered.
+ */
 const POPUP_BASE = TRICK_BAR_Y + 62;
-const POPUP_PITCH = 62;
+const POPUP_PITCH = 58;
 const POPUP_BAR_H = 50;
 
 export class PopupWidget extends Widget {
   private pool: Popup[] = [];
+  /** Draw order, reused every frame. See the note in `draw()`. */
+  private order: Popup[] = [];
   private live = 0;
   private activeTrick: string | null = null;
   private trickScore = 0;
@@ -1516,10 +1558,37 @@ export class PopupWidget extends Widget {
       drawText(ctx, t, w - 46, h - TRICK_BAR_Y + (TRICK_BAR_H + st.size) * 0.5, st);
     }
 
-    // The stack. Newest at the bottom, older ones pushed up the frame.
+    // ── The stack. Newest at the bottom, older ones pushed up the frame ──────
+    //
+    // The sort was `b.age - a.age`, which is the opposite of that: it put the
+    // OLDEST at the bottom and made each new popup appear at the top of the
+    // pile. That is backwards twice over. The bottom slot is the only one that
+    // is guaranteed clear of the standings board and of the layer's own top
+    // edge, so it is the slot the newest popup — the one the player is being
+    // told something by — has to land in; and when the pile is deeper than the
+    // column, the ones that get pushed out have to be the ones already on their
+    // way out, not the one that just landed.
+    //
+    // Built into a pooled array, not `filter().sort()`. While popups are live
+    // the signature changes every frame — `age` is in it — so this IS the
+    // per-frame path, and the old form allocated a fresh array and a fresh
+    // comparator closure on each of those frames. Six elements: an insertion
+    // sort in place is both allocation-free and faster.
     let slot = 0;
-    const ordered = this.pool.filter((p) => p.active).sort((a, b) => b.age - a.age);
-    for (const p of ordered) {
+    const ord = this.order;
+    let n = 0;
+    for (let i = 0; i < this.pool.length; i++) {
+      const p = this.pool[i];
+      if (!p.active) continue;
+      let k = n++;
+      while (k > 0 && ord[k - 1].age > p.age) {
+        ord[k] = ord[k - 1];
+        k--;
+      }
+      ord[k] = p;
+    }
+    for (let i = 0; i < n; i++) {
+      const p = ord[i];
       const k = ease.snap(clamp01(p.age / 0.20));
       const y = h - POPUP_BASE - slot * POPUP_PITCH;
       slot++;

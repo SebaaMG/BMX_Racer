@@ -145,7 +145,23 @@ export class Sky {
       glslVersion: GLSL3,
       side: BackSide,
       depthWrite: false,
-      depthTest: false,
+      // ── DEPTH-TESTED, AND DRAWN LAST AMONG THE OPAQUES ────────────────────
+      // This was depthTest false at renderOrder -1000, i.e. a background fill:
+      // the dome shaded every one of the 5.76 million pixels in a retina frame
+      // and the terrain then painted over most of them. tools/capture/
+      // _skycost.mjs renders the same frame with the sky group visible and
+      // hidden and differences the wall time behind a readPixels flush; on
+      // valley-vista, where the sky is about a sixth of the frame, the dome was
+      // costing 12.3 ms of a 27.9 ms post.render. That is the most expensive
+      // thing in the picture, spent almost entirely on pixels nobody sees.
+      //
+      // The vertex shader already emits p.xyww, so every dome fragment lands
+      // exactly on the far plane at NDC z = 1. With the test on and the default
+      // LESS_EQUAL, a cleared depth buffer (1.0) still admits it, and anything
+      // with real geometry in front rejects it for free. depthWrite stays off,
+      // so nothing downstream — the ink pass reads the depth texture — can tell
+      // the difference.
+      depthTest: true,
       fog: false,
       uniforms: {
         uTime: NPR.uTime,
@@ -423,7 +439,13 @@ export class Sky {
           // gap by 0.02 out of 0.122.
           float hHorizon = h + wander * 0.300 + brushField(sp, 63.0) * 0.055;
           float hUpper   = h + wander * 0.285 + brushField(sp, 91.0) * 0.048;
-          float hZenith  = h + wander * 0.330 + brushField(sp, 27.0) * 0.042;
+          // The zenith boundary gets less swell and more brush than the other
+          // two. It is the only one that can enter frame as an ISOLATED lobe
+          // rather than as an edge crossing the whole width — a camera looking
+          // up sees the middle of it — and a single rounded lobe of deep blue
+          // coming down out of the top of frame reads as a blue cloud rather
+          // than as the top of the sky.
+          float hZenith  = h + wander * 0.240 + brushField(sp, 27.0) * 0.055;
 
           vec3 col = uBelow;
           col = mix(col, uHorizon, bandStepS(hHorizon, 0.018, 0.0018));
@@ -743,7 +765,12 @@ export class Sky {
     const dome = new Mesh(geo, this.domeMat);
     dome.name = 'sky:dome';
     dome.frustumCulled = false;
-    dome.renderOrder = -1000;
+    // AFTER the opaques, not before them. The material is opaque, so three
+    // sorts it inside the opaque group and this only moves it to the end of
+    // that group — transparents (dust, smear, the shaft fan at 4000) still
+    // draw over it. Combined with the depth test above, every pixel the
+    // terrain owns is rejected before the dome's fragment shader runs.
+    dome.renderOrder = 900;
     dome.userData.skipPrepass = true;
     dome.userData.skipShadow = true;
     this.group.add(dome);

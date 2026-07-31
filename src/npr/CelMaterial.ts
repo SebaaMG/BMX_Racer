@@ -195,6 +195,37 @@ export interface CelOptions {
    */
   valueSteps?: number;
   /**
+   * Draw a CONTOUR around the specular highlight. 0 (default) is off.
+   *
+   * A cel highlight is a shape with an edge. `bandedSpecular` already gives it
+   * flat tiers — but flat tiers alone are a posterised photograph, not a
+   * drawing, and the difference is that an animator puts a LINE round the
+   * glint. This is that line: the highlight's own outer boundary, inked at a
+   * width taken from the term's screen derivative so it is one pixel wide at
+   * every angle, in the material's own darkest band so a helmet contour stays
+   * a helmet colour.
+   *
+   * Two things were tried before this and both are worth recording, because
+   * each looked right on paper:
+   *
+   *  • `specPower` 140 → 9. A scanline across the crown at `rider-closeup`
+   *    afterwards reads five genuinely FLAT plateaus (luma 75, 122, 90, 143,
+   *    200), so the exponent fix worked exactly as intended. It did not change
+   *    the read, and a term-by-term isolation on one frozen frame — spec off,
+   *    matcap off, rim off, bloom off — proved why: the crown looked the same
+   *    with all four dead. The tiers were never the problem.
+   *
+   *  • Posterising the whole shaded value (`valueSteps`) and inking every tier
+   *    boundary. On a DOME the value varies radially, so the tiers are
+   *    concentric and the lines came out as a set of nested rings — the helmet
+   *    read as a contour map. A highlight is ONE shape, so only the highlight's
+   *    own boundary may be drawn.
+   */
+  specInk?: number;
+  /** Override the preset's rim strength / exponent. */
+  rimStrength?: number;
+  rimPower?: number;
+  /**
    * DISTANCE IDENTITY. Opt-in, and deliberately so — see the note on
    * `identityUniforms` below. Enables a chroma floor, a rim floor and an
    * outline taper keyed to the subject's APPARENT SIZE in device pixels.
@@ -289,6 +320,7 @@ function buildDefines(opts: CelOptions): Record<string, string | number> {
   if ((opts.alphaTest ?? 0) > 0) d.NPR_ALPHATEST = 1;
   if (opts.identity) d.NPR_IDENTITY = 1;
   if ((opts.valueSteps ?? 0) > 0) d.NPR_QUANTIZE = 1;
+  if ((opts.specInk ?? 0) > 0) d.NPR_SPEC_INK = 1;
   return d;
 }
 
@@ -355,8 +387,8 @@ function rampUniforms(p: RampPreset, opts: CelOptions): Record<string, IUniform>
     uSpecStrength: { value: opts.specStrength ?? p.specStrength },
     uSpecPower: { value: opts.specPower ?? p.specPower },
     uSpecColor: { value: p.specColor.clone() },
-    uRimStrength: { value: p.rimStrength },
-    uRimPower: { value: p.rimPower },
+    uRimStrength: { value: opts.rimStrength ?? p.rimStrength },
+    uRimPower: { value: opts.rimPower ?? p.rimPower },
     uRimColor: { value: p.rimColor.clone() },
     uHatchStrength: { value: p.hatchStrength },
     uHatchScale: { value: p.hatchScale },
@@ -368,6 +400,7 @@ function rampUniforms(p: RampPreset, opts: CelOptions): Record<string, IUniform>
     uMap: { value: opts.map ?? null },
     uWindStrength: { value: opts.wind ? 1 : 0 },
     uValueSteps: { value: opts.valueSteps ?? 0 },
+    uSpecInk: { value: opts.specInk ?? 0 },
     ...identityUniforms(opts),
   };
 }
@@ -481,6 +514,7 @@ function buildFragmentShader(opts: CelOptions, varyings: string): string {
 
     uniform sampler2D uMap;
     uniform float uValueSteps;
+    uniform float uSpecInk;
 
     in vec3  vWorldPos;
     in vec3  vNormal;
@@ -511,12 +545,33 @@ function buildFragmentShader(opts: CelOptions, varyings: string): string {
        *  fragment that has already been mixed 70% toward a teal haze plateau
        *  produces a saturated teal rider.
        *
-       *  RIM FLOOR. The Fresnel exponent is opened up toward 1 as the subject
-       *  shrinks, which widens the band of surface that clears the rim
-       *  threshold from a hairline to several pixels. A background painter
-       *  drawing a 15 px figure does exactly this: the light wrap stops being
-       *  a hairline and becomes one of the three or four marks that make up
-       *  the whole figure.
+       *  RIM FLOOR. The Fresnel exponent is opened up as the subject shrinks,
+       *  which widens the band of surface that clears the rim threshold from a
+       *  hairline to a couple of pixels. A background painter drawing a 15 px
+       *  figure does exactly this: the light wrap stops being a hairline and
+       *  becomes one of the three or four marks that make up the whole figure.
+       *
+       *  AND IT TAKES THE SUBJECT'S OWN HUE AS IT DOES SO. That is not a
+       *  flourish, it is the difference between the two floors helping each
+       *  other and fighting. Measured on the opponent's jersey alone — rendered
+       *  twice per size and differenced against a render with only the jersey
+       *  hidden, so the sample is exactly the jersey and nothing else — the
+       *  first version of this rim was a NET LOSS below 25 px:
+       *
+       *      15 px jersey   floors off   mean chroma 67   on-hue 59%
+       *      15 px jersey   floors on    mean chroma 44   on-hue 25%
+       *
+       *  The hue it re-seated was right (peak hue error fell from 5 deg to 2),
+       *  but the jersey at 15 px is twenty-four pixels in total and the rim
+       *  covered a third of them in cream, so the average of what a viewer
+       *  actually sees moved AWAY from the committed colour. A separating line
+       *  that erases the thing it is separating has separated nothing.
+       *
+       *  So the exponent opens to 1.15 rather than 0.85 — 16% of the radius
+       *  instead of 23%, which is still ~1.5 px on a 15 px rider — and the wrap
+       *  colour crossfades from the palette's rim toward the identity hue as k
+       *  rises. A far rider's light wrap being tinted by his own jersey is what
+       *  a painter would do anyway.
        */
       vec3 applyIdentityFloors(vec3 col, vec3 N, vec3 V) {
         float k = 1.0 - smoothstep(uIdentityPx.y, uIdentityPx.x, vScreenPx);
@@ -526,8 +581,9 @@ function buildFragmentShader(opts: CelOptions, varyings: string): string {
         vec3 idc = uIdentityColor * mix(0.50, 1.35, lq);
         col = mix(col, idc, k * uIdentityChroma);
 
-        float rim = celRim(N, V, mix(uRimPower, 0.85, k));
-        col += uRimColor * rim * k * uIdentityRim;
+        float rim = celRim(N, V, mix(uRimPower, 1.15, k));
+        vec3 rimC = mix(uRimColor, uRimColor * 0.30 + uIdentityColor * 1.30, k * uIdentityChroma);
+        col += rimC * rim * k * uIdentityRim;
         return col;
       }
     #endif
@@ -577,7 +633,27 @@ function buildFragmentShader(opts: CelOptions, varyings: string): string {
           if (peak > 1e-4) {
             float q = floor(sqrt(peak) * uValueSteps + 0.5) / uValueSteps;
             celCol *= (q * q) / peak;
+
           }
+        }
+      #endif
+
+      // ── The drawn contour on the highlight ────────────────────────────────
+      // See CelOptions.specInk. Recomputed here rather than returned from
+      // celShade because celShade is shared by every surface in the game and
+      // most of them must not pay for this.
+      #ifdef NPR_SPEC_INK
+        {
+          vec3 specH = normalize(uSunDir + V);
+          float specTerm = pow(saturate1(dot(N, specH)), uSpecPower);
+          // The same 0.20 threshold bandedSpecular uses for its outer tier, so
+          // the line lands exactly on the edge of the shape it is drawing.
+          float specW = max(fwidth(specTerm) * 0.75, 0.006);
+          float specEdge = 1.0 - smoothstep(specW * 0.8, specW * 2.6, abs(specTerm - 0.20));
+          // Only on the lit side. A contour around a highlight that is not
+          // there is just a scribble.
+          float specLit = saturate1(dot(N, uSunDir) * 3.0);
+          celCol = mix(celCol, uBandColor[0] * 0.55, specEdge * uSpecInk * specLit);
         }
       #endif
 
