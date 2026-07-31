@@ -16,7 +16,7 @@
  * Neither system needs to know anything about the other's internals.
  */
 
-import { Vector3 } from 'three';
+import { CatmullRomCurve3, Vector3 } from 'three';
 import { TrackSectionKind } from './Contracts';
 
 // ── World scale ──────────────────────────────────────────────────────────────
@@ -156,10 +156,85 @@ export interface TerrainFeature {
   params: Record<string, number>;
 }
 
+/**
+ * The tabletop, as an explicit jump rather than as a lump with a width.
+ *
+ * Every length here is measured ALONG THE ROUTE from the takeoff lip, which is
+ * the feature's anchor point. That is the only frame in which the numbers mean
+ * anything: a jump described in world XZ with a hardcoded azimuth is only a
+ * jump if the course happens to agree with the azimuth, and when it does not
+ * the rider crosses the mound's flank instead of running up the kicker.
+ *
+ * The heights are relative to the mountain's own fall line under the mound, not
+ * to sea level, so the deck follows the descent instead of sitting level and
+ * pointing the landing ramp back uphill.
+ *
+ * Reading the shape, and why each number is what it is:
+ *
+ *   face 8.5m / height 4.2m / faceEase 0.38
+ *     A kicker is a STRAIGHT ramp with a rounded transition at its foot, and it
+ *     has to be built that way rather than as a curve. The first attempt used
+ *     `height * k^1.3`, whose gradient reaches the takeoff angle at exactly one
+ *     point — the lip — and the 1.6 m kernel the track builder runs over
+ *     designed features promptly rounded that point off, leaving a 19 degree
+ *     roller that got shallower as it approached the lip. Backwards.
+ *
+ *     So: ease from zero slope over the first `faceEase` of the face, then hold
+ *     one gradient the rest of the way and STOP. The held gradient is
+ *     height / (face * (1 - faceEase/2)) = 0.61, which over ground falling at
+ *     0.11 is a 26.7 degree takeoff sustained over the last 5.3 m. A straight
+ *     segment is invariant under a symmetric blur, so smoothing now rounds only
+ *     the lip corner itself — which is what a real lip looks like — instead of
+ *     eating the angle the rider is supposed to read from 40 m out.
+ *
+ *   deck 18m
+ *     An 18 m/s launch off a 26.7 degree lip flies 12.7 m under this game's
+ *     20.4 m/s^2 gravity. The deck is longer than that, so the default outcome
+ *     is landing ON it: that is what makes this a tabletop and not a gap. It is
+ *     also short enough that clearing it is worth trying.
+ *
+ *   landing 16m
+ *     Falls away as a smoothstep — zero slope where it leaves the deck, so there
+ *     is no second lip to launch off, and zero slope where it rejoins the hill,
+ *     so there is no compression at the bottom. Peak fall 1.5 * height / landing
+ *     = 0.39, about 22 degrees.
+ *
+ *     deck + landing = 34 m is not arbitrary: the corridor here is a bench about
+ *     34 m long (the descent profile deliberately flattens through `tabletop
+ *     approach — flatter so the lip reads`) and then plunges at 0.30 into the
+ *     ravine. Ending the landing at the bench edge keeps the ramp's own fall and
+ *     the mountain's out of each other's way; overlapping them was worth 10
+ *     degrees of landing gradient for nothing.
+ *
+ *   feather 12m
+ *     Run-in and run-out over which the carve blends into untouched ground.
+ *     Without it the carve's authority collapses across one texel and the spline
+ *     tries to climb the step.
+ */
+export const TABLETOP = {
+  /** Kicker face length, metres along the route, ending at the lip. */
+  face: 7.5,
+  /** Flat deck from the lip. */
+  deck: 18,
+  /** Landing ramp beyond the deck. */
+  landing: 16,
+  /** Crest height above the natural fall line. */
+  height: 4.2,
+  /** Half-width of the deck. */
+  halfWidth: 8.5,
+  /** Lateral fall-off from the deck edge to natural ground. */
+  flank: 7,
+  /** Longitudinal blend into untouched ground at each end. */
+  feather: 12,
+  /** Fraction of the face spent easing in from zero slope. */
+  faceEase: 0.36,
+};
+
 export const TERRAIN_FEATURES: TerrainFeature[] = [
   { kind: 'start-plateau', x: -120, z: -1620, params: { radius: 26, flatness: 0.92 } },
-  // The tabletop: a raised flat-topped mound with a clean lip.
-  { kind: 'tabletop', x: 25, z: 150, params: { length: 34, width: 16, height: 4.2, lipSharpness: 0.72 } },
+  // The tabletop. x/z is the TAKEOFF LIP and sits on the route; everything else
+  // is measured along the route from there. See TABLETOP above.
+  { kind: 'tabletop', x: 23.5, z: 133, params: { ...TABLETOP } },
   // The ravine: a genuine gap the rider must clear. Steep sides, 11m across.
   { kind: 'ravine', x: 32, z: 306, params: { width: 11.5, depth: 26, length: 240, angle: 1.44 } },
   // The ridge: narrow the crest and drop the flanks hard.
@@ -169,6 +244,76 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   { kind: 'rock-garden', x: -50, z: -100, params: { radius: 70, roughness: 1.35, boulderCount: 46 } },
   { kind: 'finish-flat', x: 108, z: 1490, params: { radius: 60, flatness: 0.85 } },
 ];
+
+// ── The tabletop, as one shape both systems build ────────────────────────────
+/**
+ * Resolved tabletop geometry, with the two derived stations the callers want.
+ *
+ * `sMin`/`sMax` are lip-relative route distances bounding the whole footprint
+ * INCLUDING the feather, so a caller can ask "is this sample inside the jump"
+ * without re-deriving the arithmetic and getting a different answer.
+ */
+export interface TabletopGeometry {
+  face: number;
+  deck: number;
+  landing: number;
+  height: number;
+  halfWidth: number;
+  flank: number;
+  feather: number;
+  faceEase: number;
+  /** Start of the run-in feather, lip-relative. Negative. */
+  sMin: number;
+  /** End of the run-out feather, lip-relative. */
+  sMax: number;
+}
+
+export function tabletopGeometry(f?: TerrainFeature): TabletopGeometry {
+  const p = f?.params ?? {};
+  const g = {
+    face: p.face ?? TABLETOP.face,
+    deck: p.deck ?? TABLETOP.deck,
+    landing: p.landing ?? TABLETOP.landing,
+    height: p.height ?? TABLETOP.height,
+    halfWidth: p.halfWidth ?? TABLETOP.halfWidth,
+    flank: p.flank ?? TABLETOP.flank,
+    feather: p.feather ?? TABLETOP.feather,
+    faceEase: p.faceEase ?? TABLETOP.faceEase,
+    sMin: 0,
+    sMax: 0,
+  };
+  g.sMin = -g.face - g.feather;
+  g.sMax = g.deck + g.landing + g.feather;
+  return g;
+}
+
+/**
+ * Height of the jump ABOVE THE FALL LINE at a lip-relative route distance.
+ *
+ * Zero outside `-face .. deck + landing`, and zero-sloped where it reaches zero
+ * at both ends, so adding it to any fall line can never introduce a step. The
+ * heightfield carve and the track profile both call this, which is the whole
+ * point: the collision surface and the racing line are the same curve plus a
+ * known offset, not two independent guesses that have to be reconciled after
+ * the fact.
+ */
+export function tabletopProfile(g: TabletopGeometry, s: number): number {
+  if (s <= -g.face || s >= g.deck + g.landing) return 0;
+  if (s < 0) {
+    // Face: a quadratic ease from zero slope, then a STRAIGHT ramp at the
+    // takeoff gradient all the way to the lip, where it stops dead.
+    const k = (s + g.face) / g.face;
+    const e = Math.min(Math.max(g.faceEase, 1e-3), 0.99);
+    // Held gradient, in units of height per unit k.
+    const m = 1 / (1 - e * 0.5);
+    return g.height * (k < e ? (m * k * k) / (2 * e) : m * (k - e * 0.5));
+  }
+  if (s <= g.deck) return g.height;
+  // Landing. Smoothstep, so there is no second lip at the deck edge and no
+  // compression where it rejoins the hillside.
+  const k = (s - g.deck) / g.landing;
+  return g.height * (1 - k * k * (3 - 2 * k));
+}
 
 // ── Checkpoints ──────────────────────────────────────────────────────────────
 /** Normalised positions along the track where a checkpoint gate stands. */
@@ -237,6 +382,194 @@ export const SURFACES = {
 export function routePoints(): Vector3[] {
   return ROUTE.map((r) => new Vector3(r.x, 0, r.z));
 }
+
+// ── The route as geometry ────────────────────────────────────────────────────
+/**
+ * One shared, arc-length-parameterised polyline through the ROUTE controls.
+ *
+ * Terrain and track each used to carry their own idea of where the course goes:
+ * the terrain re-splined the controls itself, and the authored features were
+ * pinned to a hardcoded world XZ and a hardcoded azimuth. That is fine right up
+ * until an azimuth disagrees with the route it is supposed to be aligned to, at
+ * which point the feature is built across the course instead of along it and
+ * nothing downstream can tell you why. The tabletop was 5.7 degrees out.
+ *
+ * So there is exactly one route curve, it lives here with the controls, and both
+ * systems project onto it. `centripetal` matches TrackSpline's own curve type,
+ * which is what makes a station computed here land on the same ground the track
+ * builder will put the centreline.
+ *
+ * Deterministic: a pure function of ROUTE, built once, cached.
+ */
+export interface RoutePolyline {
+  x: Float64Array;
+  z: Float64Array;
+  /** Unit tangent in XZ at each station. */
+  tx: Float64Array;
+  tz: Float64Array;
+  /** Station spacing, metres. */
+  step: number;
+  count: number;
+  length: number;
+}
+
+let _routePoly: RoutePolyline | null = null;
+
+/** The shared route polyline, resampled to a uniform ~1 m station spacing. */
+export function routePolyline(): RoutePolyline {
+  if (_routePoly) return _routePoly;
+
+  const ctrl = ROUTE.map((r) => new Vector3(r.x, 0, r.z));
+  const curve = new CatmullRomCurve3(ctrl, false, 'centripetal', 0.5);
+
+  const DENSE = 12000;
+  const dx = new Float64Array(DENSE + 1);
+  const dz = new Float64Array(DENSE + 1);
+  const cum = new Float64Array(DENSE + 1);
+  const p = new Vector3();
+  for (let i = 0; i <= DENSE; i++) {
+    curve.getPoint(i / DENSE, p);
+    dx[i] = p.x;
+    dz[i] = p.z;
+    if (i > 0) cum[i] = cum[i - 1] + Math.hypot(dx[i] - dx[i - 1], dz[i] - dz[i - 1]);
+  }
+  const length = cum[DENSE];
+  const count = Math.max(2, Math.round(length) + 1);
+  const step = length / (count - 1);
+
+  const x = new Float64Array(count);
+  const z = new Float64Array(count);
+  const tx = new Float64Array(count);
+  const tz = new Float64Array(count);
+  let j = 0;
+  for (let i = 0; i < count; i++) {
+    const target = i * step;
+    while (j < DENSE && cum[j + 1] < target) j++;
+    const seg = cum[j + 1] - cum[j];
+    const f = seg > 1e-9 ? (target - cum[j]) / seg : 0;
+    x[i] = dx[j] + (dx[j + 1] - dx[j]) * f;
+    z[i] = dz[j] + (dz[j + 1] - dz[j]) * f;
+  }
+  for (let i = 0; i < count; i++) {
+    const a = Math.max(0, i - 1);
+    const b = Math.min(count - 1, i + 1);
+    const ux = x[b] - x[a];
+    const uz = z[b] - z[a];
+    const l = Math.hypot(ux, uz) || 1;
+    tx[i] = ux / l;
+    tz[i] = uz / l;
+  }
+
+  _routePoly = { x, z, tx, tz, step, count, length };
+  return _routePoly;
+}
+
+/** A point resolved against the route: arc distance, lateral offset, tangent. */
+export interface RouteFrame {
+  /** Arc distance along the route, metres from the start gate. */
+  s: number;
+  /** Signed lateral offset, metres. Positive is to the LEFT of travel. */
+  u: number;
+  x: number;
+  z: number;
+  tx: number;
+  tz: number;
+}
+
+export function makeRouteFrame(): RouteFrame {
+  return { s: 0, u: 0, x: 0, z: 0, tx: 0, tz: 1 };
+}
+
+/**
+ * Route position and tangent at an arc distance. Clamped, allocation-free.
+ */
+export function routeAt(s: number, out: RouteFrame): RouteFrame {
+  const poly = routePolyline();
+  const f = Math.min(Math.max(s / poly.step, 0), poly.count - 1);
+  const i0 = Math.min(f | 0, poly.count - 1);
+  const i1 = Math.min(i0 + 1, poly.count - 1);
+  const k = f - i0;
+  out.s = s;
+  out.u = 0;
+  out.x = poly.x[i0] + (poly.x[i1] - poly.x[i0]) * k;
+  out.z = poly.z[i0] + (poly.z[i1] - poly.z[i0]) * k;
+  const ux = poly.tx[i0] + (poly.tx[i1] - poly.tx[i0]) * k;
+  const uz = poly.tz[i0] + (poly.tz[i1] - poly.tz[i0]) * k;
+  const l = Math.hypot(ux, uz) || 1;
+  out.tx = ux / l;
+  out.tz = uz / l;
+  return out;
+}
+
+/**
+ * Project a world XZ point onto the route.
+ *
+ * `from`/`to` bound the station scan. The switchbacks bring two legs of the
+ * course within 45 m of each other, so an unbounded scan genuinely can pick the
+ * wrong leg; every caller here knows which stretch of route it is asking about
+ * and says so.
+ */
+export function projectOnRoute(
+  x: number,
+  z: number,
+  out: RouteFrame,
+  from = 0,
+  to = Number.POSITIVE_INFINITY,
+): RouteFrame {
+  const poly = routePolyline();
+  const i0 = Math.max(0, Math.min(poly.count - 1, Math.floor(from / poly.step)));
+  const i1 = Math.max(i0, Math.min(poly.count - 1, Math.ceil(to / poly.step)));
+
+  let best = i0;
+  let bestD2 = Infinity;
+  for (let i = i0; i <= i1; i++) {
+    const ddx = poly.x[i] - x;
+    const ddz = poly.z[i] - z;
+    const d2 = ddx * ddx + ddz * ddz;
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      best = i;
+    }
+  }
+
+  // Refine onto the two adjoining segments so `s` is continuous rather than
+  // quantised to the station spacing — a quantised `s` puts a 1 m stair in the
+  // face of any ramp built in this frame.
+  let bs = best * poly.step;
+  let bu = 0;
+  let bd2 = Infinity;
+  for (let k = -1; k <= 0; k++) {
+    const a = best + k;
+    const b = a + 1;
+    if (a < i0 || b > i1) continue;
+    const sx = poly.x[b] - poly.x[a];
+    const sz = poly.z[b] - poly.z[a];
+    const l2 = sx * sx + sz * sz;
+    if (l2 < 1e-12) continue;
+    const t = Math.min(Math.max(((x - poly.x[a]) * sx + (z - poly.z[a]) * sz) / l2, 0), 1);
+    const cx = poly.x[a] + sx * t;
+    const cz = poly.z[a] + sz * t;
+    const d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz);
+    if (d2 < bd2) {
+      bd2 = d2;
+      bs = (a + t) * poly.step;
+      const l = Math.sqrt(l2);
+      // Left-hand normal in plan, matching TrackSpline's `left`.
+      bu = (x - cx) * (sz / l) + (z - cz) * (-sx / l);
+    }
+  }
+
+  routeAt(bs, out);
+  out.u = bu;
+  return out;
+}
+
+/** Arc distance along the route of the point nearest (x, z). */
+export function routeDistanceOf(x: number, z: number, from?: number, to?: number): number {
+  return projectOnRoute(x, z, _rfScratch, from, to).s;
+}
+
+const _rfScratch = makeRouteFrame();
 
 /** Total straight-line length of the route polyline — a rough course length. */
 export function routePolylineLength(): number {

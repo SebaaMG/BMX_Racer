@@ -75,6 +75,13 @@ import { NPR } from '../NprGlobals';
 import { INK, LINES } from '../Palette';
 import { FullscreenPass } from './Fullscreen';
 
+/**
+ * The tightest radius, in metres, a surface may curve through and still count
+ * as SMOOTH. Belongs in Palette.LINES beside the other line constants; that
+ * file is owned elsewhere this pass, so it lives here.
+ */
+const CREASE_RADIUS = 0.22;
+
 export const LINE_DEBUG = {
   off: 0,
   field: 1,
@@ -83,6 +90,10 @@ export const LINE_DEBUG = {
   id: 4,
   hull: 5,
   curvature: 6,
+  /** Diagnostic packing: r contour, g hull, b coverage, a final alpha. */
+  probeContour: 7,
+  /** Diagnostic packing: r nMagX, g nMagY, b spanX/4m, a spanY/4m. */
+  probeNormal: 8,
 } as const;
 
 const FRAGMENT = /* glsl */ `
@@ -96,6 +107,14 @@ const FRAGMENT = /* glsl */ `
 
   uniform vec2  uTexel;
   uniform vec2  uCamPlanes;          // near, far
+  // World metres subtended by ONE device pixel at one metre of view depth:
+  // 2*tan(fovY/2) / heightInPixels. Multiply by the fragment's view depth to
+  // get the pixel's world footprint perpendicular to the view ray.
+  uniform float uPixelScale;
+  // Radius of the tightest surface that is still allowed to be "smooth".
+  // Anything rounder than this cannot be a crease no matter how many degrees
+  // of normal it turns across a pixel — see the scale-invariance note below.
+  uniform float uCreaseRadius;
   uniform vec2  uNormalEdge;         // threshold, knee
   uniform vec2  uDepthEdge;          // threshold, knee
   uniform float uIdThreshold;
@@ -219,7 +238,19 @@ const FRAGMENT = /* glsl */ `
     // what lets the threshold be expressed in normal units and stay meaningful.
     vec3 gx = (nrm[2] + 2.0 * nrm[5] + nrm[8]) - (nrm[0] + 2.0 * nrm[3] + nrm[6]);
     vec3 gy = (nrm[6] + 2.0 * nrm[7] + nrm[8]) - (nrm[0] + 2.0 * nrm[1] + nrm[2]);
-    float nMag = sqrt(dot(gx, gx) + dot(gy, gy)) * 0.25;
+    float mx = length(gx) * 0.25;   // normal step across the 2-px horizontal span
+    float my = length(gy) * 0.25;   // ... and the vertical one
+
+    // World distance the Sobel's 2-pixel span actually covers ON THE SURFACE.
+    // The lateral part is the pixel footprint; the along-ray part is read
+    // straight out of the depth channel, which is what makes this account for
+    // slope as well as distance without needing to reconstruct a tangent frame.
+    float pxW = dC * uPixelScale;
+    float lat = 2.0 * pxW;
+    float sx  = sqrt(lat * lat + (dep[5] - dep[3]) * (dep[5] - dep[3]));
+    float sy  = sqrt(lat * lat + (dep[7] - dep[1]) * (dep[7] - dep[1]));
+
+    float nMag = sqrt(mx * mx + my * my);
     float eNormal = smoothstep(uNormalEdge.x, uNormalEdge.x + uNormalEdge.y, nMag);
 
     // ── Depth discontinuity ─────────────────────────────────────────────────
@@ -295,6 +326,19 @@ const FRAGMENT = /* glsl */ `
     ink = mix(ink, uFogColors[fi] * 0.55, uFogStrengths[fi] * saturate1(t * 1.3));
 
     if (uDebug > 0.5) {
+      // Two PACKED diagnostic channels sit above the single-value views. They
+      // exist so a probe can read four quantities out of one 8-bit readback
+      // instead of re-rendering the frame once per quantity — which is the only
+      // way to correlate "the contour fired" with "the hull mask ate it" at a
+      // specific pixel.
+      if (uDebug > 6.5 && uDebug < 7.5) {
+        fragColor = vec4(contour, hull, 1.0, saturate1(alpha));
+        return;
+      }
+      if (uDebug > 7.5) {
+        fragColor = vec4(saturate1(mx), saturate1(my), saturate1(sx * 0.25), saturate1(sy * 0.25));
+        return;
+      }
       float v = 0.0;
       if (uDebug < 1.5)      v = alpha;
       else if (uDebug < 2.5) v = eNormal;
@@ -320,9 +364,12 @@ export class LinesPass {
   private pass: FullscreenPass;
   private uniforms: Record<string, IUniform>;
   private scale: number;
+  /** G-buffer height in device pixels — the Sobel's own sampling grid. */
+  private pixelHeight: number;
 
   constructor(width: number, height: number, options: LinesPassOptions = {}) {
     this.scale = options.scale ?? 1;
+    this.pixelHeight = height;
 
     this.target = new WebGLRenderTarget(
       Math.max(1, Math.round(width * this.scale)),
@@ -347,6 +394,8 @@ export class LinesPass {
       uSceneDepth: { value: null },
       uTexel: { value: new Vector2(1 / width, 1 / height) },
       uCamPlanes: { value: new Vector2(0.12, 6000) },
+      uPixelScale: { value: 2 * Math.tan((62 * Math.PI) / 360) / Math.max(height, 1) },
+      uCreaseRadius: { value: CREASE_RADIUS },
       uNormalEdge: { value: new Vector2(LINES.sobelNormalThreshold, LINES.sobelNormalKnee) },
       uDepthEdge: { value: new Vector2(LINES.sobelDepthThreshold, LINES.sobelDepthKnee) },
       uIdThreshold: { value: LINES.sobelIdThreshold },
@@ -382,6 +431,7 @@ export class LinesPass {
     // is rendered at reduced scale we still want a one-pixel kernel on the
     // source, or the stroke would widen with the downscale.
     (this.uniforms.uTexel.value as Vector2).set(1 / width, 1 / height);
+    this.pixelHeight = height;
   }
 
   setDebug(mode: number): void {
@@ -407,6 +457,12 @@ export class LinesPass {
     this.uniforms.uGAux.value = gAux;
     this.uniforms.uSceneDepth.value = sceneDepth;
     (this.uniforms.uCamPlanes.value as Vector2).set(camera.near, camera.far);
+    // The camera director springs the FOV on boosts and landings, so the
+    // pixel-to-world scale has to be read every frame rather than cached at
+    // resize: a 62->78 degree kick changes the footprint by a third, and a
+    // detector calibrated in world units would drift with it.
+    this.uniforms.uPixelScale.value =
+      (2 * Math.tan((camera.fov * Math.PI) / 360)) / Math.max(this.pixelHeight, 1);
     this.pass.render(renderer, this.target);
   }
 

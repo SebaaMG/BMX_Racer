@@ -53,6 +53,7 @@ import {
   Texture,
   Vector2,
   Vector3,
+  Vector4,
 } from 'three';
 
 import { SurfaceKind, type SurfaceProperties } from '../game/Contracts';
@@ -325,6 +326,18 @@ const DUST_VERT = /* glsl */ `
   uniform float uFxTime;
   uniform float uSizeScale;
 
+  // The shot, published by the CameraDirector every frame.
+  //
+  //   uSubject.xyz  the point the shot is framed on, world space
+  //   uSubject.w    the radius that must stay legible around it; 0 disables
+  //   uLensBand     the fraction of the lens-to-subject span over which a puff
+  //                 stops being "in the way" and starts being "part of the shot"
+  //   uNearAng      angular radius (size / distance) at which a puff begins to
+  //                 dither out, and the one at which it is gone
+  uniform vec4  uSubject;
+  uniform vec2  uLensBand;
+  uniform vec2  uNearAng;
+
   in vec3 aOrigin;
   in vec3 aVel;
   in vec4 aParams;   // x birthTime, y 1/life, z seed01, w kind
@@ -428,23 +441,70 @@ const DUST_VERT = /* glsl */ `
     vWorldPos = wpos;
     vViewDist = length(wpos - uCameraPos);
 
-    // ── Near-camera cut ──────────────────────────────────────────────────────
-    // A puff two metres across that the camera has walked inside of covers the
-    // entire frame, and a chase camera rides through its own subject's dust
-    // constantly — cornering, landing, and every time the rider slows. Without
-    // this the stream bed rendered as a single screen-filling grey ring with
-    // the rider somewhere inside it, which is not a near-plane artefact but the
-    // system working exactly as written at a distance it was never sized for.
+    // ── Proximity: how much of the frame is this puff about to own? ──────────
     //
+    // Measured on the CENTRE of the puff, not on this vertex, so all four
+    // corners agree and the quad fades as one drawing rather than developing a
+    // gradient across itself.
+    //
+    // The old test was a fixed distance ramp, 0.85 m to 2.6 m. That is the
+    // wrong quantity: what fills the frame is not how near a puff is, it is how
+    // near it is RELATIVE TO ITS OWN SIZE. A 0.3 m skid puff at 1.2 m is a
+    // detail; a 1.9 m plume at 2.6 m subtends 72 degrees and covers most of a
+    // 62-degree lens while passing the distance test cleanly. Fading on the
+    // angular radius (size / distance) is scale-invariant and catches both.
+    float centreDist = max(length(p - uCameraPos), 1e-4);
+    float angRadius = sz / centreDist;
+    float nearFade = clamp((uNearAng.y - angRadius) / max(uNearAng.y - uNearAng.x, 1e-3), 0.0, 1.0);
+
+    // ── The lens corridor ────────────────────────────────────────────────────
+    //
+    // The near fade above only knows about ONE puff at a time, and the failure
+    // it cannot see is the one that actually broke the bike portrait: the
+    // camera is not inside a puff, it is inside the EMITTER VOLUME, with four
+    // to six ordinary-sized puffs strung out between the lens and the rider.
+    // Each of them passes the angular test on its own and together they are an
+    // opaque wall, and the frame named for the subject does not contain it.
+    //
+    // So this asks the only question that matters: is this puff between the
+    // lens and the subject, and does its disc cover the subject's silhouette?
+    // The subject's radius is projected down the corridor (reff) so the test is
+    // the honest screen-space overlap rather than a fixed tube, and the whole
+    // thing releases as the puff approaches the subject — dust AT the rear
+    // wheel is the effect working, dust halfway up the lens is the effect
+    // eating the shot. That release is what keeps the trail: it hangs behind
+    // and below the wheel, where uLensBand.y has already let go of it.
+    float lensFade = 1.0;
+    if (uSubject.w > 0.0) {
+      vec3 toSub = uSubject.xyz - uCameraPos;
+      float subDist = length(toSub);
+      if (subDist > 0.35) {
+        vec3 toPuff = p - uCameraPos;
+        float along = dot(toPuff, toSub) / subDist;
+        if (along > 0.0) {
+          float perp = sqrt(max(dot(toPuff, toPuff) - along * along, 0.0));
+          float s = along / subDist;
+          float reff = uSubject.w * clamp(s, 0.0, 1.0);
+          float cover = 1.0 - smoothstep(0.0, sz + reff, perp);
+          float ahead = 1.0 - smoothstep(uLensBand.x, uLensBand.y, s);
+          lensFade = 1.0 - cover * ahead;
+        }
+      }
+    }
+
     // Quantised to thirds like every other opacity here, so a puff the camera
-    // closes on steps out over three frames instead of dissolving. A smooth
-    // proximity fade would be the one continuous alpha ramp in the picture.
+    // closes on steps out over three holds instead of dissolving — a smooth
+    // proximity ramp would be the one continuous alpha in the picture. ROUNDED
+    // rather than ceil()'d, because ceil leaves a fully-blocking puff at a
+    // third of full opacity, and a third of a screen-filling puff is still a
+    // screen-filling puff.
+    //
     // It is carried separately from vAlpha rather than folded into it because
     // the ink contour deliberately refuses to follow vAlpha down (see the
     // fragment stage) — folding it in would leave a puff the camera is inside
     // of drawn as a hard black ring across the whole frame, which is worse
     // than the grey disc it replaced.
-    vNear = ceil(clamp((vViewDist - 0.85) / 1.75, 0.0, 1.0) * 3.0) / 3.0;
+    vNear = floor(clamp(min(nearFade, lensFade), 0.0, 1.0) * 3.0 + 0.5) / 3.0;
     if (vNear <= 0.0) {
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
       return;
@@ -637,6 +697,16 @@ export class DustSystem {
         // The atlas cell is twice the puff's footprint (the padding that keeps
         // mips from bleeding), so every quad is scaled x2 to compensate.
         uSizeScale: { value: 2.0 },
+        // Disabled until a camera publishes a shot. A DustSystem with no
+        // director attached behaves exactly as it always did.
+        uSubject: { value: new Vector4(0, 0, 0, 0) },
+        // A puff is fully suppressed up to a third of the way from the lens to
+        // the subject and completely free from 88% of the way on, which is
+        // where the rear wheel's own trail lives.
+        uLensBand: { value: new Vector2(0.34, 0.88) },
+        // Begins to go at ~19 degrees of angular radius, gone by ~33. A puff
+        // that owns two thirds of the frame height is not a picture element.
+        uNearAng: { value: new Vector2(0.34, 0.66) },
         uAtlas: { value: puffAtlas() },
         uBand0: { value: b0.clone() },
         uBand1: { value: b1.clone() },
@@ -673,6 +743,8 @@ export class DustSystem {
     this.object = new Object3D();
     this.object.name = 'fx:dust:group';
     this.object.add(this.mesh);
+
+    _liveSystems.push(this);
   }
 
   /** Advance the FX clock. `dt` must be the SCALED dt so freezes freeze dust. */
@@ -928,9 +1000,81 @@ export class DustSystem {
     this.material.uniforms.uOpacity.value = clamp01(v);
   }
 
+  /**
+   * Publish the shot: the point the camera is framing and the radius around it
+   * that has to stay legible. Puffs that come between the lens and that point
+   * and cover it are faded out — see the lens corridor in the vertex shader.
+   *
+   * Radius 0 disables the rule entirely, which is the state a DustSystem with
+   * no camera attached stays in.
+   */
+  setShotSubject(x: number, y: number, z: number, radius: number): void {
+    const v = this.material.uniforms.uSubject.value as Vector4;
+    v.set(x, y, z, Math.max(radius, 0));
+  }
+
+  clearShotSubject(): void {
+    (this.material.uniforms.uSubject.value as Vector4).w = 0;
+  }
+
+  /**
+   * Kill every live puff.
+   *
+   * This is what a TELEPORT needs, and its absence is the whole of the
+   * `bike-detail` failure. The capture harness runs three poses in a row at the
+   * same point on the course (rider-closeup, rider-threequarter, bike-detail);
+   * each one respawns the bike and steps 12 frames, and the dust from the
+   * previous two is still well inside its 0.7-2.3 s life when the shutter
+   * opens. The bike-detail camera then sits 2.3 m from the bike inside three
+   * poses' worth of accumulated cloud. The same thing happens in play on any
+   * respawn: the rider reappears 400 m down the mountain wearing the dust he
+   * kicked up before he was moved.
+   *
+   * Stamping the birth time far in the past is enough — the shader's liveness
+   * test is age = (uFxTime - birth) / life, and nothing else reads these slots.
+   */
+  clear(): void {
+    for (let i = 0; i < this.pool.capacity; i++) {
+      this.aParams[i * 4] = -1e9;
+      this.aParams[i * 4 + 1] = 1;
+    }
+    this.pool.markAll();
+    this.emittedThisFrame = 0;
+  }
+
   dispose(): void {
+    const i = _liveSystems.indexOf(this);
+    if (i >= 0) _liveSystems.splice(i, 1);
     this.pool.dispose();
     this.material.dispose();
     this.object.removeFromParent();
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The camera channel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every live DustSystem, so the camera can reach the dust without the Game
+ * having to hand one to the other.
+ *
+ * The alternative was a setter on the FX facade wired through Game.render, and
+ * that is a worse trade than it looks: the two facts the dust needs — where the
+ * shot is pointed and when the subject teleported — are both owned by the
+ * CameraDirector and by nothing else, and routing them through two more objects
+ * only creates two more places for them to arrive a frame late. There is one
+ * DustSystem in a running game; the list exists so a second one (a test, a
+ * second viewport) is not silently ignored.
+ */
+const _liveSystems: DustSystem[] = [];
+
+/** Tell every dust system what the camera is framing. See setShotSubject. */
+export function publishDustShot(x: number, y: number, z: number, radius: number): void {
+  for (let i = 0; i < _liveSystems.length; i++) _liveSystems[i].setShotSubject(x, y, z, radius);
+}
+
+/** Drop every live puff everywhere. Call on a teleport, a respawn, a pose cut. */
+export function clearAllDust(): void {
+  for (let i = 0; i < _liveSystems.length; i++) _liveSystems[i].clear();
 }

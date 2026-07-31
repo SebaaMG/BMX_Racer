@@ -59,8 +59,11 @@ import {
   ROUTE,
   RouteControl,
   TERRAIN_FEATURES,
+  TabletopGeometry,
   TerrainFeature,
   corridorHeightAt,
+  tabletopGeometry,
+  tabletopProfile,
 } from '../game/WorldConstants';
 import { clamp, clamp01, lerp, smoothstep } from '../core/MathX';
 
@@ -123,6 +126,8 @@ export interface TrackSplineOptions {
   smoothRadius?: number;
   /** Height smoothing kernel radius inside a designed feature, metres. */
   featureRadius?: number;
+  /** Kernel radius across a takeoff lip, metres. A lip is a corner. */
+  lipRadius?: number;
   /** How far the ribbon surface floats above the conformed terrain. */
   lift?: number;
   /** Local search half-window used by `project` when a hint is supplied. */
@@ -246,6 +251,7 @@ export class TrackSpline {
     const spacing = opts.spacing ?? 0.5;
     const smoothRadius = opts.smoothRadius ?? 9;
     const featureRadius = opts.featureRadius ?? 1.6;
+    const lipRadius = opts.lipRadius ?? 0.5;
     this.lift = opts.lift ?? 0.06;
     this.hintWindow = opts.hintWindow ?? 22;
 
@@ -299,11 +305,37 @@ export class TrackSpline {
     }
 
     // ── 3. Feature-aware smoothing ───────────────────────────────────────────
+    // The tabletop's footprint is asymmetric about its anchor (the anchor is the
+    // LIP: 9 m of face behind it, 38 m of deck and landing ahead), so it cannot
+    // be described by a radius the way the ravine and the stream can. It is
+    // stamped by plan index instead, off the same geometry the heightfield used.
+    const tabletop = TERRAIN_FEATURES.find((f) => f.kind === 'tabletop');
+    const tabGeom = tabletop ? tabletopGeometry(tabletop) : null;
+    const tabLip = tabletop
+      ? nearestPlanIndex(ax, az, tabletop.x ?? 0, tabletop.z ?? 0)
+      : -1;
+
     const preserve = new Float32Array(planCount);
     for (let i = 0; i < planCount; i++) {
       preserve[i] = featurePreservation(ax[i], az[i]);
     }
-    const smoothed = variableSmooth(raw, preserve, planStep, smoothRadius, featureRadius);
+    const sharp = new Float32Array(planCount);
+    if (tabGeom && tabLip >= 0) {
+      const edge = 6;
+      for (let i = 0; i < planCount; i++) {
+        const s = (i - tabLip) * planStep;
+        if (s < tabGeom.sMin - edge || s > tabGeom.sMax + edge) continue;
+        const w =
+          smoothstep(tabGeom.sMin - edge, tabGeom.sMin, s) *
+          (1 - smoothstep(tabGeom.sMax, tabGeom.sMax + edge, s));
+        if (w > preserve[i]) preserve[i] = w;
+        // The lip itself: no smoothing at all for 2.5 m either side of it.
+        sharp[i] = 1 - smoothstep(2.5, 6.0, Math.abs(s));
+      }
+    }
+    const smoothed = variableSmooth(
+      raw, preserve, sharp, planStep, smoothRadius, featureRadius, lipRadius,
+    );
     limitSlope(smoothed, planStep, 1.05);
 
     // ── 4. Lip surgery ───────────────────────────────────────────────────────
@@ -315,14 +347,30 @@ export class TrackSpline {
     if (ravine) {
       this.carveRavine(ravine, ax, az, smoothed, gapFlagPlan, lipFlagPlan, planStep, gapsPlan);
     }
-    const tabletop = TERRAIN_FEATURES.find((f) => f.kind === 'tabletop');
     let tabTakeoffPlan = -1;
     let tabLandingPlan = -1;
-    if (tabletop) {
-      const r = this.carveTabletop(tabletop, ax, az, smoothed, lipFlagPlan, planStep);
+    if (tabGeom && tabLip >= 0) {
+      const r = this.carveTabletop(tabGeom, tabLip, smoothed, lipFlagPlan, planStep);
       tabTakeoffPlan = r.takeoff;
       tabLandingPlan = r.landing;
     }
+
+    // The surgery above writes into an already slope-limited profile, so run the
+    // limit again over the result.
+    //
+    // This is the invariant that was actually violated, and it is worth naming.
+    // `ax`/`az` are uniform in PLAN, so bounding |dy| per plan sample is exactly
+    // the statement "the centreline is a single-valued function of XZ with a
+    // gradient a bike can ride". The old tabletop surgery added its full mound
+    // height twice at one index — once as the last step of the run-up ramp and
+    // again as the first step of the deck — putting 4.2 m of rise into a 0.5 m
+    // plan step. Step 5 then resampled that segment to uniform 3D arc length and
+    // spread the spike over 8 m of track, producing a centreline that climbed
+    // 4 m and fell 4.45 m across 1 m of ground: not a function of XZ, so no
+    // heightfield could ever agree with it and the bike fell through the
+    // mountain. Enforcing the invariant HERE means no future edit to the surgery
+    // can reintroduce the same class of bug silently.
+    limitSlope(smoothed, planStep, 1.05);
 
     // Per-control lift, if the route ever asks for one.
     for (let i = 0; i < planCount; i++) {
@@ -506,69 +554,75 @@ export class TrackSpline {
   }
 
   /**
-   * The tabletop. If the terrain generator has already built the mound we only
-   * add the kicker onto its deck; if it has not (or has softened it), we build
-   * a trapezoidal mound into the profile ourselves. The section has to read as
-   * a jump whatever the heightfield does, or the whole approach is a lie.
+   * The tabletop.
+   *
+   * The heightfield carve normally builds the whole mound, and when it has, this
+   * does nothing to the profile at all — the centreline simply conforms, which
+   * is the arrangement the rest of the course already uses and the only one in
+   * which the collision surface and the racing line cannot drift apart.
+   *
+   * The synthesis path exists for the case the docstring at the top of the file
+   * promises: a heightfield that does not contain the feature (a reduced-
+   * resolution build, a terrain bug) must still produce a rideable, readable
+   * jump. It adds only the DEFICIT, and it adds it as `tabletopProfile` — the
+   * same shape function the heightfield carve used — so whatever mix of real and
+   * synthetic ground results, the sum is still that one curve. `tabletopProfile`
+   * is zero and zero-sloped at both ends, so no amount of it can introduce a
+   * step at the boundary.
+   *
+   * What this used to do, and must never do again: run a ramp loop up to and
+   * INCLUDING `iTake`, then a deck loop starting AT `iTake`, so the crest height
+   * landed on that one sample twice.
    */
   private carveTabletop(
-    f: TerrainFeature,
-    ax: Float64Array,
-    az: Float64Array,
+    g: TabletopGeometry,
+    iLip: number,
     h: Float64Array,
     lipFlag: Float32Array,
     step: number,
   ): { takeoff: number; landing: number } {
-    const len = f.params.length ?? 34;
-    const height = f.params.height ?? 4.2;
-    const cx = f.x ?? 0;
-    const cz = f.z ?? 0;
+    const n = h.length;
+    const idx = (s: number): number => iLip + Math.round(s / step);
+    const iFace = idx(-g.face);
+    const iDeckEnd = idx(g.deck);
+    const iBefore = idx(g.sMin);
+    const iAfter = idx(g.sMax);
+    if (iBefore < 0 || iAfter >= n || iDeckEnd <= iFace) return { takeoff: -1, landing: -1 };
 
-    const iTake = nearestPlanIndex(ax, az, cx, cz - len * 0.5);
-    const iLand = nearestPlanIndex(ax, az, cx, cz + len * 0.5);
-    if (iTake < 0 || iLand <= iTake) return { takeoff: -1, landing: -1 };
+    // Is the mound already in the ground? Measure the deck against the CHORD of
+    // the untouched profile either side of the whole footprint.
+    //
+    // The old test extrapolated the approach gradient across the deck. On a jump
+    // the approach gradient is the kicker face — steeply uphill by definition —
+    // so it predicted a deck several metres higher than any real deck, decided
+    // the mound was missing, and synthesised a second 4.2 m one on top of the
+    // first. A chord across ground the feature does not touch has no such
+    // circularity.
+    const span = Math.max(1, iAfter - iBefore);
+    let crest = -Infinity;
+    for (let i = iLip; i <= iDeckEnd; i++) {
+      const chord = lerp(h[iBefore], h[iAfter], (i - iBefore) / span);
+      if (h[i] - chord > crest) crest = h[i] - chord;
+    }
 
-    // Does the ground already rise onto a deck? Compare the deck height with a
-    // linear extrapolation of the approach gradient.
-    const back = Math.max(0, iTake - Math.round(24 / step));
-    const approachSlope = (h[iTake] - h[back]) / Math.max(1e-3, (iTake - back) * step);
-    const deckMid = h[Math.round((iTake + iLand) * 0.5)];
-    const expected = h[iTake] + approachSlope * ((iLand - iTake) * 0.5 * step);
-    const deckRise = deckMid - expected;
-
-    if (deckRise < height * 0.4) {
-      // Synthesise it. Ramp up over 15m, flat deck, ramp down over 13m — the
-      // asymmetry is deliberate: the landing side is longer so the down-ramp
-      // catches a rider who over-jumped.
-      const upSamples = Math.round(15 / step);
-      const downSamples = Math.round(13 / step);
-      const add = height - Math.max(0, deckRise);
-      for (let k = 0; k <= upSamples; k++) {
-        const i = iTake - upSamples + k;
-        if (i < 0) continue;
-        h[i] += add * smoothstep(0, 1, k / upSamples);
-      }
-      for (let i = iTake; i <= iLand; i++) h[i] += add;
-      for (let k = 1; k <= downSamples; k++) {
-        const i = iLand + k;
-        if (i >= ax.length) break;
-        h[i] += add * (1 - smoothstep(0, 1, k / downSamples));
+    const deficit = clamp(g.height - crest, 0, g.height);
+    if (deficit > 0.2) {
+      const invH = 1 / Math.max(g.height, 1e-3);
+      for (let i = iBefore; i <= iAfter; i++) {
+        h[i] += deficit * tabletopProfile(g, (i - iLip) * step) * invH;
       }
     }
 
-    // The kicker on the deck edge. Small — the mound does the work; this is
-    // just the last bite of upward rate that sets the launch angle.
-    const kickRun = Math.round(4.5 / step);
-    for (let k = 0; k <= kickRun; k++) {
-      const i = iTake - kickRun + k;
-      if (i < 0) continue;
-      const u = k / kickRun;
-      h[i] += 0.62 * Math.pow(u, 2.0);
-      lipFlag[i] = Math.max(lipFlag[i], smoothstep(0.4, 1.0, u));
+    // The lip mask. The ribbon shader lightens the takeoff so it reads at
+    // distance, and the bank is flattened where this is high — a banked lip is
+    // unlaunchable.
+    const faceSpan = Math.max(1, iLip - iFace);
+    for (let i = Math.max(0, iFace); i <= iLip; i++) {
+      lipFlag[i] = Math.max(lipFlag[i], smoothstep(0.4, 1.0, (i - iFace) / faceSpan));
     }
-    lipFlag[iLand] = Math.max(lipFlag[iLand], 0.55);
+    lipFlag[iDeckEnd] = Math.max(lipFlag[iDeckEnd], 0.55);
 
-    return { takeoff: iTake * step, landing: iLand * step };
+    return { takeoff: iLip * step, landing: iDeckEnd * step };
   }
 
   private buildFrames(ctrlF: Float32Array): void {
@@ -925,7 +979,20 @@ export class TrackSpline {
    */
   getCarve(): TrackCarve {
     if (this.carve) return this.carve;
-    const step = Math.max(1, Math.round(3.5 / this.spacing));
+    // 1.5 m, not 3.5 m.
+    //
+    // `applyTrackCarve` reconstructs the collision surface by tenting between
+    // consecutive carve points, so the point spacing IS the resolution of the
+    // ground the bike rides. At 3.5 m the tabletop's 28.6 degree face arrived as
+    // a 22.4 degree straight line and its lip — a corner — was linearised over
+    // 4 m. That is the difference between a kicker that launches the rider and a
+    // roll-over that does not, and none of it was visible in the ribbon mesh,
+    // which is drawn from the spline directly and looked correct throughout.
+    //
+    // 1.5 m is where this stops mattering: the heightfield's own texels are 2 m,
+    // so a finer tent cannot describe anything the field can hold. The extra
+    // points cost one linear pass over the corridor at load time.
+    const step = Math.max(1, Math.round(1.5 / this.spacing));
     const points: Vector3[] = [];
     const halfWidths: number[] = [];
     const banks: number[] = [];
@@ -1010,7 +1077,17 @@ function safeHeight(terrain: ITerrain, x: number, z: number, t: number): number 
   return h;
 }
 
-/** 1 where the height profile must be preserved verbatim, 0 where it may be smoothed. */
+/**
+ * 1 where the height profile must be preserved verbatim, 0 where it may be
+ * smoothed.
+ *
+ * The features that CROSS the route (the ravine, the stream) are described by
+ * distance from their own axis, which is what this handles. The tabletop RUNS
+ * ALONG the route and its footprint is asymmetric about its anchor, so it is
+ * stamped by plan index in the constructor instead — a radius centred on the
+ * lip would either miss the landing ramp or preserve 40 m of ordinary hillside
+ * behind the run-in.
+ */
 function featurePreservation(x: number, z: number): number {
   let w = 0;
   for (const f of TERRAIN_FEATURES) {
@@ -1018,9 +1095,6 @@ function featurePreservation(x: number, z: number): number {
       const off = Math.abs(axisOffset(f, x, z));
       const half = (f.params.width ?? 12) * 0.5;
       w = Math.max(w, 1 - smoothstep(half, half * 2.6, off));
-    } else if (f.kind === 'tabletop') {
-      const r = Math.hypot(x - (f.x ?? 0), z - (f.z ?? 0));
-      w = Math.max(w, 1 - smoothstep((f.params.length ?? 34) * 0.5, (f.params.length ?? 34) * 0.9, r));
     }
   }
   return clamp01(w);
@@ -1031,19 +1105,33 @@ function featurePreservation(x: number, z: number): number {
  * fixed kernel is what eats the tabletop; letting the radius collapse inside a
  * designed feature keeps that shape while still ironing the erosion chatter out
  * of the 1600 metres of ordinary hillside between features.
+ *
+ * There are three bands, not two, and the third one is the takeoff lip.
+ *
+ * A lip is a CORNER — the face runs straight at the takeoff angle and then
+ * stops. Even the "tight" 1.6 m kernel has a 0.8 m sigma, which spreads that
+ * corner over about 4 m of track, and a corner spread over 4 m is not a corner:
+ * measured on the tabletop, the ground's vertical rate fell from 10 m/s to zero
+ * over 0.19 s, which is gentle enough that the suspension simply followed it and
+ * the rider rolled off the lip with a third of the launch the ramp had built.
+ * Over the couple of metres either side of a lip the kernel therefore collapses
+ * to nothing and the profile is taken as the heightfield gives it — which is
+ * still 2 m texels, so this cannot produce anything the terrain does not have.
  */
 function variableSmooth(
   src: Float64Array,
   preserve: Float32Array,
+  sharp: Float32Array,
   step: number,
   wideRadius: number,
   tightRadius: number,
+  sharpRadius: number,
 ): Float64Array {
   const n = src.length;
   const out = new Float64Array(n);
   const maxTaps = Math.ceil((wideRadius * 2) / step);
   for (let i = 0; i < n; i++) {
-    const radius = lerp(wideRadius, tightRadius, preserve[i]);
+    const radius = lerp(lerp(wideRadius, tightRadius, preserve[i]), sharpRadius, sharp[i]);
     const taps = Math.min(maxTaps, Math.max(1, Math.ceil((radius * 2) / step)));
     const sigma = Math.max(radius * 0.5, step);
     let sum = 0;

@@ -17,12 +17,33 @@
  *
  *  2. GEOMETRY MOTION SMEAR. Not a post-process blur — a duplicate of the mesh
  *     whose trailing vertices are extruded backward along the LOCAL velocity of
- *     each vertex, drawn translucent with QUANTISED opacity. Local, not global:
- *     the extrusion is driven by linear velocity PLUS omega x r, so during a
- *     360 the outstretched limbs streak hard and the torso barely moves, which
- *     is exactly how a rotating figure is drawn. This is how animation draws a
- *     fast limb: a solid shape with a tail, not a blurred photograph. Post blur
- *     softens edges, and every other pixel in this game is trying to stay hard.
+ *     each vertex, drawn as a banded streak with its own ink contour. Local,
+ *     not global: the extrusion is driven by linear velocity PLUS omega x r, so
+ *     during a 360 the outstretched limbs streak hard and the torso barely
+ *     moves, which is exactly how a rotating figure is drawn.
+ *
+ *     Two properties make it a DRAWING of motion rather than a blur of it, and
+ *     both were learned the hard way:
+ *
+ *     a) IT MEASURES SCREEN MOTION, NOT WORLD MOTION. The extrusion direction
+ *        is the vertex's velocity RELATIVE TO THE CAMERA, projected into the
+ *        screen plane. An animator smears what moves on the paper. A rider
+ *        held dead-centre by a chase camera at 66 km/h is not moving on the
+ *        paper and must not be smeared — and if you extrude him along his
+ *        world velocity anyway, that velocity points away from the lens, the
+ *        "tail" is pushed toward the camera, and the clone is drawn ON TOP of
+ *        the rider as a translucent wash. That is the entire mechanism behind
+ *        "the smear dissolves the rider". Projecting into the screen plane
+ *        makes it structurally impossible: the tail can only ever move
+ *        sideways at the same depth, where the body's own depth buffer
+ *        occludes it.
+ *
+ *     b) LENGTH CARRIES THE INTENSITY, NOT OPACITY. A faster limb gets a
+ *        LONGER streak with more bands, drawn at the same committed values —
+ *        the ink contour holds at full strength the way DustSystem's puff ring
+ *        does. Fading a streak's opacity with speed is what produces a soft
+ *        symmetric halo, which reads as a bloom, which is the one thing a
+ *        cel frame cannot afford.
  *
  *  3. WHEEL SPIN SMEAR. A separate mechanism again, because neither of the
  *     above can express a wheel. A thin annulus in the wheel plane draws
@@ -52,12 +73,11 @@ import {
 import { BikeMode, type BikeState } from '../game/Contracts';
 import { clamp, clamp01, dampHL } from '../core/MathX';
 import { globalUniformBlock, POST_STATE } from '../npr/NprGlobals';
-import { RAMPS, SUN_RIM_COLOR } from '../npr/Palette';
+import { INK, RAMPS, SUN_RIM_COLOR } from '../npr/Palette';
 import { GLSL_COMMON, GLSL_FRAG_OUT, GLSL_GLOBAL_UNIFORMS, GLSL_VERTEX_TRANSFORM } from '../npr/ShaderChunks';
 
 // ── Module scratch. Nothing below allocates in an update path. ───────────────
 const _wp = new Vector3();
-const _inst = new Vector3();
 const _camDir = new Vector3();
 const _toPoint = new Vector3();
 const _focusPoint = new Vector3();
@@ -67,6 +87,9 @@ const _scale = new Vector3();
 const _quat = new Quaternion();
 const _UNIT_Z = new Vector3(0, 0, 1);
 const _ZERO = new Vector3();
+const _delta = new Vector3();
+const _rel = new Vector3();
+const _omega = new Vector3();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tuning
@@ -121,9 +144,52 @@ export const SPEED_TUNING = {
    */
   spinStart: 14,
   spinFull: 45,
-  /** Metres of tail per (m/s) of local vertex speed. */
-  smearMetresPerSpeed: 0.020,
-  smearMaxLength: 0.55,
+
+  // ── Motion smear ───────────────────────────────────────────────────────────
+  /**
+   * DEVICE PIXELS of streak per (m/s) of ON-SCREEN vertex motion.
+   *
+   * The unit matters. The old tuning was metres of tail per m/s of WORLD speed
+   * with a 0.55 m ceiling, which is 40 px on a close-up and 2 px in a wide —
+   * the same physical tail reading as a completely different drawing depending
+   * on the shot. A drawn smear is authored in screen space because that is
+   * where it is looked at.
+   */
+  smearPixelsPerSpeed: 5.5,
+  /**
+   * Below this the streak is not drawn AT ALL.
+   *
+   * This is the guarantee behind "nothing over the body". A vertex that has
+   * moved four pixels has no streak to draw; any mark made for it necessarily
+   * lands inside the silhouette it came from and reads as a translucent film
+   * over the character. The gate is on measured pixels, so it holds at every
+   * distance and in every shot without a second constant.
+   */
+  smearMinPixels: 9,
+  /** Ceiling on the streak, device pixels. Past this it stops being a smear. */
+  smearMaxPixels: 110,
+
+  // ── Sanity limits on the quantities the smear is derived from ─────────────
+  /**
+   * Ceiling on any tracked velocity, m/s. ~2x the bike's top speed.
+   *
+   * Velocities here are finite differences of world position. Every
+   * discontinuity in the game — a race restart, a checkpoint respawn, a replay
+   * seek, the capture harness teleporting the rider 700 m down the mountain —
+   * differences as thousands of m/s, and an unclamped tail then saturates to
+   * its maximum length pointing in an arbitrary direction. That is not a
+   * hypothetical: measured at the capture poses, the per-part velocity fed to
+   * the smear ranged from 232 to 7119 m/s.
+   */
+  velocityCeiling: 42,
+  /** Ceiling on the subject's angular velocity, rad/s. A real whip is ~10. */
+  omegaCeiling: 14,
+  /**
+   * A single-frame world displacement above this is a TELEPORT, not motion.
+   * The tracker re-primes instead of integrating it, so a discontinuity costs
+   * one frame of no smear rather than a second of garbage.
+   */
+  teleportMetres: 2.0,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,16 +202,18 @@ const SMEAR_VERT = /* glsl */ `
   ${GLSL_GLOBAL_UNIFORMS}
   ${GLSL_VERTEX_TRANSFORM}
 
-  uniform vec3  uLinear;     // world linear velocity of this mesh, m/s
+  uniform vec3  uLinear;     // CAMERA-RELATIVE linear velocity of this mesh, m/s
   uniform vec3  uOmega;      // world angular velocity of the subject, rad/s
   uniform vec3  uPivot;      // world point omega rotates about
-  uniform float uMetresPerSpeed;
-  uniform float uMaxLength;
+  uniform float uPixelsPerSpeed;
+  uniform float uMinPixels;
+  uniform float uMaxPixels;
   uniform float uAmount;     // 0..1 master
 
+  /** 0 at the leading edge of the streak, 1 at the deepest part of the tail. */
   out float vTrail;
-  /** How far this vertex actually moved, as a fraction of uMaxLength. */
-  out float vStretch;
+  /** Device pixels this vertex was actually displaced by. */
+  out float vPixels;
 
   void main() {
     vec3 localPos = position;
@@ -158,31 +226,43 @@ const SMEAR_VERT = /* glsl */ `
     // PER-VERTEX velocity, not per-object. omega x r is what makes a whipping
     // limb streak while the hips barely move; a single object-space direction
     // would smear the whole rider sideways during a spin and read as a bug.
+    // uLinear already has the camera's own motion removed, so a subject the
+    // camera is tracking contributes nothing here and only its ROTATION draws.
     vec3 vel = uLinear + cross(uOmega, wpos - uPivot);
-    float speed = length(vel);
-    float len = min(speed * uMetresPerSpeed, uMaxLength) * uAmount;
+
+    // ── Screen-plane projection ───────────────────────────────────────────────
+    // Only the component of the motion that moves the vertex ACROSS the frame
+    // can be drawn as a streak. The component along the view ray produces no
+    // mark on the paper, and extruding along it is what pushes the tail toward
+    // the lens and lays it over the character.
+    vec3 toCam = uCameraPos - wpos;
+    float camDist = max(length(toCam), 1e-3);
+    vec3 viewRay = toCam / camDist;
+    vec3 vScreen = vel - viewRay * dot(vel, viewRay);
+    float sp = length(vScreen);
+
+    // World metres per device pixel at this depth — the same conversion the
+    // outline hull uses, so a streak and a stroke agree about what a pixel is.
+    float pxToWorld = (2.0 * camDist) / (uResolution.y * projectionMatrix[1][1]);
+
+    float pixels = min(sp * uPixelsPerSpeed * uAmount, uMaxPixels);
 
     vTrail = 0.0;
-    vStretch = 0.0;
-    if (len > 1e-4 && speed > 1e-4) {
-      vec3 tdir = vel / speed;
+    vPixels = 0.0;
+    if (pixels >= uMinPixels && sp > 1e-4) {
+      vec3 tdir = vScreen / sp;
       // Only the TRAILING half of the surface is extruded. Faces looking into
       // the direction of travel stay exactly where they are, so the duplicate
-      // becomes a teardrop with a tail rather than a fattened copy — and the
+      // becomes a shape with a tail rather than a fattened copy — and the
       // un-extruded half is discarded in the fragment stage so it never
       // z-fights with the mesh it was cloned from.
       float trail = saturate1(-dot(normalize(wnrm), tdir));
       // Squared so the tail concentrates behind the shape instead of smearing
       // the whole silhouette sideways.
       float t = trail * trail;
-      float stretch = len * t;
-      wpos -= tdir * stretch;
+      wpos -= tdir * (pixels * t * pxToWorld);
       vTrail = t;
-      // The DISTANCE this vertex travelled, not just which way it faces. A
-      // vertex that did not move must contribute nothing, or the duplicate mesh
-      // sits exactly on top of the source and lays a flat translucent wash over
-      // the whole figure — which is what dissolved the rider into a pale ghost.
-      vStretch = stretch / max(uMaxLength, 1e-4);
+      vPixels = pixels * t;
     }
 
     gl_Position = projectionMatrix * viewMatrix * vec4(wpos, 1.0);
@@ -197,33 +277,65 @@ const SMEAR_FRAG = /* glsl */ `
 
   uniform vec3  uColorNear;
   uniform vec3  uColorFar;
+  uniform vec3  uInkColor;
   uniform float uOpacity;
+  uniform float uMinPixels;
+  uniform float uAmount;
 
   in float vTrail;
-  in float vStretch;
+  in float vPixels;
 
   void main() {
-    // Kill the un-extruded shell entirely.
-    float shape = smoothstep(0.10, 0.42, vTrail);
+    // Kill the un-extruded shell entirely. Everything below this contour is
+    // still sitting exactly where the source mesh is.
+    const float EDGE = 0.16;
+    if (vTrail <= EDGE) discard;
+    // ...and kill any fragment whose vertex did not move a drawable number of
+    // pixels. This is the hard guarantee that nothing is ever laid over the
+    // body: a mark shorter than uMinPixels cannot escape the silhouette it
+    // came from, so it is not made at all.
+    if (vPixels < uMinPixels) discard;
 
-    // Gate on how far the vertex actually MOVED. Facing away from travel is not
-    // enough on its own: the whole trailing half of a nearly-stationary mesh
-    // passes that test, so the clone was drawn over the body at full strength.
-    shape *= smoothstep(0.04, 0.40, vStretch);
+    // ── The streak as a DRAWING ───────────────────────────────────────────────
+    // Three flat bands along the tail with an inked line at every boundary and
+    // an inked contour around the whole shape. This is the multi-image streak
+    // an animator draws — a fast limb rendered as two or three discrete
+    // positions with a line round each — as opposed to a continuous falloff,
+    // which is a photograph of a fast limb.
+    float u3 = (vTrail - EDGE) / (1.0 - EDGE) * 3.0;
+    float band = floor(min(u3, 2.999)) / 2.0;      // 0, 0.5, 1
 
-    // ...and thin the very tip so the streak tapers instead of ending in a wall.
-    float a = uOpacity * shape * (1.0 - vTrail * 0.42);
+    float w = max(fwidth(u3), 1e-4);
+    float f = fract(u3);
+    float dBand = min(f, 1.0 - f);
+    float inkBand = 1.0 - smoothstep(w * 0.5, w * 1.6, dBand);
 
-    // Three hard opacity levels. A smoothly fading ghost is a photographic
-    // signal; a streak drawn at two or three flat values is an animated one.
-    //
-    // ROUNDED, not ceiled. ceil() promotes every surviving fragment to at least
-    // 1/3 — so an alpha of 0.02 was drawn at 0.333, and the quantiser that was
-    // supposed to make the streak graphic was instead multiplying it by 16x.
-    a = floor(clamp(a, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
-    if (a <= 0.001) discard;
+    // The outer contour: the constant-vTrail line that bounds the whole mark.
+    float wt = max(fwidth(vTrail), 1e-5);
+    float inkEdge = 1.0 - smoothstep(wt * 0.6, wt * 2.0, abs(vTrail - EDGE));
 
-    vec3 col = mix(uColorNear, uColorFar, vTrail);
+    float ink = max(inkBand, inkEdge);
+
+    // The fill steps DOWN along the tail in hard thirds and never fades
+    // smoothly. Intensity is carried by how LONG the streak is, not by how
+    // faint it is — a faint streak is a halo.
+    float fill = uOpacity * (1.0 - band * 0.55);
+    fill = floor(clamp(fill, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
+
+    // Quantised master so the effect steps out in three frames rather than
+    // dissolving. Everything in this game is cut, not faded.
+    float on = floor(clamp(uAmount * 2.2, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
+    if (on <= 0.001) discard;
+
+    // THE LINE OUTLIVES THE FILL — the same rule DustSystem's puff ring lives
+    // by. The contour holds at a committed value while the interior drops
+    // away, which is what keeps a dispersing mark reading as a drawing instead
+    // of as a smudge.
+    float a = mix(fill, max(fill, 0.76), ink) * on;
+    if (a <= 0.02) discard;
+
+    vec3 col = mix(uColorNear, uColorFar, band);
+    col = mix(col, uInkColor, ink);
     fragColor = vec4(col, a);
   }
 `;
@@ -236,11 +348,13 @@ function createSmearMaterial(colorNear: Color, colorFar: Color): ShaderMaterial 
       uLinear: { value: new Vector3() },
       uOmega: { value: new Vector3() },
       uPivot: { value: new Vector3() },
-      uMetresPerSpeed: { value: SPEED_TUNING.smearMetresPerSpeed },
-      uMaxLength: { value: SPEED_TUNING.smearMaxLength },
+      uPixelsPerSpeed: { value: SPEED_TUNING.smearPixelsPerSpeed },
+      uMinPixels: { value: SPEED_TUNING.smearMinPixels },
+      uMaxPixels: { value: SPEED_TUNING.smearMaxPixels },
       uAmount: { value: 0 },
       uColorNear: { value: colorNear.clone() },
       uColorFar: { value: colorFar.clone() },
+      uInkColor: { value: INK.clone() },
       uOpacity: { value: 0 },
     },
     vertexShader: SMEAR_VERT,
@@ -375,7 +489,11 @@ export class SpinSmear {
     this.mesh.renderOrder = 17;
     this.mesh.visible = false;
     this.mesh.userData.fxTransparent = true;
-    this.mesh.userData.nprSkipPrepass = true;
+    // SceneRegistry reads `skipPrepass` / `skipShadow`; FX surfaces carry no
+    // companion pass materials anyway, but declaring it keeps the intent
+    // readable and survives anyone adding one later.
+    this.mesh.userData.skipPrepass = true;
+    this.mesh.userData.skipShadow = true;
 
     this.setRadius(radius, axis);
   }
@@ -437,9 +555,60 @@ interface SmearPart {
   material: ShaderMaterial;
   /** The mesh this was cloned from — we track ITS world transform, not the root's. */
   src: Object3D;
-  lastPos: Vector3;
-  vel: Vector3;
-  primed: boolean;
+  vel: VelocityTracker;
+}
+
+/**
+ * A world-position differentiator that refuses to believe in teleports.
+ *
+ * Every velocity the smear is built from comes from one of these. The rule it
+ * enforces is simple and it is the difference between the effect working and
+ * the effect destroying the character: a displacement larger than
+ * `teleportMetres` in a single frame is not motion, it is the game moving
+ * something, and the correct velocity to report for that frame is the one we
+ * already had — not `700 m / 16 ms`.
+ */
+/** Exponential blend factor for a 45 ms half-life at this frame's dt. */
+function velBlendFor(dt: number): number {
+  return 1 - Math.pow(2, -Math.max(dt, 0) / 0.045);
+}
+
+class VelocityTracker {
+  readonly value = new Vector3();
+  private last = new Vector3();
+  private primed = false;
+
+  /** Re-prime at `p` with zero velocity. */
+  reset(p: Vector3): void {
+    this.last.copy(p);
+    this.value.set(0, 0, 0);
+    this.primed = true;
+  }
+
+  /** Feed this frame's world position. Returns the smoothed velocity. */
+  step(p: Vector3, dt: number, blend: number): Vector3 {
+    if (!this.primed) {
+      this.reset(p);
+      return this.value;
+    }
+    _delta.subVectors(p, this.last);
+    this.last.copy(p);
+    const moved = _delta.length();
+    if (moved > SPEED_TUNING.teleportMetres || dt <= 1e-5) {
+      // A discontinuity. Drop the frame rather than differentiating it.
+      this.value.set(0, 0, 0);
+      return this.value;
+    }
+    _delta.multiplyScalar(1 / dt);
+    // Heavy smoothing: raw per-frame position deltas are noisy enough to make
+    // the tail flicker direction, which reads as a glitch, not as motion.
+    this.value.lerp(_delta, blend);
+    const s = this.value.length();
+    if (s > SPEED_TUNING.velocityCeiling) {
+      this.value.multiplyScalar(SPEED_TUNING.velocityCeiling / s);
+    }
+    return this.value;
+  }
 }
 
 interface SmearEntry {
@@ -483,6 +652,9 @@ export class SpeedFX {
   /** Subject rotation, shared by every smear entry. See setSubjectSpin(). */
   private omega = new Vector3();
   private pivot = new Vector3();
+
+  /** The camera's own motion, removed from every part's velocity. */
+  private camVel = new VelocityTracker();
 
   /** Objects auto-smeared from the subject's own speed, set by the facade. */
   private autoTargets: Object3D[] = [];
@@ -564,15 +736,10 @@ export class SpeedFX {
       if (o.userData?.isHull || o.userData?.fxTransparent) return;
       const material = createSmearMaterial(this.colorNear, this.colorFar);
       const mesh = this.cloneFor(m, material);
+      const vel = new VelocityTracker();
       m.getWorldPosition(_wp);
-      parts.push({
-        mesh,
-        material,
-        src: m,
-        lastPos: _wp.clone(),
-        vel: new Vector3(),
-        primed: false,
-      });
+      vel.reset(_wp);
+      parts.push({ mesh, material, src: m, vel });
     };
 
     consider(target);
@@ -614,7 +781,8 @@ export class SpeedFX {
     out.matrixWorldAutoUpdate = false;
     out.visible = false;
     out.userData.fxTransparent = true;
-    out.userData.nprSkipPrepass = true;
+    out.userData.skipPrepass = true;
+    out.userData.skipShadow = true;
     return out;
   }
 
@@ -647,9 +815,20 @@ export class SpeedFX {
    */
   update(dt: number, camera: PerspectiveCamera, state: BikeState | null): void {
     if (state) this.setSubjectSpin(state.angularVelocity, state.position);
+    this.trackCamera(dt, camera);
     this.updateSmears(dt, state);
     for (const s of this.spins) s.update(dt);
     this.updatePost(dt, camera, state);
+  }
+
+  /**
+   * The camera's own world velocity, tracked with the same teleport guard as
+   * everything else. Subtracted from every smeared part so the shader is fed
+   * the motion that will actually appear on screen.
+   */
+  private trackCamera(dt: number, camera: PerspectiveCamera): void {
+    camera.getWorldPosition(_wp);
+    this.camVel.step(_wp, dt, velBlendFor(dt));
   }
 
   private updateSmears(dt: number, state: BikeState | null): void {
@@ -658,13 +837,21 @@ export class SpeedFX {
     // effect earns its keep, because a 360 at 4 rad/s moves a limb faster
     // across the screen than the whole bike moves down the hill.
     if (state) {
-      const spin = this.omega.length();
+      // CLAMPED. Angular velocity spikes on any physics discontinuity — a
+      // respawn, a teleport, the first steps after a reset — and an unclamped
+      // spin term put a full-strength smear on a rider standing still at the
+      // summit. It is also gated on the body actually being in a state where a
+      // whip is possible: a 10 rad/s tumble at 0.15 m/s is a solver artefact,
+      // not a trick.
+      const spin = Math.min(this.omega.length(), SPEED_TUNING.omegaCeiling);
+      const whipping =
+        (state.mode === BikeMode.Airborne || state.mode === BikeMode.Crashing) && state.speed > 3;
       // Onset at 15 m/s (54 km/h) rather than 19 (68 km/h). The old floor sat
       // above almost every speed the course is actually ridden at, so the
       // geometry smear — the one that streaks a limb during a trick — was
       // effectively dead code outside a full-tuck sprint.
       const fromSpeed = clamp01((state.speed - 15) / 9) * 0.68;
-      const fromSpin = clamp01((spin - 4.2) / 6.5) * 0.9;
+      const fromSpin = whipping ? clamp01((spin - 4.2) / 6.5) * 0.9 : 0;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {
         for (const o of this.autoTargets) this.smear(o, amount);
@@ -672,8 +859,12 @@ export class SpeedFX {
     }
 
     if (this.entries.size === 0) return;
-    const invDt = dt > 1e-5 ? 1 / dt : 0;
-    const velBlend = 1 - Math.pow(2, -Math.max(dt, 0) / 0.045);
+    const blend = velBlendFor(dt);
+    _omega.copy(this.omega);
+    const spin = _omega.length();
+    if (spin > SPEED_TUNING.omegaCeiling) {
+      _omega.multiplyScalar(SPEED_TUNING.omegaCeiling / spin);
+    }
 
     for (const e of this.entries.values()) {
       if (e.hold > 0) {
@@ -681,31 +872,29 @@ export class SpeedFX {
         e.current = dampHL(e.current, e.request, 0.035, dt);
       } else {
         e.request = 0;
-        e.current = dampHL(e.current, 0, 0.07, dt);
+        e.current = dampHL(e.current, 0, 0.05, dt);
       }
-      const active = e.current > 0.02;
+      const active = e.current > 0.03;
 
       for (const p of e.parts) {
         p.src.getWorldPosition(_wp);
-        if (!p.primed) {
-          p.lastPos.copy(_wp);
-          p.primed = true;
-        }
-        _inst.subVectors(_wp, p.lastPos).multiplyScalar(invDt);
-        // Heavy smoothing: raw per-frame position deltas are noisy enough to
-        // make the tail flicker direction, which reads as a glitch, not motion.
-        p.vel.lerp(_inst, velBlend);
-        p.lastPos.copy(_wp);
+        p.vel.step(_wp, dt, blend);
 
         p.mesh.visible = active;
         if (!active) continue;
 
         p.mesh.matrixWorld.copy(p.src.matrixWorld);
-        (p.material.uniforms.uLinear.value as Vector3).copy(p.vel);
-        (p.material.uniforms.uOmega.value as Vector3).copy(this.omega);
+        // CAMERA-RELATIVE. What the audience sees move is the difference; a
+        // subject the camera is glued to does not streak, and pretending it
+        // does is what put a translucent copy of the rider over the rider.
+        _rel.subVectors(p.vel.value, this.camVel.value);
+        (p.material.uniforms.uLinear.value as Vector3).copy(_rel);
+        (p.material.uniforms.uOmega.value as Vector3).copy(_omega);
         (p.material.uniforms.uPivot.value as Vector3).copy(this.pivot);
         p.material.uniforms.uAmount.value = e.current;
-        p.material.uniforms.uOpacity.value = 0.55 * e.current;
+        // The fill is a committed value, not a function of how fast we are
+        // going — speed is expressed as streak LENGTH in the vertex stage.
+        p.material.uniforms.uOpacity.value = 0.62;
       }
     }
   }
@@ -739,7 +928,18 @@ export class SpeedFX {
       if (state.mode === BikeMode.Airborne) targetIntensity *= 0.68;
       if (state.mode === BikeMode.Crashing) targetIntensity *= 0.12;
 
-      targetRadial = Math.pow(v01, 3.0) * 0.30 + this.boostPunch * 0.42;
+      // RADIAL BLUR IS A BLUR, and it is the only genuinely photographic
+      // operator in the post stack: an 8-tap accumulation along the ray from
+      // the focus point, which is exactly the "soft pale halo around the
+      // forearms and shorts that scales down as speed drops" a motion critic
+      // read as a lighting bloom. It cannot be the game's speed cue in a
+      // drawn frame — the speed lines and the geometry streaks are — so it is
+      // cut back to a punctuation mark on the boost and nothing else.
+      //
+      // The steady-state term is kept only as a whisper (0.06 at full tuck),
+      // below the threshold at which it produces a visible halo on a lit edge
+      // but still enough to keep the frame from feeling glassy at 80 km/h.
+      targetRadial = Math.pow(v01, 3.0) * 0.06 + this.boostPunch * 0.22;
 
       this.updateFocus(dt, camera, state);
     } else {

@@ -77,7 +77,7 @@ import { RAMPS, RampPreset } from '../npr/Palette';
 import { barkTexture, paperGrain, trailSurface } from '../npr/GeneratedTextures';
 import { SurfaceKind } from '../game/Contracts';
 import { WORLD_HALF } from '../game/WorldConstants';
-import { ZONE_KIND_COUNT } from './Zones';
+import { ZONE_KIND_COUNT, zoneMipLevels } from './Zones';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data textures
@@ -245,7 +245,55 @@ export const TERRAIN_SHARED_DECLS = /* glsl */ `
  */
 export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
   uniform sampler2D uZoneTex;
-  uniform float uZoneJitter;
+  uniform float uZoneJitter;   // wander in MIP texels
+  uniform float uZoneLodMax;
+
+  /**
+   * A texture fetch whose footprint is forced back toward ISOTROPIC.
+   *
+   * Hardware anisotropic filtering takes at most N samples along the major axis
+   * of the pixel footprint and picks its mip level from the MINOR axis. That is
+   * correct while the ratio between them is under N and catastrophically wrong
+   * once it is over: the level is chosen as if the surface were being viewed
+   * head-on, and the sixteen or eighty or four-hundred texels the pixel
+   * actually covers along the view direction are represented by eight taps.
+   * A mountainside seen from a chase camera is routinely at fifty to one.
+   *
+   * That is the whole of the one-pixel scanline chatter on the trail and on the
+   * slopes beside it: not a missing mip chain, but a mip chain being asked for
+   * the wrong level. Growing the minor axis until the ratio is inside what the
+   * sampler can actually resolve costs a little sharpness at a grazing angle
+   * and buys a surface that holds still. It is also the right ARTISTIC answer
+   * — ground seen almost edge-on should read as a flat plane of paper, not as a
+   * field of resolved grit.
+   */
+  vec4 isoSample(sampler2D tex, vec2 uv) {
+    vec2 dx = dFdx(uv);
+    vec2 dy = dFdy(uv);
+    float lx = max(length(dx), 1e-9);
+    float ly = max(length(dy), 1e-9);
+    // 1/6: the textures this is used on carry anisotropy 4 to 8.
+    float need = max(lx, ly) * 0.1667;
+    dx *= max(1.0, need / lx);
+    dy *= max(1.0, need / ly);
+    return textureGrad(tex, uv, dx, dy);
+  }
+
+  /**
+   * How much of a detail layer survives at this pixel, in THREE HARD STEPS.
+   *
+   * Mip-correct sampling stops a detail texture aliasing, but it does not stop
+   * it turning into a flat grey wash the moment a pixel covers more than a few
+   * texels — and a flat grey wash multiplied over the band colour is a value
+   * shift with no drawing in it, which is worse than nothing. This retires each
+   * layer while it can still be seen as a mark. Quantised, because every fade
+   * in this shader has to be: a continuous one is a gradient laid over the
+   * hard bands, which is the defect the bands exist to prevent.
+   */
+  float detailFade(vec2 uv, float texSize) {
+    float fp = max(length(dFdx(uv)), length(dFdy(uv))) * texSize;
+    return floor(clamp(1.85 - fp * 0.55, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
+  }
 
   /**
    * The zone lookup, shared by the MAIN and PREPASS fragment shaders.
@@ -258,63 +306,60 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
    * there. Two copies of a lookup this fiddly will always drift apart.
    *
    * It lives in its own chunk rather than in TERRAIN_SHARED_DECLS because that
-   * block is injected into the VERTEX stage as well, and fwidth() is a fragment
-   * builtin.
+   * block is injected into the VERTEX stage as well, and the derivative
+   * builtins are fragment-only.
    *
-   * Snap to a power-of-two texel block sized from the screen-space derivative
-   * (this is what kills far-field salt-and-pepper on a nearest-sampled map that
-   * can never have a mip chain, because the average of rock and grass is dirt),
-   * but jitter BEFORE the snap, in units of the block, so the block grid itself
-   * is ragged rather than axis-aligned at every distance. Jittering after the
-   * snap only frays the sample position; the grid survives and the far field
-   * breaks into rectangles that read as compression artefacts.
+   * ── WHY THIS IS A MIP FETCH AND NOT A BLOCK SNAP ────────────────────────
+   * A material index cannot be filtered by averaging, so this used to snap the
+   * LOOKUP POSITION to a power-of-two texel block sized from the screen-space
+   * derivative and read level 0. That is a sound idea with one fatal detail:
+   * the block size was clamped at 32 texels. On any obliquely-viewed slope —
+   * which is most of the mountain — one screen pixel spans hundreds of texels,
+   * so the block stopped tracking the footprint, adjacent pixels landed in
+   * blocks several apart, and the surface broke into hard alternating stripes
+   * of two entirely different ramps: the orange-and-lavender static over every
+   * scree face and the white stipple over every snowfield.
+   *
+   * The reduction a zone map actually wants is a MAJORITY, and Zones.ts builds
+   * one as a real mip chain (see buildZoneMips). So the footprint now selects a
+   * LEVEL instead of a block, one mip texel is guaranteed to cover more than a
+   * screen pixel, and the fetch is nearest-in-level, nearest-between-levels —
+   * still a hard index, never an average, and now stable.
+   *
+   * The jitter survives, at a different scale and for a different reason. It is
+   * a SUB-TEXEL displacement of the sample position, so it does nothing at all
+   * in the interior of a patch and frays only the boundary — which is exactly
+   * where a hard-edged material change wants to look torn rather than
+   * rasterised. Its wavelength is tied to the mip texel, so it stays a few
+   * pixels across at every distance, and its amplitude is about one mip texel,
+   * so the edge wanders by roughly a pixel: a drawn edge, not a stair.
    */
   int sampleZone(vec2 worldXZ, vec2 uvT, int kindCount) {
     float texels = uHeightParams.z;
     vec2 tc = uvT * texels;
-    float footprint = max(max(fwidth(tc.x), fwidth(tc.y)), 1.0);
-    float zStep = clamp(exp2(ceil(log2(footprint))), 1.0, 32.0);
-    // The jitter noise has to have a WAVELENGTH COMPARABLE TO THE BLOCK, not to
-    // the texel. At 1.6/zStep the wavelength was zStep/1.6 metres — a third of
-    // the block it was supposed to be fraying — so on a steeply oblique face,
-    // where one screen pixel already spans several metres of ground, the block
-    // index resolved differently in adjacent pixels and the far field broke
-    // into orange salt-and-pepper over grey rock. The zone map is 2 m per
-    // texel, so a block is 2*zStep metres across; this puts the wander at
-    // roughly two blocks per cycle, which frays the grid without ever
-    // resolving below a screen pixel.
-    float noiseFreq = 0.24 / zStep;
-    vec2 jit = vec2(fbm2(worldXZ * noiseFreq, 2), fbm2(worldXZ * noiseFreq + 47.3, 2)) - 0.5;
-    // About a third of a block of wander: enough to break the grid, small
-    // enough that the boundary still reads as one drawn line rather than a wave.
-    vec2 jitTexels = jit * (uZoneJitter * texels) * max(1.0, zStep * 0.30);
 
-    // ── THE LATTICE IS ROTATED, AND THAT IS NOT A REFINEMENT ────────────────
-    // A snapped boundary is a staircase; there is no way round that, because the
-    // block IS a screen pixel by construction and anything that frays it at the
-    // block scale aliases at the pixel scale. What CAN be fixed is the
-    // staircase's ORIENTATION. Axis-aligned, it produces long right-angled runs
-    // that the material-id Sobel then draws as a hard rectilinear zigzag across
-    // the snowfields — unmistakably a grid, and the single most computer-looking
-    // mark left on the mountain.
-    //
-    // Rotating the lattice by a very low-frequency angle field breaks that: the
-    // boundary is still made of straight snapped segments, but they run at an
-    // angle that drifts across the map, so what the eye reads is cut paper
-    // rather than a raster. The angle field's wavelength is twenty blocks, so it
-    // is constant to within a few percent across any one block and the lattice
-    // never tears; and because both the main pass and the prepass call this one
-    // function, the ink and the paint stay on the same boundary.
-    float ang = (fbm2(worldXZ * (0.012 / zStep) + 91.7, 2) - 0.5) * 2.6;
-    float ca = cos(ang);
-    float sa = sin(ang);
-    mat2 rot = mat2(ca, -sa, sa, ca);
-    vec2 lat = rot * (tc + jitTexels);
-    vec2 latSnap = (floor(lat / zStep) + 0.5) * zStep;
-    // Inverse of a rotation is its transpose; written out so no matrix inverse
-    // is generated for a 2x2 orthonormal frame.
-    vec2 zoneTc = mat2(ca, sa, -sa, ca) * latSnap;
-    return clamp(int(texture(uZoneTex, zoneTc / texels).r * 255.0 + 0.5), 0, kindCount - 1);
+    // Footprint of one screen pixel, in level-0 zone texels. The longer of the
+    // two screen axes, because the artefact this exists to kill lives on the
+    // axis that is most stretched.
+    vec2 dtx = dFdx(tc);
+    vec2 dty = dFdy(tc);
+    float fp = max(length(dtx), length(dty));
+    // The +0.85 bias is not a fudge: it makes one mip texel cover roughly TWO
+    // screen pixels rather than one. At parity a boundary can still fall
+    // between every adjacent pixel pair, which is a one-pixel checkerboard by
+    // another name; at 2:1 the coarse field is resolved and what is left is a
+    // genuine drawn edge.
+    float lvl = clamp(floor(log2(max(fp, 1.0)) + 0.85 + 0.5), 0.0, uZoneLodMax);
+    float mtex = exp2(lvl);
+
+    // Wavelength four mip texels — eight screen pixels — so the tear reads as a
+    // wobble in the line rather than as fizz along it, and so it is quantised
+    // to the same ladder as the mip and therefore cannot crawl within a level.
+    float nf = 0.25 / mtex;
+    vec2 jit = vec2(fbm2(tc * nf, 2), fbm2(tc * nf + 47.3, 2)) - 0.5;
+    vec2 tcj = tc + jit * (mtex * uZoneJitter);
+
+    return clamp(int(textureLod(uZoneTex, tcj / texels, lvl).r * 255.0 + 0.5), 0, kindCount - 1);
   }
 `;
 
@@ -465,7 +510,11 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     vec2 uvT = terrainUv(w);
 
     // ── Surface data: one fetch for normal + erosion, one for the zone ──────
-    vec4 nx = texture(uNormalTex, uvT);
+    // isoSample, not texture(): see the note on isoSample. The normal map is
+    // the input to a HARD ramp, so half a texel of anisotropic under-sampling
+    // is not a softness artefact, it is a whole band flipping between adjacent
+    // pixels — the alternating scanlines that covered every oblique slope.
+    vec4 nx = isoSample(uNormalTex, uvT);
     vec3 N = normalize(nx.xyz * 2.0 - 1.0);
     float erosion = nx.w * 2.0 - 1.0;
 
@@ -507,18 +556,25 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     float isSnow  = float(zone == ${SurfaceKind.Snow});
     float isWater = float(zone == ${SurfaceKind.Water});
 
-    // Water is the one terrain surface with motion in it.
+    // ── Water is the one terrain surface with motion in it ──────────────────
     //
-    // The amplitude used to be 0.055 and scaled by farFade, and both were
-    // wrong. A ripple that only tilts the normal by three degrees cannot move a
-    // highlight across a surface, and killing it at range meant the one shot in
-    // the game that is mostly water had none of it at all. Two crossed waves
-    // plus a slow chop, at an amplitude that genuinely breaks the mirror, and
-    // NO distance fade — the stream bed is looked at from thirty metres and
-    // from three hundred.
+    // And the one that is NOT shaded with the terrain's own normal. That is the
+    // whole reason the stream bed rendered as a flat lavender puddle: the zone
+    // marked Water sits on the CHANNEL FLOOR, and a channel floor is eroded
+    // rock — tilted, rough, and carrying a normal that scatters the ramp lookup
+    // across every band at once. Perturbing that normal with a ripple only
+    // adds noise to noise.
+    //
+    // A water surface is level, by definition, everywhere. Forcing it level and
+    // then tilting it by the wave field is what turns RAMPS.water from four
+    // colours nobody ever sees into four colours laid out as bands ACROSS the
+    // flow, which is how water is drawn. The amplitude is chosen so N.L sweeps
+    // roughly 0.02 to 0.72 — the whole ramp, all three thresholds crossed,
+    // several times across the visible width of the stream.
     float ripple = sin(w.x * 2.4 + uTime * 1.6) + sin(w.y * 3.1 - uTime * 2.2);
     float chop   = sin(w.x * 0.62 - w.y * 0.51 + uTime * 0.9);
-    N = normalize(N + vec3(ripple * 0.17 + chop * 0.09, 0.0, ripple * 0.13 - chop * 0.07) * isWater);
+    vec3 waterN = normalize(vec3(ripple * 0.20 + chop * 0.11, 1.0, ripple * 0.15 - chop * 0.08));
+    N = normalize(mix(N, waterN, isWater));
 
     // ── Lighting. Identical in structure to celShade; only the ramp differs ─
     vec3 V = s.viewDir;
@@ -546,7 +602,16 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // Ambient bounce, QUANTISED. N.y varies smoothly across every rounded
     // landform, so tinting by it continuously lays a soft gradient over the top
     // of the hard bands and undoes them.
-    float upness = floor((N.y * 0.5 + 0.5) * 3.0 + 0.5) / 3.0;
+    // Quantised, but REMAPPED so a horizontal face never reaches pure sky.
+    //
+    // floor(x*3+0.5)/3 sends N.y = 1 to exactly 1.0, which made the bounce term pure
+    // SKY_BOUNCE on every flat surface — and flat surfaces are most of the
+    // frame. GROUND_BOUNCE, the warm dirt bounce that carries half the
+    // committed dawn-gold, could therefore never contribute to the one surface
+    // the player looks at for the entire run. A real horizontal patch of dirt
+    // is lit by the sky AND by the sunlit ground around it; the range below
+    // keeps a quarter of the warm term alive at the top of the scale.
+    float upness = mix(0.18, 0.82, floor((N.y * 0.5 + 0.5) * 3.0 + 0.5) / 3.0);
     vec3 bounce = mix(uGroundBounce, uSkyBounce, upness);
     col = mix(col, col * bounce * 1.55, uAmbient * (1.0 - 0.55 * saturate1(bIdx / 3.0)));
     col *= s.albedoTint;
@@ -571,23 +636,52 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // receding ground an iso-distance contour runs roughly horizontally across
     // the frame, which is exactly where those boundaries belong.
     //
-    // Logarithmic, so the plates are roughly even in SCREEN space rather than
-    // in world space: eight plateaus from 4 m to 2 km, one step every 1.29
-    // octaves, which lands two hard steps inside the first forty metres.
-    // The plate boundaries land at 6, 15, 37 and 90 metres, and the stack
-    // saturates there.
-    float aerialT = saturate1(log2(max(s.viewDist, 4.0) * 0.25) / 9.0);
-    float aerial  = floor(aerialT * 7.0 + 0.5) / 7.0;
-    // SATURATING, and that matters as much as the quantisation. The plates are
-    // carrying the near and middle field, which is where the shading term is
-    // constant and the fog is still sitting on plateau zero with a strength of
-    // 0.16. Past a couple of hundred metres the fog bands take the job over
-    // completely, and stacking more haze on top of them only greys the far
-    // distance into the wash the fog quantisation exists to prevent. Fog band 1
-    // begins at 223 m, so the two systems hand over cleanly with no overlap.
-    float plate = min(aerial, 0.43);
-    col = mix(col, uSkyBounce * 1.28, plate * 0.62);
-    col *= mix(0.88, 1.06, plate / 0.43);
+    // ── WHERE THE BOUNDARIES ARE, AND HOW BIG THE STEP IS ──────────────────
+    // Both had to change, and the second mattered more.
+    //
+    // The old ladder ran log2(d/4)/9 in seven steps: boundaries at 6, 15, 37,
+    // 90, 220 and 538 m, then a hard cap at 0.72 that the fifth step already
+    // reached. From 220 m out to the horizon — which is most of every wide
+    // shot, and the entire visible surface of a dune seen from a chase camera —
+    // the stack was CONSTANT, so the largest shapes in the game were carrying
+    // no plates at all. That is why a 420-row column down the main dune
+    // measured ninety distinct values and not one plateau boundary.
+    //
+    // And where they did land they were invisible: one seventh of a 0.26 haze
+    // mix is 3.7% of a colour barely different from the ground colour, plus a
+    // 3% value multiply. Three or four levels out of 255. A step has to be a
+    // step you can point at.
+    //
+    // The ladder below is 5 m to 400 m in seven steps of 1.87x, which puts
+    // boundaries at 6.8, 12.8, 23.9, 44.6, 83.4, 156 and 291 m. Four of them
+    // are inside the first forty-five metres, which is the range that receding
+    // FLAT ground occupies in a chase or orbit shot, and three more cover the
+    // middle distance before the fog bands take over at 223 m.
+    float aerialT = saturate1(log2(clamp(s.viewDist, 5.0, 400.0) / 5.0) / 6.322);
+    float plate   = floor(aerialT * 7.0 + 0.5) / 7.0;
+
+    float hazeSun = saturate1(dot(normalize(-V), uSunDir));
+    hazeSun = hazeSun * hazeSun;
+    vec3 hazeCol = mix(uSkyBounce * 1.30, uFogSunTint * 1.10, hazeSun * 0.72);
+
+    // THE VALUE LADDER CARRIES THE STEP; THE HAZE ONLY TINTS IT.
+    //
+    // A haze mix strong enough to be visible on its own is a chroma drain: it
+    // is a mix toward one flat colour, so eight steps of it end with the far
+    // field painted in sky blue and the dawn-gold gone. The previous version
+    // did exactly that and the trail measured 30% saturation against an
+    // authored 56%, with the hue rotated as far as magenta.
+    //
+    // A MULTIPLY cannot do that. It scales all three channels together, so it
+    // moves value while leaving hue and saturation where the palette put them,
+    // and it is therefore free to be large. 3.6% per step compounding to +27%
+    // across the whole ladder is a plate stack you can read at a glance and a
+    // palette that arrives at the grade intact. The haze mix on top is kept
+    // small — a quarter of what it was per step — and warms toward the sun
+    // exactly as the fog does, because at a 21.5 degree sun the air between you
+    // and a ridge you are looking INTO is gold, not blue.
+    col = mix(col, hazeCol, plate * 0.17);
+    col *= mix(0.93, 1.27, plate);
 
     // ── Surface detail ─────────────────────────────────────────────────────
     // Two vertical projections plus a horizontal one, blended by how the face
@@ -606,8 +700,8 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     float kx = floor((abs(N.x) / max(abs(N.x) + abs(N.z), 1e-4)) * 3.0 + 0.5) / 3.0;
     float ds = uDetailScale;
 
-    float rockZ = texture(uDetailRock, vec2(wp.z, wp.y) * ds).r;
-    float rockX = texture(uDetailRock, vec2(wp.x, wp.y) * ds).r;
+    float rockZ = isoSample(uDetailRock, vec2(wp.z, wp.y) * ds).r;
+    float rockX = isoSample(uDetailRock, vec2(wp.x, wp.y) * ds).r;
     // THE TOP-DOWN PROJECTION USES A DIFFERENT TEXTURE, and that is the whole
     // point of writing it out rather than reusing rockZ. uDetailRock is the
     // bark generator and bark is CONCENTRIC. On a vertical face those rings
@@ -618,11 +712,27 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // removes because a warp bends a ring, it does not open it. The paper
     // grain has no preferred centre and no preferred direction, which is
     // exactly what ground seen from above wants.
-    float rockY = texture(uDetailGrain, w * ds * 0.85).r;
+    float rockY = isoSample(uDetailGrain, w * ds * 0.85).r;
     float bedding = mix(rockY, mix(rockZ, rockX, kx), wallness);
 
-    float gravel = texture(uDetailGravel, w * ds * 2.4).g;
-    float grain  = texture(uDetailGrain, w * ds * 5.0).r;
+    // ── THE TWO LAYERS THAT DREW THE SCANLINE MOIRE ─────────────────────────
+    // gravel at ds*2.4 is a tile per 7.6 m and grain at ds*5.0 a tile per 3.6 m
+    // — and both were fetched with a plain texture() call, so on the trail,
+    // seen at a raking angle, one pixel spanned tens of texels along the view
+    // direction while the sampler picked its mip from the two or three texels
+    // it spanned across. That is an eight-to-one under-sample at best and it
+    // alternated row by row for two hundred rows.
+    //
+    // isoSample fixes the fetch. detailFade then retires each layer at the
+    // point where a screen pixel covers about two texels of it, in three hard
+    // steps, because a marking that can no longer be resolved as a marking has
+    // to LEAVE rather than average into a grey film over the band colour.
+    vec2 gravelUv = w * ds * 2.4;
+    vec2 grainUv  = w * ds * 5.0;
+    float gravel = isoSample(uDetailGravel, gravelUv).g;
+    float grain  = isoSample(uDetailGrain, grainUv).r;
+    float gravelAA = detailFade(gravelUv, 512.0);
+    float grainAA  = detailFade(grainUv, 512.0);
 
     // High-frequency detail is faded out with distance rather than left to the
     // mip chain alone: past a few hundred metres the ridges have to read as
@@ -657,21 +767,38 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     col = mix(col, col * 1.11,  bandStep(strata, 0.61, 0.02) * wallMask * 0.60);
 
     float pebble = 1.0 - bandStep(gravel, 0.30, 0.02);
-    col = mix(col, col * vec3(1.07, 1.05, 1.0), pebble * (isScree * 0.34 + isDirt * 0.16) * detail);
+    col = mix(col, col * vec3(1.07, 1.05, 1.0), pebble * (isScree * 0.34 + isDirt * 0.16) * detail * gravelAA);
 
     float clump = bandStep(grain, 0.53, 0.02);
-    col = mix(col, col * vec3(0.91, 1.04, 0.89), clump * isGrass * 0.32 * detail);
+    col = mix(col, col * vec3(0.91, 1.04, 0.89), clump * isGrass * 0.32 * detail * grainAA);
 
-    float drift = bandStep(rockY, 0.56, 0.02);
-    col = mix(col, col * 1.06, drift * isSnow * 0.38 * detail);
+    // ── SNOW GETS THE LONGEST WAVELENGTH IN THE SHADER, ON PURPOSE ─────────
+    // A snowfield is the one surface with no internal drawing in it at all: it
+    // is a flat white shape with a drawn edge, and everything a shader adds
+    // inside that shape is a defect. The drift mark used to run on rockY —
+    // the 4 m paper grain — which at native resolution is a fine white
+    // splatter over the summit and at any distance is pepper. This is a
+    // 25-metre wind form with a hard edge: ONE readable shoulder across a
+    // whole bowl, which is what a background painter draws, and which the mip
+    // chain can still resolve at a kilometre.
+    float sculpt = fbm2(w * 0.040 + 17.9, 2);
+    float drift = bandStep(sculpt, 0.52, 0.03);
+    col = mix(col, col * 1.055, drift * isSnow * 0.55);
+    col = mix(col, col * 0.965, bandStep(sculpt, 0.38, 0.03) * (1.0 - drift) * isSnow * 0.45);
 
     // ── Erosion read ───────────────────────────────────────────────────────
     // The shading agrees with the shape: cut ground goes cold and dark, the
     // fan below it goes pale and warm. Both quantised, both narrow.
     float cut  = bandStep(-erosion, 0.34, 0.03);
     float fill = bandStep(erosion, 0.30, 0.03);
-    col = mix(col, col * vec3(0.86, 0.88, 0.95), cut * 0.50);
-    col = mix(col, col * vec3(1.05, 1.02, 0.96), fill * 0.34);
+    // Water is exempt from the cut mark, and that exemption is the single
+    // biggest reason the stream had no colour in it. A carved channel is the
+    // most deeply cut ground on the mountain, so the cut mark was pinned at 1 over the
+    // whole stream and pushed half of a desaturating grey-blue multiply through
+    // the one surface in the game that is supposed to be the most saturated.
+    // The riverbed is under the water; the water is not the riverbed.
+    col = mix(col, col * vec3(0.86, 0.88, 0.95), cut * 0.50 * (1.0 - isWater));
+    col = mix(col, col * vec3(1.05, 1.02, 0.96), fill * 0.34 * (1.0 - isWater));
 
     // ── Hatch, specular, rim — all per zone ────────────────────────────────
     col = terrainHatch(col, bIdx, s.fragCoord, uZoneMiscB[zone].x, uZoneMiscB[zone].y);
@@ -704,12 +831,31 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     float fleck = bandStep(glint, 0.052, 0.004) * 0.55
                 + bandStep(glint, 0.108, 0.003) * 0.45;
     float wrim = bandStep(pow(1.0 - saturate1(dot(N, V)), 1.6), 0.40, 0.03);
-    // Flow contours: the current, drawn as banded bright lines running with the
-    // ripple. Water in a cel background is drawn, not simulated.
-    float flow = bandStep(sin(w.x * 1.35 + w.y * 0.9 + uTime * 0.85 + ripple * 0.7), 0.72, 0.03);
-    col += isWater * (uSpecColor * fleck * 1.05 * shadow
-                    + uRimColor * wrim * 0.34
-                    + uSpecColor * flow * 0.16);
+
+    // ── Flow contours ──────────────────────────────────────────────────────
+    // The current, drawn. Water in a cel background is not simulated and it is
+    // not a shader effect on a plane — it is a set of long, tapering, hard-
+    // edged strokes running with the flow, and a painter draws maybe four of
+    // them across a stream this wide.
+    //
+    // Two tiers at different wavelengths so the field never reads as a grating:
+    // a wide, dim carrier and a narrow, hot core drawn only where the carrier
+    // and the wave crest agree. Both are advected by the ripple field, so the strokes
+    // bend around the wave rather than crossing it. And both are BRIGHT
+    // ADDITIVE — this is the one surface in the game allowed a white line.
+    float flowPhase = w.x * 1.35 + w.y * 0.90 + uTime * 0.85 + ripple * 0.9;
+    float flowWide  = bandStep(sin(flowPhase), 0.55, 0.03);
+    float flowCore  = bandStep(sin(flowPhase * 2.13 + 1.7), 0.86, 0.02) * flowWide;
+
+    // A hard-edged HIGHLIGHT SHAPE, not a specular falloff: the flat patch of
+    // sky the water is mirroring back, thresholded into one solid form and cut
+    // by the wave field so it breaks into the shards a painter would draw.
+    float sheet = bandStep(dot(N, Hw) + ripple * 0.06, 0.905, 0.006);
+
+    col += isWater * (uSpecColor * fleck * 1.20 * shadow
+                    + uSpecColor * sheet * 0.55 * shadow
+                    + uRimColor * wrim * 0.40
+                    + uSpecColor * (flowWide * 0.13 + flowCore * 0.30));
 
     return col;
   }
@@ -817,11 +963,27 @@ export interface TerrainMaterialSet {
 export function createTerrainMaterials(o: TerrainMaterialOptions): TerrainMaterialSet {
   const heightParams = new Vector4(WORLD_HALF, 1 / o.cellSize, o.size, o.cellSize);
 
+  // uZoneJitter and uZoneLodMax live HERE, not in the fragment-only block, and
+  // that is a bug fix rather than tidiness. TERRAIN_ZONE_LOOKUP is compiled
+  // into the prepass as well, but the prepass material was only ever handed
+  // `shared` — so the jitter uniform it declared was never bound, defaulted to
+  // zero, and the prepass sampled a zone boundary the main pass had moved by up
+  // to two texels. The material-id Sobel was therefore inking a line beside the
+  // paint edge rather than on it, which is the second half of the same defect
+  // the shared sampleZone() function exists to close.
   const shared: Record<string, IUniform> = {
     uHeightTex: { value: o.heightTexture as Texture },
     uHeightParams: { value: heightParams },
     uNormalTex: { value: o.normalTexture as Texture },
     uZoneTex: { value: o.zoneTexture as Texture },
+    // About one mip texel of wander — see sampleZone. This is a SUB-TEXEL
+    // displacement now, not the 2.5 level-0 texels the block-snap version used.
+    uZoneJitter: { value: 1.15 },
+    // The zone chain runs to 1x1, but past 256 texels a block is half a
+    // kilometre of mountain and the far ridges lose the shape of their
+    // snowfields. 8 levels is 512 m, which is coarser than anything the eye
+    // resolves at the distance the clamp is reached.
+    uZoneLodMax: { value: Math.min(8, zoneMipLevels(o.size)) },
   };
 
   // Material ids, one per zone, so the Sobel pass inks every material boundary
@@ -845,8 +1007,6 @@ export function createTerrainMaterials(o: TerrainMaterialOptions): TerrainMateri
     uZoneThresh: { value: packed.thresholds },
     uZoneMiscA: { value: packed.miscA },
     uZoneMiscB: { value: packed.miscB },
-    // 2.5 texels of raggedness, expressed in uv so the shader needs no divide.
-    uZoneJitter: { value: 2.5 / o.size },
     uDetailScale: { value: detailScale },
   };
 
@@ -940,7 +1100,11 @@ function createTerrainPrepassMaterial(
 
       void main() {
         vec2 uvT = terrainUv(vWorld.xz);
-        vec3 n = normalize(texture(uNormalTex, uvT).xyz * 2.0 - 1.0);
+        // The SAME fetch the main pass uses, anisotropy cap and all. If the
+        // prepass read a sharper normal than the paint, the Sobel would ink
+        // creases the shading does not have — a mesh of hairline scratches over
+        // a surface the main pass is drawing as one flat plane.
+        vec3 n = normalize(isoSample(uNormalTex, uvT).xyz * 2.0 - 1.0);
         vec3 vn = normalize((viewMatrix * vec4(n, 0.0)).xyz);
 
         int zone = sampleZone(vWorld.xz, uvT, ${ZONE_KIND_COUNT});

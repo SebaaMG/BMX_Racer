@@ -99,6 +99,18 @@ interface Situation {
    * ground before the shutter opens.
    */
   launch?: number;
+  /**
+   * Fixed physics steps to run before the shutter, at 120 Hz.
+   *
+   * The jumps work for real now — a rider placed on the run-in with speed and
+   * no impulse launches off the kicker and lands on the deck. So an air pose
+   * should be REACHED by riding into it, not faked with a vertical impulse:
+   * the artificial launch on `ravine-gap` flew the rider straight past the
+   * receiving ramp and 13 m into the far hillside. The harness only settles 12
+   * frames before shooting, which is 4 m of travel, so a pose that needs to
+   * cover 25 m of run-in has to say so.
+   */
+  preroll?: number;
   camera: CameraMode;
   orbit?: { yaw: number; pitch: number; dist: number; spin?: number };
   input?: Partial<BikeInput>;
@@ -127,13 +139,14 @@ const SITUATIONS: Record<string, Situation> = {
   'treeline-silhouette':{ t: 0.470, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
   'rockgarden-low':     { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
   // Genuinely ballistic off the table, not parked in the air above it.
-  'tabletop-air':       { t: 0.626, speed: 18, lift: 0.6, launch: 7.4, camera: CameraMode.Chase, input: { airPitch: 0.3 } },
+  // Placed on the run-in and ridden off the lip. No impulse.
+  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 130, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
   // Placed just short of the hole (0.675) and launched, so the rider is
   // arcing OVER the ravine rather than standing next to it.
   // The harness settles 12 frames (0.2 s) before the shutter, which carries the
   // rider ~4 m. Spawn that far SHORT of the near lip so the shutter opens with
   // the rider over the hole and still rising.
-  'ravine-gap':         { t: 0.6745, speed: 21, lift: 0.8, launch: 9.5, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.22, dist: 19 } },
+  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 150, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.22, dist: 19 } },
   'ridge-exposure':     { t: 0.757, speed: 16, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
   streambed:            { t: 0.849, speed: 12, camera: CameraMode.Chase },
   // Short of the line, so the gate is ahead of the rider and in frame.
@@ -468,12 +481,22 @@ export class Game {
       const r = racers[i];
       const bike = r.bike as Bike;
       const isPlayer = r === this.race.player;
-      const back = isPlayer ? 0 : 3.5 + i * 4.5;
+      // Opponents go BEYOND the camera boom, never inside it.
+      //
+      // 3.5 m was the old first-rival offset and the chase boom settles around
+      // 4.8 m behind the player — so the harness was parking a rival almost
+      // exactly where the camera lives. Every chase capture had an opponent
+      // filling a screen quadrant, near-plane-clipped, while the actual subject
+      // was a 110 px figure behind it. The camera's own occluder avoidance
+      // cannot help: there is nowhere for a 4.8 m boom to go that is not inside
+      // a rider standing 3.5 m away. Real race spacing is metres, not
+      // centimetres, and the review set has to show the race the player sees.
+      const back = isPlayer ? 0 : 12 + i * 6.5;
       const d = Math.max(1, Math.min(total - 2, s.t * total - back));
       const sample = this.track.sampleAtDistance(d);
 
       _v.copy(sample.position);
-      if (!isPlayer) _v.addScaledVector(sample.left, i % 2 === 0 ? 1.6 : -1.6);
+      if (!isPlayer) _v.addScaledVector(sample.left, i % 2 === 0 ? 2.4 : -2.4);
       _fwd.copy(sample.tangent);
 
       // Spawn on whichever surface is HIGHER: the ribbon mesh or the
@@ -511,6 +534,11 @@ export class Game {
       dir.setOrbit(s.orbit.yaw, s.orbit.pitch, s.orbit.dist, s.orbit.spin ?? 0.35);
     }
     dir.resetTo(this.race.player.bike.state);
+
+    // Ride into the situation rather than being dropped into it.
+    if (s.preroll) {
+      for (let i = 0; i < s.preroll; i++) this.race.fixedUpdate(1 / 120);
+    }
 
     // Swallow the checkpoint splits the teleport just crossed, and wipe any
     // popup already on screen from the previous pose.

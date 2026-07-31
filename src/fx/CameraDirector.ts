@@ -95,6 +95,7 @@ import {
 import { Noise2D } from '../core/Noise';
 import { Rng } from '../core/RNG';
 import { BIKE } from '../game/WorldConstants';
+import { clearAllDust, publishDustShot } from './DustSystem';
 
 // ── Module scratch ───────────────────────────────────────────────────────────
 // Nothing in the update path allocates. Every vector below is written before it
@@ -214,6 +215,26 @@ export const CAMERA_TUNING = {
 
   /** Radius of the subject's own body, for the near-fade and lift tests. */
   bodyRadius: 0.95,
+  /**
+   * The radius around the subject that has to stay LEGIBLE — bike, rider and
+   * the ink contour around them. Published to the particle systems, which fade
+   * anything that comes between the lens and this sphere. Larger than
+   * `bodyRadius` on purpose: that one is a collision radius, this one is a
+   * composition radius and it has to cover the drawn silhouette, not the body.
+   */
+  subjectClearRadius: 1.25,
+  /**
+   * Minimum standoff for the HAND-FRAMED modes (Orbit, Cinematic), metres.
+   *
+   * `bike-detail` is authored at 2.3 m, and at 2.3 m the lens is INSIDE the
+   * emitter volume: the wheels throw dust from the contact patch, a plume grows
+   * to nearly two metres across, and several of them end up strung out between
+   * the camera and the bike. The corridor fade in DustSystem removes what does
+   * get in the way, but a camera that is standing in the dust cloud is asking
+   * that fade to save every single frame. Outside the cloud is a better place
+   * to be, and 3.25 m still frames a bike portrait that fills half the raster.
+   */
+  framedMinDist: 3.25,
   /** Radius of another rider's body as an occluding cylinder. */
   occluderRadius: 1.10,
   /** Clearance kept between the camera and an occluder on the boom line. */
@@ -247,6 +268,36 @@ export const CAMERA_TUNING = {
   liftMax: 2.6,
   liftAttackHL: 0.05,
   liftReleaseHL: 0.30,
+
+  // ── Framed-shot elevation solve ────────────────────────────────────────────
+  /**
+   * A hand-framed shot (Orbit, Cinematic) may not be shortened — `summit-wide`
+   * is a deliberate 52 m crane and `valley-vista` a 180 m establishing shot —
+   * but it may be RAISED, and it must be, because the mountain does not care
+   * what yaw and pitch an author typed. `ravine-gap` is authored at 19 m and
+   * 12.6 degrees of elevation on a slope that is steeper than that: the camera
+   * lands inside the hillside, the unconditional terrain floor shoves it back
+   * out to sit ON the surface, and the shot becomes a violet-grey slab with the
+   * rider somewhere behind it. Measured: 0 subject pixels in the frame.
+   *
+   * So the arm is rotated UP about the pivot, in fixed steps, until the camera
+   * end is clear of the ground and the whole sight line to the subject is
+   * clear. Rotating rather than lifting keeps the authored DISTANCE and AZIMUTH
+   * exactly — the shot's scale and its side are what the author chose, and the
+   * elevation is the one axis the terrain has a legitimate vote on. It is also
+   * self-correcting for the ravine specifically: swinging up at constant radius
+   * pulls the camera horizontally in off the hillside and out over the void,
+   * which is precisely where the shot wants to be.
+   *
+   * Searched from the authored elevation, never below it, and capped so a
+   * blocked shot degrades to a steep three-quarter rather than to a map view.
+   */
+  framedRiseStep: 0.075,
+  framedRiseMax: 0.90,
+  framedRiseMaxElev: 1.24,
+  framedRiseAttackHL: 0.06,
+  framedRiseReleaseHL: 0.34,
+  framedClearSamples: 7,
 
   /** Another rider begins dithering out at this range and is gone by `Full`. */
   nearFadeStart: 2.60,
@@ -431,6 +482,11 @@ export class CameraDirector implements ICameraDirector {
   private boomRetract = 0;
   /** Vertical escape currently applied. Bounded by `liftMax`. */
   private collisionLift = 0;
+  /**
+   * Extra ELEVATION applied to a hand-framed arm, radians. Never negative — the
+   * solver can only ever raise a shot, never drop it below what was authored.
+   */
+  private framedRise = 0;
   /** Last solved boom length, pivot to camera. */
   private boomLength = 0;
   /**
@@ -1193,14 +1249,17 @@ export class CameraDirector implements ICameraDirector {
 
   private updateOrbit(t: BikeState, dt: number): void {
     this.orbitYaw += this.orbitSpin * dt;
-    this.boomDesired = this.orbitDist;
+    // The standoff floor. An orbit closer than this has the lens inside the
+    // subject's own dust — see `framedMinDist`.
+    const dist = Math.max(this.orbitDist, CAMERA_TUNING.framedMinDist);
+    this.boomDesired = dist;
     const cy = Math.cos(this.orbitPitch);
     this.lookPos.copy(t.position);
     this.lookPos.y += 1.1;
     this.camPos.set(
-      this.lookPos.x + Math.sin(this.orbitYaw) * cy * this.orbitDist,
-      this.lookPos.y + Math.sin(this.orbitPitch) * this.orbitDist,
-      this.lookPos.z + Math.cos(this.orbitYaw) * cy * this.orbitDist,
+      this.lookPos.x + Math.sin(this.orbitYaw) * cy * dist,
+      this.lookPos.y + Math.sin(this.orbitPitch) * dist,
+      this.lookPos.z + Math.cos(this.orbitYaw) * cy * dist,
     );
     this.roll = dampHL(this.roll, 0, 0.2, dt);
   }
@@ -1248,6 +1307,7 @@ export class CameraDirector implements ICameraDirector {
     this.lz.value = lookAt.z; this.lz.velocity = 0;
 
     this.collisionLift = 0;
+    this.framedRise = 0;
     this.boomRetract = 0;
     this.frameBias = 0;
     this.shakeDur = 0;
@@ -1320,6 +1380,24 @@ export class CameraDirector implements ICameraDirector {
     this.fovS.value = this.fovBase;
     this.fovS.velocity = 0;
     this.clearNearFade();
+
+    // THE SUBJECT HAS TELEPORTED. Everything the old shot left hanging in the
+    // air belongs to a place that is now hundreds of metres away, and the one
+    // system that does not find that out on its own is the dust: a puff is a
+    // fire-and-forget instance with a 0.7-2.3 s life and no idea the world
+    // moved underneath it.
+    //
+    // This is the whole of the `bike-detail` failure. The capture harness runs
+    // rider-closeup, rider-threequarter and bike-detail back to back at the
+    // SAME point on the course, twelve frames each; each pose re-spawns the
+    // bike, which lands and throws a burst, and the previous two poses' clouds
+    // are still very much alive when the bike-detail shutter opens 2.3 m away.
+    // Measured on the shipped harness path: 30 live puffs, 9 of them between
+    // the lens and the bike, covering 46% of the sight line — the bike rendered
+    // as X-ray line art through four to six overlapping peach impostors. Run
+    // on its own, the identical pose was clean, which is exactly the signature
+    // of state carried across a cut.
+    clearAllDust();
   }
 
   // ── Replay ────────────────────────────────────────────────────────────────
@@ -1494,6 +1572,9 @@ export class CameraDirector implements ICameraDirector {
 
     _camFinal.copy(this.camPos).add(this.shakeOffset);
     if (tracking) _camFinal.y += this.collisionLift;
+    // Hand-framed modes take their correction as elevation about the pivot
+    // instead, so the authored distance and azimuth survive it.
+    if (tracking && !boomed) this.applyFramedRise(_camFinal, _pivot);
     _lookFinal.copy(this.lookPos);
     if (tracking) _lookFinal.y += this.frameBias;
 
@@ -1537,6 +1618,18 @@ export class CameraDirector implements ICameraDirector {
     }
 
     this.updateNearFade(_camFinal, dt);
+
+    // Tell the particle systems what this frame is OF.
+    //
+    // The camera is the only thing in the build that knows both where the lens
+    // is and what it is pointed at, and the dust cannot make a sensible
+    // decision about which puffs are allowed to exist without knowing the
+    // second half of that. Published every frame, after the camera is placed,
+    // so the corridor the dust tests against is this frame's corridor and not
+    // the last one's.
+    _tmp.copy(this.mode === CameraMode.Replay ? this.replayPosition : subject.position);
+    _tmp.y += CAMERA_TUNING.subjectPivotHeight;
+    publishDustShot(_tmp.x, _tmp.y, _tmp.z, CAMERA_TUNING.subjectClearRadius);
   }
 
   /**
@@ -1581,7 +1674,16 @@ export class CameraDirector implements ICameraDirector {
     } else {
       _boomDir.copy(cam).sub(pivot);
       this.boomLength = _boomDir.length();
+      // A hand-framed arm is not shortened and is not lifted vertically — it is
+      // rotated up about the pivot until it can see, which keeps the authored
+      // distance and azimuth intact. That is the whole solve for these modes,
+      // so the bounded vertical escape below has nothing left to do.
+      this.solveFramedRise(cam, pivot, dt);
+      this.collisionLift = 0;
+      return;
     }
+
+    this.framedRise = 0;
 
     // Vertical escape for what shortening could not fix — the camera end
     // sitting in rising ground, or a rider passing directly under the lens.
@@ -1636,6 +1738,108 @@ export class CameraDirector implements ICameraDirector {
       need > this.collisionLift
         ? dampHL(this.collisionLift, need, CAMERA_TUNING.liftAttackHL, dt)
         : dampHL(this.collisionLift, need, CAMERA_TUNING.liftReleaseHL, dt);
+  }
+
+  /**
+   * The framed-shot elevation solve. See `framedRiseStep` in the tuning block.
+   *
+   * Searches upward from the AUTHORED elevation in fixed steps for the first
+   * one whose camera end is out of the ground and whose whole sight line to the
+   * subject is clear, and damps toward it. The search is run against the raw
+   * authored arm every frame, never against last frame's answer, so there is no
+   * feedback path and therefore nothing to oscillate: the damping is smoothing
+   * a stable target, not chasing its own output.
+   */
+  private solveFramedRise(cam: Vector3, pivot: Vector3, dt: number): void {
+    const dx = cam.x - pivot.x;
+    const dy = cam.y - pivot.y;
+    const dz = cam.z - pivot.z;
+    const h = Math.sqrt(dx * dx + dz * dz);
+    const len = Math.sqrt(h * h + dy * dy);
+    if (len < 1e-3) {
+      this.framedRise = 0;
+      return;
+    }
+    const e0 = Math.atan2(dy, h);
+    const ux = h > 1e-4 ? dx / h : -Math.sin(this.aimYaw);
+    const uz = h > 1e-4 ? dz / h : -Math.cos(this.aimYaw);
+
+    let want = 0;
+    if (!this.framedClear(pivot, len, ux, uz, e0)) {
+      const maxRise = Math.min(
+        CAMERA_TUNING.framedRiseMax,
+        Math.max(0, CAMERA_TUNING.framedRiseMaxElev - e0),
+      );
+      const step = CAMERA_TUNING.framedRiseStep;
+      // If nothing in the range clears, take the top of it: a steep shot that
+      // still has the mountain in the way is worth more than a shot buried in
+      // it, and the unconditional floor downstream will do the rest.
+      want = maxRise;
+      for (let r = step; r <= maxRise + 1e-6; r += step) {
+        if (this.framedClear(pivot, len, ux, uz, e0 + r)) {
+          want = r;
+          break;
+        }
+      }
+    }
+
+    this.framedRise =
+      want > this.framedRise
+        ? dampHL(this.framedRise, want, CAMERA_TUNING.framedRiseAttackHL, dt)
+        : dampHL(this.framedRise, want, CAMERA_TUNING.framedRiseReleaseHL, dt);
+  }
+
+  /**
+   * Can a camera at this elevation, on an arm of this length and azimuth, both
+   * stand clear of the ground and see the pivot? Pure query, no state.
+   */
+  private framedClear(pivot: Vector3, len: number, ux: number, uz: number, elev: number): boolean {
+    const ce = Math.cos(elev);
+    const se = Math.sin(elev);
+    const cx = pivot.x + ux * ce * len;
+    const cy = pivot.y + se * len;
+    const cz = pivot.z + uz * ce * len;
+
+    if (this.terrain) {
+      if (cy < this.terrain.heightAt(cx, cz) + CAMERA_TUNING.terrainMargin) return false;
+      const N = CAMERA_TUNING.framedClearSamples;
+      for (let i = 1; i <= N; i++) {
+        const s = i / (N + 1);
+        const px = pivot.x + (cx - pivot.x) * s;
+        const py = pivot.y + (cy - pivot.y) * s;
+        const pz = pivot.z + (cz - pivot.z) * s;
+        // Same ramped margin as the boom sweep, and for the same reason: close
+        // to the pivot the "obstruction" is the ground the rider is riding on.
+        const margin = lerp(CAMERA_TUNING.boomClearNear, CAMERA_TUNING.boomClearFar, s);
+        if (this.terrain.heightAt(px, pz) + margin - py > CAMERA_TUNING.boomDeadband) return false;
+      }
+    }
+
+    const r = CAMERA_TUNING.occluderLiftRadius;
+    for (let i = 0; i < this.occCount; i++) {
+      const o = _occPos[i];
+      const ddx = o.x - cx;
+      const ddz = o.z - cz;
+      if (ddx * ddx + ddz * ddz < r * r && cy < o.y + CAMERA_TUNING.riderTop) return false;
+    }
+    return true;
+  }
+
+  /** Rotate a solved framed arm up by `framedRise`, preserving length and azimuth. */
+  private applyFramedRise(cam: Vector3, pivot: Vector3): void {
+    if (this.framedRise <= 1e-4) return;
+    const dx = cam.x - pivot.x;
+    const dy = cam.y - pivot.y;
+    const dz = cam.z - pivot.z;
+    const h = Math.sqrt(dx * dx + dz * dz);
+    const len = Math.sqrt(h * h + dy * dy);
+    if (len < 1e-3) return;
+    const e = Math.min(Math.atan2(dy, h) + this.framedRise, CAMERA_TUNING.framedRiseMaxElev);
+    const ce = Math.cos(e);
+    const se = Math.sin(e);
+    const ux = h > 1e-4 ? dx / h : -Math.sin(this.aimYaw);
+    const uz = h > 1e-4 ? dz / h : -Math.cos(this.aimYaw);
+    cam.set(pivot.x + ux * ce * len, pivot.y + se * len, pivot.z + uz * ce * len);
   }
 
   /** Raise a point clear of the hillside. No amplification, no state. */

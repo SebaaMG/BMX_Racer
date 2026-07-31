@@ -53,6 +53,11 @@ import {
   VALLEY_HEIGHT,
   WORLD_HALF,
   corridorHeightAt,
+  makeRouteFrame,
+  routeAt,
+  routeDistanceOf,
+  tabletopGeometry,
+  tabletopProfile,
 } from '../game/WorldConstants';
 import { SurfaceKind } from '../game/Contracts';
 
@@ -619,6 +624,7 @@ export function carveFeatures(
 
   const rng = new Rng(seed);
   const nRough = new Noise2D(`${seed}:rough`);
+  const _rf = makeRouteFrame();
 
   /** Iterate the texels inside a world-space AABB. */
   const forBox = (
@@ -700,78 +706,170 @@ export function carveFeatures(
       }
 
       // ── Tabletop ──────────────────────────────────────────────────────────
-      // Kicker face, flat deck, landing ramp. The lip is the whole point: the
-      // face is close to straight and it STOPS, so the rider can read the
-      // takeoff angle from 40m out. A smoothstep face would be unreadable.
+      // Built in the ROUTE'S OWN FRAME, on a fall line read out of the mountain.
+      //
+      // The two things this gets right that the previous version did not:
+      //
+      // 1. ORIENTATION. The mound used to run along a hardcoded (0.20, 0.98)
+      //    azimuth while the route through here runs (0.097, 0.995) — 5.7
+      //    degrees out, enough that the deck edge wandered 1.7 m across the
+      //    racing line over its length and the "kicker" was partly a flank. The
+      //    axis is now the route itself, sampled station by station, so the ramp
+      //    runs along the track by construction and follows its curve.
+      //
+      // 2. THE REFERENCE ELEVATION. It used to be a straight lerp between two
+      //    disc means 64 m apart, which is only the fall line if the mountain
+      //    happens to be planar over 64 m. It is not. The reference is now the
+      //    terrain's own profile along the route, laterally averaged to reject
+      //    gully chatter, box-smoothed, and gradient-limited so the deck can
+      //    never sit on a reference that climbs or plunges. The jump shape is
+      //    then added on top of that as a pure function of route distance
+      //    (`tabletopProfile`, shared with the track builder).
+      //
+      // The result is single-valued in XZ with a bounded gradient by
+      // construction, which is the property a heightfield has to have and the
+      // one the old carve broke.
       case 'tabletop': {
-        const L = p.length;
-        const W = p.width;
-        const H = p.height;
-        const lip = p.lipSharpness;
-        // Aligned with the route tangent at the mound's centre.
-        const dirX = 0.20;
-        const dirZ = 0.98;
-        const nrmX = dirZ;
-        const nrmZ = -dirX;
-        const takeoff = 13;
-        const landing = 17;
-        const halfW = W * 0.5;
-        const reach = L * 0.5 + landing + 6;
-        // The deck follows the descent profile rather than sitting level, or
-        // the landing ramp would point uphill.
-        //
-        // That was the INTENT; the code used one constant mean for the whole
-        // 64 m feature. On ground that drops ~10 m across the mound, a constant
-        // reference cuts the uphill run-in down by metres and fills the
-        // downhill out-run by metres — and because the carve also ended in a
-        // hard `return`, the cut appeared instantly at the boundary. The result
-        // was a NEAR-VERTICAL WALL at the start of the run-in: measured as a 74
-        // degree face, over which the track centreline became multivalued in XZ
-        // (three consecutive spline points within 1 m horizontally spanning 4.5
-        // m of height). A heightfield cannot represent that, so the physics saw
-        // a mesa where the mesh showed a ramp, and the bike fell through it.
-        //
-        // The reference now follows the fall line between the two ends, and the
-        // whole carve feathers out longitudinally instead of stopping dead.
-        const sUp = -L * 0.5 - takeoff;
-        const sDn = L * 0.5 + landing;
-        const refUp = meanHeight(fx + dirX * sUp, fz + dirZ * sUp, 9);
-        const refDn = meanHeight(fx + dirX * sDn, fz + dirZ * sDn, 9);
-        const refAt = (sv: number): number =>
-          lerp(refUp, refDn, clamp01((sv - sUp) / Math.max(sDn - sUp, 1e-3)));
-        /** Metres of run-in and run-out over which the carve blends away. */
-        const endFeather = 9;
+        const g = tabletopGeometry(f);
+        // The anchor is the LIP, snapped onto the route.
+        const sLip = routeDistanceOf(fx, fz);
 
-        forBox(fx, fz, reach, reach, (i, x, z) => {
-          const dx = x - fx;
-          const dz = z - fz;
-          const s = dx * dirX + dz * dirZ;
-          const u = Math.abs(dx * nrmX + dz * nrmZ);
-          if (u > halfW + 7) return;
-          if (s < -L * 0.5 - takeoff || s > L * 0.5 + landing) return;
+        // ── Stations along the route, 1 m apart, spanning the whole footprint.
+        const ST = 1;
+        const nSt = Math.round((g.sMax - g.sMin) / ST) + 1;
+        const stX = new Float64Array(nSt);
+        const stZ = new Float64Array(nSt);
+        const stNx = new Float64Array(nSt);
+        const stNz = new Float64Array(nSt);
+        const base = new Float64Array(nSt);
+        for (let k = 0; k < nSt; k++) {
+          routeAt(sLip + g.sMin + k * ST, _rf);
+          stX[k] = _rf.x;
+          stZ[k] = _rf.z;
+          stNx[k] = _rf.tz;   // left-hand normal in plan
+          stNz[k] = -_rf.tx;
+        }
 
-          let hh = 0;
-          if (s < -L * 0.5) {
-            const k = clamp01((s + L * 0.5 + takeoff) / takeoff);
-            // Concave kicker: exponent above 1 means it starts shallow and
-            // steepens into the lip.
-            hh = H * Math.pow(k, 1 + lip * 0.55);
-          } else if (s <= L * 0.5) {
-            hh = H;
-          } else {
-            const k = clamp01((s - L * 0.5) / landing);
-            hh = H * Math.pow(1 - k, 1.25);
+        // ── The fall line. Read BEFORE anything is written, three taps across
+        //    the corridor so a gully clipping one side does not drag the deck
+        //    down with it.
+        for (let k = 0; k < nSt; k++) {
+          let sum = 0;
+          for (let t = -1; t <= 1; t++) {
+            const o = t * 6;
+            sum += bilinearSample(
+              height, size,
+              w2g(stX[k] + stNx[k] * o),
+              w2g(stZ[k] + stNz[k] * o),
+            );
           }
-          const across = 1 - smoothstep(halfW, halfW + 6.5, u);
-          // Longitudinal feather. Without this the carve's authority went from
-          // 0.85 to 0 across a single texel at each end, which is the step the
-          // spline then tried to climb.
+          base[k] = sum / 3;
+        }
+        // Box-smooth: erosion chatter under a jump is noise, not terrain.
+        {
+          const rad = 10;
+          const tmp = base.slice();
+          for (let k = 0; k < nSt; k++) {
+            let sum = 0;
+            let n = 0;
+            for (let j = -rad; j <= rad; j++) {
+              sum += tmp[clamp(k + j, 0, nSt - 1)];
+              n++;
+            }
+            base[k] = sum / n;
+          }
+        }
+        // Gradient limit, forward and backward and averaged. Caps the fall line
+        // at 0.42 (23 degrees) and forbids it from CLIMBING at all: a jump built
+        // on a rising reference points its landing ramp back up the hill, which
+        // is the failure the old comment described and the old code caused.
+        {
+          const maxFall = 0.42 * ST;
+          const fwd = base.slice();
+          for (let k = 1; k < nSt; k++) {
+            const d = fwd[k] - fwd[k - 1];
+            if (d > 0) fwd[k] = fwd[k - 1];
+            else if (d < -maxFall) fwd[k] = fwd[k - 1] - maxFall;
+          }
+          const bwd = base.slice();
+          for (let k = nSt - 2; k >= 0; k--) {
+            const d = bwd[k] - bwd[k + 1];
+            if (d < 0) bwd[k] = bwd[k + 1];
+            else if (d > maxFall) bwd[k] = bwd[k + 1] + maxFall;
+          }
+          for (let k = 0; k < nSt; k++) base[k] = (fwd[k] + bwd[k]) * 0.5;
+        }
+
+        // ── Footprint AABB from the stations themselves.
+        const lateral = g.halfWidth + g.flank + 6;
+        let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
+        for (let k = 0; k < nSt; k++) {
+          if (stX[k] < bx0) bx0 = stX[k];
+          if (stX[k] > bx1) bx1 = stX[k];
+          if (stZ[k] < bz0) bz0 = stZ[k];
+          if (stZ[k] > bz1) bz1 = stZ[k];
+        }
+        const bcx = (bx0 + bx1) * 0.5;
+        const bcz = (bz0 + bz1) * 0.5;
+
+        forBox(bcx, bcz, (bx1 - bx0) * 0.5 + lateral, (bz1 - bz0) * 0.5 + lateral, (i, x, z) => {
+          // Project onto the station polyline: nearest station, then refined
+          // onto the adjoining segment so `s` is continuous. A station-quantised
+          // `s` would put a 1 m stair across the face.
+          let bk = 0;
+          let bd2 = Infinity;
+          for (let k = 0; k < nSt; k++) {
+            const ddx = stX[k] - x;
+            const ddz = stZ[k] - z;
+            const d2 = ddx * ddx + ddz * ddz;
+            if (d2 < bd2) { bd2 = d2; bk = k; }
+          }
+          let kf = bk;
+          let u = 0;
+          let segD2 = Infinity;
+          for (let j = -1; j <= 0; j++) {
+            const a = bk + j;
+            const b = a + 1;
+            if (a < 0 || b >= nSt) continue;
+            const sx = stX[b] - stX[a];
+            const sz = stZ[b] - stZ[a];
+            const l2 = sx * sx + sz * sz;
+            if (l2 < 1e-12) continue;
+            const t = clamp01(((x - stX[a]) * sx + (z - stZ[a]) * sz) / l2);
+            const cx2 = stX[a] + sx * t;
+            const cz2 = stZ[a] + sz * t;
+            const d2 = (x - cx2) * (x - cx2) + (z - cz2) * (z - cz2);
+            if (d2 < segD2) {
+              segD2 = d2;
+              kf = a + t;
+              const l = Math.sqrt(l2);
+              u = (x - cx2) * (sz / l) + (z - cz2) * (-sx / l);
+            }
+          }
+          const au = Math.abs(u);
+          if (au > lateral) return;
+
+          const s = g.sMin + kf * ST;
+          if (s <= g.sMin || s >= g.sMax) return;
+
+          // Lateral fall-off: the mound has real 31 degree sides, not a cliff.
+          const across = 1 - smoothstep(g.halfWidth, g.halfWidth + g.flank, au);
+          // Longitudinal blend into untouched ground. The profile is already
+          // zero at both ends, so this only feathers the FALL LINE correction.
           const along =
-            smoothstep(sUp, sUp + endFeather, s) * (1 - smoothstep(sDn - endFeather, sDn, s));
-          const w = across * along;
-          const ref = refAt(s);
-          const add = hh * across;
-          height[i] = lerp(height[i], ref + add, w * 0.85);
+            smoothstep(g.sMin, g.sMin + g.feather, s) *
+            (1 - smoothstep(g.sMax - g.feather, g.sMax, s));
+
+          const k0 = clamp(Math.floor(kf), 0, nSt - 1);
+          const k1 = Math.min(k0 + 1, nSt - 1);
+          const ref = lerp(base[k0], base[k1], kf - k0);
+          const add = tabletopProfile(g, s) * across;
+
+          // Not 1: a trace of the mountain's own surface survives on the mound,
+          // which is what stops a 40 x 60 m authored slab from reading as a
+          // different material to the hillside it is cut into.
+          const w = across * along * 0.95;
+          height[i] = lerp(height[i], ref + add, w);
           if (add > 0.35 && w > 0.4) mark(i, SurfaceKind.Dirt);
         });
         break;

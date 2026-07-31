@@ -1,13 +1,54 @@
 /**
- * Sky — gradient dome, two parallax layers of hard-edged cel cloud, a drawn
- * sun disc, and the geometric shaft volume that rakes through the tree line.
+ * Sky — banded gradient dome, three layers of INKED cel cloud, a drawn sun
+ * disc, and a quantised fan of sun shafts.
  *
  * The dome is a single inverted sphere locked to the camera. Every value in it
  * is banded: the vertical gradient steps between four plateaus rather than
- * blending, the clouds are alpha-cut with a two-value interior, and the sun
- * glow is a set of concentric hard rings rather than a falloff. A smooth sky
- * behind a banded mountain is the fastest way to break the illusion — the eye
- * reads the gradient as "3D render" instantly.
+ * blending, every cloud is an alpha-cut shape with a drawn contour and a
+ * three-value interior, and the sun glow is a set of concentric hard rings
+ * rather than a falloff. A smooth sky behind a banded mountain is the fastest
+ * way to break the illusion — the eye reads the gradient as "3D render"
+ * instantly.
+ *
+ * ── THE THREE DEFECTS THIS FILE WAS REBUILT AROUND ──────────────────────────
+ *
+ * 1. A DEAD-STRAIGHT FULL-WIDTH BAND ACROSS THE HORIZON. Measured at
+ *    treeline-silhouette as #faebdc held flat for ~190 rows, a 6-row ramp, and
+ *    #e0a277 flat below it, level across all 3200 px, slicing cloud blobs
+ *    along its top edge. Three separate causes, all of them in this file, none
+ *    of them SKY.horizonSharpness (which is declared in Palette.ts and read by
+ *    nothing at all):
+ *
+ *      a. The four gradient plateaus were positioned in raw dir.y with a
+ *         perturbation of +/-0.004 in elevation — 0.23 degrees, about 6 native
+ *         pixels. A boundary that moves 6 px over 3200 px IS a straight rule.
+ *      b. The uHorizon plateau spans dir.y 0.004..0.118, which is 6.6 degrees
+ *         of elevation — 190 native rows at this field of view — and NOTHING
+ *         was ever drawn inside it. A 190-row region of one flat colour
+ *         spanning the full frame width is a letterbox bar by construction, no
+ *         matter what the maths behind it was.
+ *      c. Both cloud layers were multiplied by smoothstep(0.028, 0.24, dir.y).
+ *         That is a smooth fade evaluated on a level dome coordinate, applied
+ *         to a HARD binary mask — so every cloud that reached the bottom of the
+ *         layer was sliced off along a horizontal line, and the flat bar
+ *         appeared to composite over the cloud.
+ *
+ *    The fixes, in the same order: the wander is now +/-2 degrees of
+ *    low-frequency world-locked noise on every boundary (below); a third cloud
+ *    layer — the horizon bank — is drawn INSIDE the plateau, so the region has
+ *    contours in it rather than being empty; and no cloud alpha is ever faded
+ *    by a function of dir.y again. Where a cloud layer has to leave the frame,
+ *    its THRESHOLD walks to 1.03 so the shape shrinks and closes with its hard
+ *    edge intact. Shapes that shrink cannot be sliced.
+ *
+ * 2. THE SUN SHAFTS WERE THE LARGEST SMOOTH GRADIENT IN THE GAME. See
+ *    buildShafts().
+ *
+ * 3. CLOUDS WERE UNLINED INK BLOTS. Flat fill, no contour, no lit/shadow
+ *    break. Every cloud is now drawn by celCloud(): a one-pixel ink contour
+ *    measured in true screen pixels, a sunlit cap, a flat body, and a shaded
+ *    underside — the three colours SKY.cloudLit / cloudMid / cloudShadow, in
+ *    the shapes an animator would put them in.
  */
 
 import {
@@ -22,20 +63,29 @@ import {
   LinearMipmapLinearFilter,
   Matrix4,
   Mesh,
-  MirroredRepeatWrapping,
   Object3D,
   PerspectiveCamera,
+  RepeatWrapping,
   ShaderMaterial,
   SphereGeometry,
+  Vector2,
   Vector3,
 } from 'three';
 import { GLSL_COMMON, GLSL_FRAG_OUT } from './ShaderChunks';
 import { NPR } from './NprGlobals';
-import { SKY, SUN_DIRECTION } from './Palette';
+import { INK, SKY, SUN_DIRECTION } from './Palette';
 import { celCloudMask } from './GeneratedTextures';
 
 /** Scratch for the per-frame sun projection. Module scope so update() never allocates. */
 const _sunWorld = new Vector3();
+
+/** Cloud mask edge length. The shader's LOD estimate must agree with this. */
+const CLOUD_TEX = 1024;
+
+/** A palette mix, evaluated once at construction. Never allocates per frame. */
+function mixed(a: Color, b: Color, t: number): Color {
+  return a.clone().lerp(b, t);
+}
 
 export class Sky {
   readonly group = new Object3D();
@@ -53,36 +103,43 @@ export class Sky {
     // horizon and with LinearFilter alone they had no mip chain at all, so the
     // pattern aliased against the pixel grid. The shader then re-thresholds the
     // filtered alpha so the contour goes back to being a hard cut.
-    const cloudNear = celCloudMask(1024, 'clouds-near', 0.46);
-    const cloudFar = celCloudMask(1024, 'clouds-far', 0.60);
-    for (const t of [cloudNear, cloudFar]) {
+    const cloudNear = celCloudMask(CLOUD_TEX, 'clouds-near', 0.33);
+    const cloudFar = celCloudMask(CLOUD_TEX, 'clouds-far', 0.38);
+    const cloudBank = celCloudMask(CLOUD_TEX, 'clouds-bank', 0.34);
+    for (const t of [cloudNear, cloudFar, cloudBank]) {
       t.minFilter = LinearMipmapLinearFilter;
       t.magFilter = LinearFilter;
       t.generateMipmaps = true;
       t.anisotropy = 8;
-      // ── THE MASK DOES NOT TILE ──────────────────────────────────────────────
-      // celCloudMask is generated from tileable noise but pushed through a
-      // domain warp that is not, and the result does not join up: put the sky
-      // debug view on the raw alpha and the cloud blobs are guillotined by a
-      // dead-straight line at u = 1. That discontinuity, exposed by a
-      // projection that reached |uv| = 1.4, is the hard vertical seam that has
-      // been splitting the sky. The primary fix is that the projection can no
-      // longer reach the tile edge at all — see cloudUv() in the shader.
+      // ── PLAIN REPEAT, AND WHY THAT IS NOW THE RIGHT CHOICE ─────────────────
+      // This was MirroredRepeatWrapping, chosen as insurance because
+      // celCloudMask did not tile: TileableNoise.fbm01 wrapped every octave on
+      // the GRID size while no octave's frequency divided it, so nothing closed
+      // over [0,1] and the mask was guillotined at u = 1.
       //
-      // MirroredRepeat is the guarantee behind it. The sample coordinate stays
-      // inside the tile, but a trilinear footprint at a high mip can still
-      // reach past it, and under mirrored repeat the sampled function is
-      // continuous at every fold by construction: the texel at 1 - e and the
-      // texel at 1 + e are the same texel, so there is nothing left that can be
-      // discontinuous. Done by the SAMPLER rather than by folding the uv in the
-      // shader, which matters — folding in the shader breaks the hardware
-      // derivative at each fold and trades one seam for a thinner one.
+      // TileableNoise has since been fixed to wrap each octave on its OWN
+      // frequency, and the repair is measured, not assumed:
+      // tools/capture/_masktile.mjs imports the real module through the dev
+      // server and compares the wrap-edge difference to an ordinary interior
+      // neighbour difference. It reports 1.4/255 across the seam against
+      // 0.2-4.2/255 inside the tile — the seam is indistinguishable from
+      // ordinary texture content, on a mask that is otherwise binary. It tiles.
       //
-      // The real repair belongs in celCloudMask and is reported separately.
-      t.wrapS = MirroredRepeatWrapping;
-      t.wrapT = MirroredRepeatWrapping;
+      // Mirrored repeat is now the WORSE option, because the projection below
+      // deliberately reaches past the tile: a mirror fold is a plane of exact
+      // reflective symmetry, and a symmetric sky is as obvious a rendering
+      // artefact as a seam. Plain repeat gives an unbounded, symmetry-free
+      // field, which is what lets the cloud scale go up by 2.5x — smaller,
+      // denser, more drawn forms, which is what the sky needs.
+      t.wrapS = RepeatWrapping;
+      t.wrapT = RepeatWrapping;
       t.needsUpdate = true;
     }
+
+    // The cloud ink. Rule 2 of Palette.ts: a shadow is a hue-rotated cousin of
+    // its lit band, never a multiply toward black — so the contour is the
+    // project ink warmed a third of the way toward the cloud's own shadow.
+    const cloudInk = mixed(INK, SKY.cloudShadow, 0.20);
 
     this.domeMat = new ShaderMaterial({
       glslVersion: GLSL3,
@@ -103,17 +160,34 @@ export class Sky {
         uCloudLit: { value: SKY.cloudLit.clone() },
         uCloudMid: { value: SKY.cloudMid.clone() },
         uCloudShadow: { value: SKY.cloudShadow.clone() },
+        uCloudInk: { value: cloudInk },
+        // The far layer is the same drawing seen through more air: every one of
+        // its four values is pulled toward the upper sky. Aerial perspective on
+        // a cel cloud is a palette shift, never an opacity.
+        uFarLit: { value: mixed(SKY.cloudLit, SKY.upper, 0.30) },
+        uFarMid: { value: mixed(SKY.cloudMid, SKY.upper, 0.44) },
+        uFarShadow: { value: mixed(SKY.cloudShadow, SKY.upper, 0.46) },
+        uFarInk: { value: mixed(cloudInk, SKY.upper, 0.38) },
+        // The horizon bank sits in the warm light, so it carries the horizon's
+        // own colours rather than the high sky's.
+        uBankLit: { value: mixed(SKY.cloudLit, SKY.sunGlow, 0.46) },
+        uBankMid: { value: mixed(SKY.cloudMid, SKY.horizon, 0.58) },
+        uBankShadow: { value: mixed(SKY.cloudShadow, SKY.belowHorizon, 0.52) },
+        uBankInk: { value: mixed(cloudInk, SKY.belowHorizon, 0.34) },
         uCloudNear: { value: cloudNear },
         uCloudFar: { value: cloudFar },
-        uCloudDrift: { value: 0 },
+        uCloudBank: { value: cloudBank },
+        /** Contour width in device pixels. A drawn line, not a derived one. */
+        uInkPx: { value: 2.4 },
         uInvProjection: { value: new Matrix4() },
         uCamWorld: { value: new Matrix4() },
         /**
-         * Sky debug view. 0 off, 1 near-cloud alpha, 2 far-cloud alpha,
-         * 3 near uv tile, 4 mask detail. Kept in the shipping shader on
-         * purpose: every sky defect this file has had was a question about one
-         * scalar field, and answering it by commenting out lines and reloading
-         * is how you end up shipping the wrong hypothesis.
+         * Sky debug view. 0 off, 1 near alpha, 2 far alpha, 3 bank alpha,
+         * 4 the boundary wander field, 5 mask detail, 6 the raw tile.
+         * Kept in the shipping shader on purpose: every sky defect this file
+         * has had was a question about one scalar field, and answering it by
+         * commenting out lines and reloading is how you end up shipping the
+         * wrong hypothesis.
          */
         uSkyDebug: { value: 0 },
       },
@@ -141,13 +215,18 @@ export class Sky {
         uniform vec2  uResolution;
         uniform vec3  uZenith, uUpper, uHorizon, uBelow;
         uniform vec3  uSunDisc, uSunGlow;
-        uniform vec3  uCloudLit, uCloudMid, uCloudShadow;
+        uniform vec3  uCloudLit, uCloudMid, uCloudShadow, uCloudInk;
+        uniform vec3  uFarLit, uFarMid, uFarShadow, uFarInk;
+        uniform vec3  uBankLit, uBankMid, uBankShadow, uBankInk;
         uniform sampler2D uCloudNear;
         uniform sampler2D uCloudFar;
-        uniform float uCloudDrift;
+        uniform sampler2D uCloudBank;
+        uniform float uInkPx;
         uniform mat4  uInvProjection;
         uniform mat4  uCamWorld;
         uniform float uSkyDebug;
+
+        const float CLOUD_TEX = ${CLOUD_TEX}.0;
 
         // Local band helper — the dome doesn't pull in the full cel core.
         float bandStepS(float x, float threshold, float softness) {
@@ -167,20 +246,16 @@ export class Sky {
          * problem is its DERIVATIVE. Linear interpolation is only piecewise
          * linear, so d(dir)/d(pixel) is CONSTANT within a triangle and JUMPS
          * across every triangle edge. Every fwidth() in this shader, and — far
-         * more damaging — the mip level the GPU picks for the two cloud masks,
-         * is computed from exactly that derivative. So at every meridian of the
+         * more damaging — the mip level the GPU picks for the cloud masks, is
+         * computed from exactly that derivative. So at every meridian of the
          * dome the sampled mip level stepped by a notch, the filtered cloud
-         * alpha stepped with it, and the hard bandStepS(alpha, 0.52) threshold
-         * turned that step into a total flip: solid cloud sheet on one side,
-         * clear sky on the other.
+         * alpha stepped with it, and the hard threshold turned that step into a
+         * total flip: solid cloud sheet on one side, clear sky on the other.
          *
          * A meridian of a sphere centred on the camera is a plane through the
          * camera, and a plane through the camera projects to a perfectly
          * straight line. That is the "razor-straight vertical line at x = 1105
-         * with warmer sky to its right", the pair of them 27 pixels apart in
-         * tabletop-air where two meridians converge near the top of the frame,
-         * and the rectangular blocking in summit-wide and valley-vista where
-         * one met the horizon plateau at a right angle.
+         * with warmer sky to its right".
          *
          * Reconstructing the ray from gl_FragCoord instead makes it an exact,
          * analytic function of the pixel — smooth to every order, identical
@@ -194,115 +269,132 @@ export class Sky {
         }
 
         /**
-         * How well the cloud mask resolves at this pixel, 1 = crisply, 0 = the
-         * sampler is returning the mask's mean and there is no contour left.
+         * THE STEREOGRAPHIC PLANE. Every world-locked field in this shader —
+         * both cloud projections, the horizon bank, and the boundary wander —
+         * is a function of this and nothing else.
          *
-         * This is the second half of the seam fix and it is needed even with a
-         * perfect view ray. A tileable mask compresses toward the horizon until
-         * one texel covers many pixels; the filtered alpha then converges on the
-         * mask's AVERAGE, and re-thresholding an average at a fixed 0.52 gives
-         * either total coverage or none, over a whole region, decided by which
-         * side of 0.52 the average happens to fall. That is how a flat lavender
-         * sheet of uCloudShadow ended up covering a third of the sky.
-         */
-        float cloudDetail(vec2 uv) {
-          vec2 d = fwidth(uv) * 1024.0;
-          float lod = log2(max(max(d.x, d.y), 1e-4));
-          return 1.0 - saturate1((lod - 3.2) / 2.6);
-        }
-
-        /**
-         * THE CLOUD PROJECTION, AND WHY IT IS BOUNDED.
-         *
-         * dir.xz / (dir.y + k) with k = 0.30 reaches a magnitude of 1/k = 3.33
-         * at the horizon, and at a uv scale of 0.42 that put the near layer's
-         * coordinate up to 1.4 — well past the edge of the mask's own tile.
-         * The mask is generated by celCloudMask and it does NOT tile: put the
-         * sky debug view on the raw alpha and the cloud blobs are guillotined
-         * by a dead-straight line where the coordinate crosses an integer. That
-         * line is the intersection of a plane with the view sphere, which is
-         * why it draws as a perfectly straight rule through the sky rather than
-         * as anything organic, and it is the seam the critic traced.
-         *
-         * k = 1.0 makes this the STEREOGRAPHIC projection of the sky sphere
-         * from its south pole. Three properties, all of which matter:
+         * dir.xz / (dir.y + 1) is the stereographic projection of the sky
+         * sphere from its south pole. Three properties, all of which matter:
          *
          *  - Its magnitude is exactly 1.0 at the horizon and 0 at the zenith.
-         *    Bounded, over the entire upper hemisphere, with no tuning. At a
-         *    scale of 0.38 the coordinate can never leave [0.12, 0.88] of the
-         *    tile, in any camera orientation, ever. There is no boundary left
-         *    for the mask's own discontinuity to be exposed at.
-         *  - It is CONFORMAL. Angles are preserved exactly, so the cloud shapes
-         *    are never sheared or smeared — only uniformly scaled. That is not
-         *    true of the old projection and it is the difference between clouds
-         *    that compress toward the horizon and clouds that streak into it.
+         *    Bounded over the entire upper hemisphere with no tuning, and — the
+         *    part that matters most — SINGULARITY-FREE at the horizon, where
+         *    the old dir.xz / dir.y form ran away and beat the mask against the
+         *    pixel grid into a rectangular lattice.
+         *  - It is CONFORMAL. Angles are preserved exactly, so cloud shapes are
+         *    never sheared or smeared — only uniformly scaled.
          *  - Its scale factor is 1/(1 + dir.y): half at the zenith, one at the
-         *    horizon. Cloud shapes therefore still get finer with distance,
-         *    which is the perspective read the parallax exists for, just at a
-         *    2x ratio rather than the old 4.3x.
+         *    horizon, so shapes still get finer with distance.
          *
-         * The two layers use different k so they still separate in depth.
-         *
-         * The drift is a slow bounded oscillation rather than a linear
-         * translation for the same reason the projection is bounded: a linear
-         * drift walks the coordinate out of the safe tile and re-exposes the
-         * seam, and it does it after a few minutes of play rather than
-         * immediately, which is worse. The periods here are 12 and 16 minutes,
-         * so within any shot the motion is a constant-velocity drift.
+         * It is no longer BOUNDED INSIDE THE TILE, and that is deliberate. The
+         * containment (scale 0.46, so the coordinate could never leave
+         * [0.12, 0.88]) existed only because the mask did not tile; the agent
+         * who wrote it said so and flagged the restriction as undesirable.
+         * TileableNoise is fixed and the tiling is measured, so the scale is
+         * now free and the clouds are 2.4x denser.
          */
-        vec2 cloudUv(vec3 dir, float k, float scale, vec2 drift) {
-          return (dir.xz / (dir.y + k)) * scale + vec2(0.5) + drift;
+        vec2 domeSp(vec3 dir) {
+          return dir.xz / (dir.y + 1.0);
         }
 
         /**
-         * A projection of the view direction onto a plane above the camera,
-         * shared by the gradient's boundary wobble and both cloud layers.
+         * THE BOUNDARY WANDER, AND THE FIRST HALF OF THE LEVEL-BAR FIX.
          *
-         * Dividing by (dir.y + k) rather than by dir.y is the whole fix for the
-         * cloud seam. The old form was singular at the horizon: as dir.y fell
-         * toward its clamp the uv magnitude ran away, the tileable mask
-         * repeated faster than one pixel could resolve, and the repeats beat
-         * against the pixel grid into a hard rectangular lattice across the
-         * lower sky. Adding k keeps the identical perspective read — overhead
-         * clouds large, horizon clouds compressed — while the mapping stays
-         * finite, single-valued and C-infinity over the entire upper
-         * hemisphere. There is no wrap anywhere in it, so there is no seam.
+         * Every plateau boundary in the gradient, and every envelope that
+         * decides where a cloud layer stops, is displaced by this field. It is
+         * a function of the stereographic plane, so it is locked to the WORLD:
+         * the wander does not slide along the edge when the camera pans, which
+         * is what separates "the edge of a wash" from "a shader effect".
+         *
+         * The amplitude is the whole point. The previous build perturbed the
+         * horizon boundary by +/-0.004 in dir.y. That is 0.23 degrees of
+         * elevation, six native pixels over a 3200-pixel frame, and the critic
+         * correctly measured the result as a screen-space letterbox bar. The
+         * amplitudes below are 15-20x that: +/-2 degrees, +/-60 native pixels,
+         * with a long swell and a shorter brush ripple on top of it. No
+         * boundary in this sky can be traced as a level rule any more.
          */
-        vec2 domePlane(vec3 dir, float k) {
-          return dir.xz / (dir.y + k);
+        float wanderField(vec2 sp) {
+          float swell  = fbm2(sp * 2.15 + 11.0, 3) - 0.5;
+          float ripple = fbm2(sp * 6.30 + 41.0, 2) - 0.5;
+          return swell * 0.76 + ripple * 0.24;
         }
 
         /**
-         * Banded vertical gradient. Four plateaus, hard boundaries.
+         * How well a cloud mask resolves at this pixel, 1 = crisply, 0 = the
+         * sampler is returning the mask's mean and there is no contour left.
          *
-         * Two defects fixed here, both visible at the horizon.
-         *
-         * The bands are now positioned directly in dir.y. The previous form ran
-         * dir.y through pow(x, 0.72) of a shifted range, and that has an
-         * INFINITE derivative at x = 0 — precisely where the sharpest boundary
-         * in the whole sky sits. fwidth() blew up there, so the one transition
-         * that most needed antialiasing was the one that could not get any.
-         *
-         * And the boundary perturbation is now low-frequency and locked to the
-         * world instead of a per-pixel screen-space hash. The reason to perturb
-         * a plateau edge is to stop it drawing a mathematically straight rule
-         * across a clear sky; a slow wander does that and reads as the edge of
-         * a brushstroke. A per-pixel hash does it by converting the edge into a
-         * thirty-pixel band of speckle — which is exactly what the "heavy
-         * dither near the horizon" was.
+         * A tileable mask compresses with distance until one texel covers many
+         * pixels; the filtered alpha then converges on the mask's AVERAGE, and
+         * re-thresholding an average at a fixed value gives either total
+         * coverage or none over a whole region, decided by which side of the
+         * threshold the average happens to fall.
          */
-        vec3 skyGradient(vec3 dir, vec2 fc) {
+        float cloudDetail(vec2 uv) {
+          vec2 d = fwidth(uv) * CLOUD_TEX;
+          float lod = log2(max(max(d.x, d.y), 1e-4));
+          return 1.0 - saturate1((lod - 4.1) / 3.0);
+        }
+
+        /**
+         * THE HORIZON BANK PROJECTION.
+         *
+         * The same stereographic plane, with its RADIAL coordinate compressed
+         * about the horizon circle. Compressing radially stretches the sampled
+         * pattern tangentially, so the mask's round blobs come out as long,
+         * flat-bottomed strips lying along the horizon — the shape language of
+         * low stratus, and pointedly NOT the shape language of the terrain,
+         * which was the critic's complaint about the round clouds.
+         *
+         * It is seamless by construction. r is never 0 in the band this layer
+         * occupies (r = 1 at the horizon, and the layer is gone by r = 0.85),
+         * and the azimuthal path is a closed loop in tile space, so it is
+         * automatically periodic in azimuth with no wrap anywhere in it.
+         */
+        vec2 bankUv(vec2 sp, float scale, float stretch, vec2 drift) {
+          float r = max(length(sp), 1e-3);
+          vec2 n = sp / r;
+          // EXPANDING the radial coordinate about the horizon circle (stretch
+          // greater than one) compresses the sampled pattern across the band
+          // while leaving it untouched along it, so a round blob comes out as a
+          // long flat strip. Getting this the wrong way round is a mistake
+          // worth flagging: a stretch BELOW one elongates the features
+          // radially instead and the layer draws as vertical curtains hanging
+          // out of the sky, which is exactly what it did on the first pass.
+          //
+          // At scale 1.27 / stretch 4.0 a mask feature lands at roughly 260 x
+          // 70 native pixels: a 3.7:1 strip, which is the aspect low stratus
+          // actually has. The envelope in clouds() has the layer gone by 7.5
+          // degrees of elevation, well before the radial term could reach zero
+          // (which would need 19 degrees), so the map is single-valued and
+          // finite everywhere the layer is visible.
+          float rq = 1.0 + (r - 1.0) * stretch;
+          return n * rq * scale + vec2(0.5) + drift;
+        }
+
+        /**
+         * Banded vertical gradient. Four plateaus, hard boundaries, every one
+         * of them displaced by the wander field.
+         *
+         * The bands are positioned directly in dir.y. A previous form ran dir.y
+         * through pow(x, 0.72) of a shifted range, and that has an INFINITE
+         * derivative at x = 0 — precisely where the sharpest boundary in the
+         * whole sky sits. fwidth() blew up there, so the one transition that
+         * most needed antialiasing was the one that could not get any.
+         */
+        vec3 skyGradient(vec3 dir, vec2 sp, float wander, vec2 fc) {
           float h = dir.y;
 
-          // World-locked, roughly four cycles around the horizon. Locked to the
-          // world and not to the screen so the wander does not slide along the
-          // band edge when the camera pans.
-          float wob = fbm2(domePlane(dir, 0.62) * 2.6, 3) - 0.5;
+          // Different amplitudes per boundary so the three edges never run
+          // parallel — parallel edges read as a printing error.
+          float hHorizon = h + wander * 0.075;
+          float hUpper   = h + wander * 0.105;
+          float hZenith  = h + wander * 0.150;
 
           vec3 col = uBelow;
-          col = mix(col, uHorizon, bandStepS(h + wob * 0.008, 0.004, 0.0018));
-          col = mix(col, uUpper,   bandStepS(h + wob * 0.022, 0.118, 0.0022));
-          col = mix(col, uZenith,  bandStepS(h + wob * 0.036, 0.500, 0.0030));
+          col = mix(col, uHorizon, bandStepS(hHorizon, 0.018, 0.0018));
+          col = mix(col, uUpper,   bandStepS(hUpper,   0.140, 0.0022));
+          col = mix(col, uZenith,  bandStepS(hZenith,  0.500, 0.0030));
 
           // Warm plateaus hugging the horizon on the sun side. Dawn light does
           // not wrap a sky evenly, and a gradient that is symmetric in azimuth
@@ -310,30 +402,25 @@ export class Sky {
           //
           // THE SOFTNESS HERE IS THE WHOLE POINT. This used to be a single
           // bandStepS(toward, 0.28, 0.16) — a softness two orders of magnitude
-          // wider than the 0.0018-0.0030 used by the vertical bands directly
-          // above. The result was a sky whose HEIGHT was banded and whose
-          // AZIMUTH was a smooth yellow-to-orange ramp spanning half the frame,
-          // which is the exact photographic gradient the banding exists to
-          // avoid. Two plateaus at the band softness put the azimuthal falloff
-          // on the same footing as the vertical one.
+          // wider than the ones used by the vertical bands directly above. The
+          // result was a sky whose HEIGHT was banded and whose AZIMUTH was a
+          // smooth yellow-to-orange ramp spanning half the frame, which is the
+          // exact photographic gradient the banding exists to avoid.
           //
           // The boundary is a line of constant azimuth, which projects to a
-          // straight vertical rule on screen, so it gets the same world-locked
-          // low-frequency wander the horizontal boundaries get — a hard edge
-          // that wanders reads as the edge of a wash, a hard edge that is
-          // mathematically straight reads as a broken renderer.
+          // straight vertical rule on screen, so it gets its own wander for
+          // the same reason the horizontal boundaries do.
           vec2 az    = normalize(dir.xz + vec2(1e-5, 0.0));
           vec2 sunAz = normalize(uSunDir.xz + vec2(1e-5, 0.0));
           float toward = saturate1(dot(az, sunAz));
-          float wobA = fbm2(domePlane(dir, 0.62) * 3.1 + 17.0, 3) - 0.5;
-          float tw = toward + wobA * 0.045;
-          float low = 1.0 - bandStepS(h + wob * 0.022, 0.086, 0.0025);
+          float wobA = fbm2(sp * 3.1 + 17.0, 3) - 0.5;
+          float tw = toward + wobA * 0.055;
+          float low = 1.0 - bandStepS(hUpper, 0.115, 0.0025);
           col = mix(col, mix(col, uSunGlow, 0.24), low * bandStepS(tw, 0.20, 0.0060) * 0.55);
           col = mix(col, mix(col, uSunGlow, 0.34), low * bandStepS(tw, 0.62, 0.0055) * 0.55);
 
-          // A whisper of ordered noise, an order of magnitude below the old
-          // dither. This exists only to break 8-bit banding INSIDE a plateau
-          // and is far too small to disturb a boundary.
+          // A whisper of ordered noise. This exists only to break 8-bit banding
+          // INSIDE a plateau and is far too small to disturb a boundary.
           col += (hash21(fc) - 0.5) * 0.0022;
           return col;
         }
@@ -341,15 +428,11 @@ export class Sky {
         /**
          * Concentric hard rings around the sun. An animator draws a low sun as
          * a disc plus two or three discrete haloes; a radial falloff is a
-         * photograph. This is the former.
+         * photograph. This is the former — every ring softness sits inside the
+         * same 0.002-0.01 window the sky bands use.
          */
         vec3 sunDisc(vec3 dir, vec3 col) {
           float d = dot(dir, uSunDir);
-          // Every ring softness is inside the same 0.002-0.01 window the sky
-          // bands use. ring3 was 0.028 — five times ring2's — and that single
-          // number turned the outermost halo into a photographic glow: a soft
-          // radial falloff sitting in the middle of a sky built entirely from
-          // hard plateaus. An animator draws three haloes, not a gradient.
           float disc  = bandStepS(d, 0.99955, 0.00008);
           float ring1 = bandStepS(d, 0.9975, 0.0009);
           float ring2 = bandStepS(d, 0.988,  0.0040);
@@ -361,100 +444,182 @@ export class Sky {
           return col;
         }
 
-        /**
-         * Two cloud layers at different parallax depths. The far layer drifts
-         * at a third the speed of the near one, which is what gives a flat dome
-         * genuine depth without a single triangle of geometry.
-         *
-         * WHY THE ALPHA IS RE-THRESHOLDED. The mask is now mip-mapped, which is
-         * what removed the aliasing lattice — but a filtered hard-edged mask is
-         * a SOFT-edged mask, and a soft cloud is the one thing an anime sky
-         * never has. So we filter to kill the aliasing and then put the hard
-         * contour straight back with a step whose width is the screen-space
-         * derivative of the alpha. The edge is therefore exactly one pixel wide
-         * at any distance: cut paper up close, cut paper at the horizon, no
-         * shimmer in between.
-         *
-         * WHAT THE THRESHOLD NOW DOES WHERE THE MASK STOPS RESOLVING. It walks
-         * to 1.03 — above anything the mask can return — so as detail is lost
-         * the cloud CONTOUR SHRINKS AND CLOSES rather than the coverage
-         * flipping to fully-on or fully-off across whatever line the filtered
-         * average happened to cross 0.52 on. Two properties matter here and
-         * only this form has both: the edge stays a hard cut at every step of
-         * the way, and the layer leaves the frame by getting smaller, which is
-         * what distance does to a cloud. Fading its alpha instead would make it
-         * translucent, and a translucent cloud is not a cel cloud.
-         */
-        vec3 clouds(vec3 dir, vec3 col) {
-          float h = dir.y;
-          if (h < -0.06) return col;
+        // ── THE INKED CEL CLOUD ───────────────────────────────────────────────
+        //
+        // A drawn cloud is four things and the old one had exactly one of them:
+        //
+        //   1. A HARD CONTOUR whose width is constant in SCREEN pixels at any
+        //      distance. Not a threshold on a filtered alpha, which is a soft
+        //      edge dressed up as a hard one.
+        //   2. AN INK LINE ON THAT CONTOUR. This is the single biggest reason
+        //      the old clouds read as Rorschach blots: an unlined shape has no
+        //      authorship. Ink is what says a hand drew it.
+        //   3. A LIT CAP AND A SHADED UNDERSIDE, as flat regions with hard
+        //      boundaries — not a gradient, and not a per-texel noise value.
+        //   4. A LIGHT DIRECTION the break actually obeys.
+        //
+        // The contour is measured properly. s = alpha - threshold is a scalar
+        // field whose zero set is the outline; dividing s by the length of its
+        // screen-space gradient converts it to a SIGNED DISTANCE IN PIXELS,
+        // exactly, at any minification. Everything else keys off that number:
+        // the shape is the region where it is positive, the ink is the first
+        // uInkPx pixels inside, and both stay razor-sharp from a cloud
+        // overhead to one on the skyline. Where the mask has gone flat the
+        // gradient goes to zero, the distance goes to infinity, and the layer
+        // simply resolves to "inside" or "outside" with no shimmer.
 
+        /** x = coverage 0..1, y = ink 0..1, z = signed pixel distance. */
+        vec3 cutMask(sampler2D tex, vec2 uv, float thr) {
+          float s = texture(tex, uv).a - thr;
+          float g = max(length(vec2(dFdx(s), dFdy(s))), 1e-7);
+          float dpx = s / g;
+          float inside = smoothstep(-0.75, 0.75, dpx);
+          float ink = inside * (1.0 - smoothstep(uInkPx, uInkPx + 1.3, dpx));
+          return vec3(inside, ink, dpx);
+        }
+
+        /** Binary interior test for the light-break probes. No AA wanted. */
+        float insideAt(sampler2D tex, vec2 uv, float thr) {
+          return step(thr, texture(tex, uv).a);
+        }
+
+        /**
+         * The three-value interior.
+         *
+         * Marching the mask TOWARD the sun and asking "how far can I go before
+         * I leave the shape" is a depth-from-the-lit-edge measurement, and the
+         * band it produces is a lit CAP of controlled width on the sun side
+         * only — which is how an animator paints a cloud. Deriving the break
+         * from the mask's own interior value instead (which is what the old
+         * one did) gives a break whose shape is whatever the noise gradient
+         * happened to be, unrelated to the light, and speckled at the detail
+         * frequency.
+         *
+         * The same probe run backwards gives the shaded underside. Hot cap on
+         * the sun side, cool cut on the far side, flat body in between, ink all
+         * the way round: three texture fetches and one drawn cloud.
+         */
+        vec3 celCloud(
+          sampler2D tex, vec2 uv, vec2 toSun, float thr,
+          vec3 lit, vec3 mid, vec3 shd, vec3 ink, out float alpha
+        ) {
+          vec3 m = cutMask(tex, uv, thr);
+          alpha = m.x;
+          float capOut   = 1.0 - insideAt(tex, uv + toSun * 2.5, thr);
+          float bellyOut = 1.0 - insideAt(tex, uv - toSun * 1.7, thr);
+          vec3 c = mid;
+          c = mix(c, shd, bellyOut);   // within reach of the shaded edge
+          c = mix(c, lit, capOut);     // the sunlit cap wins over it
+          c = mix(c, ink, m.y);
+          return c;
+        }
+
+        /**
+         * Three cloud layers at different parallax depths.
+         *
+         * NOTHING IN HERE FADES ON dir.y. That is not a style choice, it is the
+         * third cause of the horizontal bar: the old layers were multiplied by
+         * smoothstep(0.028, 0.24, dir.y), a smooth ramp on a level dome
+         * coordinate applied to a binary mask, which sliced every cloud that
+         * reached the bottom of the layer along a horizontal line and left a
+         * flat plateau underneath.
+         *
+         * Where a layer has to end, its THRESHOLD walks to 1.03 — above
+         * anything the mask can return. The contour therefore SHRINKS AND
+         * CLOSES with its hard edge intact, which is what distance does to a
+         * cloud, instead of the coverage flipping across a line. And the
+         * envelope that drives the walk carries the same world-locked wander
+         * the gradient boundaries do, so even the density falloff is not level.
+         *
+         * The drift is a slow bounded oscillation rather than a linear
+         * translation. Periods here are 12 and 16 minutes, so within any shot
+         * the motion is an ordinary constant-velocity drift.
+         */
+        vec3 clouds(vec3 dir, vec2 sp, float wander, vec3 col) {
+          float h = dir.y;
           float t = uTime;
 
-          // ── Far layer: flatter, duller, slower. Depth cue only. ──
-          vec2 driftFar = vec2(sin(t * 0.0052), sin(t * 0.0041 + 2.1)) * 0.026;
-          vec2 uvFar = cloudUv(dir, 1.35, 0.58, driftFar);
-          vec4 far = texture(uCloudFar, uvFar);
-          float thrFar = mix(1.03, 0.52, cloudDetail(uvFar));
-          float aFar   = bandStepS(far.a, thrFar, 0.0020);
-          float litFar = bandStepS(far.r, 0.80, 0.0020);
-          float fadeFar = smoothstep(0.012, 0.20, h);
-          col = mix(col, mix(uCloudShadow, uCloudMid, litFar), aFar * 0.56 * fadeFar);
+          // The sun's own position on the stereographic plane. "Toward the sun"
+          // is then just the direction to that point, which is correct
+          // everywhere on a conformal map and rotates with the sun for free.
+          vec2 sunSp = uSunDir.xz / (uSunDir.y + 1.0);
+          vec2 toSun = normalize(sunSp - sp + vec2(1e-5, 0.0));
 
-          // ── Near layer ──
-          vec2 driftNear = vec2(sin(t * 0.0087), sin(t * 0.0068 + 0.7)) * 0.030;
-          vec2 uvNear = cloudUv(dir, 1.00, 0.46, driftNear);
-          vec4 near = texture(uCloudNear, uvNear);
-          float thrNear = mix(1.03, 0.52, cloudDetail(uvNear));
-          float aNear   = bandStepS(near.a, thrNear, 0.0020);
-          float litNear = bandStepS(near.r, 0.80, 0.0020);
-          float fadeNear = smoothstep(0.028, 0.24, h);
+          float alpha;
 
-          // The hot sunward rim, built DIRECTIONALLY rather than from the
-          // alpha ramp. Probing the mask a short step toward the sun's azimuth
-          // and asking "is that point outside the cloud?" gives a rim of a
-          // controlled, constant width on the sun side only — which is how an
-          // animator inks a cloud. Deriving it from the alpha ramp instead
-          // gives a rim whose width is whatever the noise gradient happens to
-          // be, and it appears all the way round the contour.
-          vec2 sunStep = normalize(uSunDir.xz + vec2(1e-5, 0.0)) * 0.0075;
-          float aheadA = texture(uCloudNear, uvNear + sunStep).a;
-          float rim = aNear * (1.0 - bandStepS(aheadA, thrNear, 0.0020));
+          // ── Far layer: finer, paler, slower. Depth cue only. ──
+          vec2 driftFar = vec2(sin(t * 0.0052), sin(t * 0.0041 + 2.1)) * 0.030;
+          vec2 uvFar = (dir.xz / (dir.y + 1.18)) * 2.60 + vec2(0.5) + driftFar;
+          float liveFar = saturate1((h + wander * 0.09 + 0.010) / 0.150);
+          float thrFar = mix(1.03, 0.50, cloudDetail(uvFar) * liveFar);
+          vec3 cFar = celCloud(
+            uCloudFar, uvFar, toSun * 0.014, thrFar,
+            uFarLit, uFarMid, uFarShadow, uFarInk, alpha
+          );
+          col = mix(col, cFar, alpha * 0.82);
 
-          vec3 nearCol = mix(uCloudShadow, uCloudLit, litNear);
-          nearCol = mix(nearCol, uCloudLit * 1.16, rim * 0.85);
-          // The same probe run in the opposite direction gives the shadowed
-          // edge. Hot rim on the sun side, cool cut on the far side, flat
-          // two-value body in between: that is a cel cloud, and it is three
-          // texture fetches.
-          float behindA = texture(uCloudNear, uvNear - sunStep).a;
-          float shade = aNear * (1.0 - bandStepS(behindA, thrNear, 0.0020)) * (1.0 - rim);
-          nearCol = mix(nearCol, uCloudShadow * 0.88, shade * 0.60);
+          // ── Near layer: the drawing. ──
+          vec2 driftNear = vec2(sin(t * 0.0087), sin(t * 0.0068 + 0.7)) * 0.034;
+          vec2 uvNear = sp * 1.70 + vec2(0.5) + driftNear;
+          float liveNear = saturate1((h + wander * 0.10 + 0.004) / 0.135);
+          float thrNear = mix(1.03, 0.50, cloudDetail(uvNear) * liveNear);
+          vec3 cNear = celCloud(
+            uCloudNear, uvNear, toSun * 0.020, thrNear,
+            uCloudLit, uCloudMid, uCloudShadow, uCloudInk, alpha
+          );
+          col = mix(col, cNear, alpha);
 
-          col = mix(col, nearCol, aNear * 0.90 * fadeNear);
+          // ── Horizon bank: the drawing that lives INSIDE the old flat bar. ──
+          //
+          // This layer exists for one reason. dir.y 0.030..0.140 is 6.3 degrees
+          // of elevation, 180 native rows at this field of view, and it used to
+          // contain one flat colour across the entire frame width. A region
+          // that large with nothing drawn in it IS a letterbox bar; there is no
+          // amount of edge-wander that fixes an empty plateau. So the plateau
+          // is where the low stratus goes.
+          //
+          // Its envelope peaks a degree or two above the skyline and is gone by
+          // 8 degrees, and — like everything else here — the envelope drives a
+          // THRESHOLD, so the strips thin out and close rather than being cut.
+          vec2 driftBank = vec2(sin(t * 0.0031 + 1.4), sin(t * 0.0026 + 3.3)) * 0.016;
+          vec2 uvBank = bankUv(sp, 1.06, 4.00, driftBank);
+          float hb = h + wander * 0.085;
+          float bankIn  = saturate1((hb + 0.055) / 0.045);
+          float bankOut = 1.0 - saturate1((hb - 0.015) / 0.115);
+          float liveBank = bankIn * bankOut;
+          float thrBank = mix(1.03, 0.46, cloudDetail(uvBank) * liveBank);
+          vec3 cBank = celCloud(
+            uCloudBank, uvBank, toSun * 0.016, thrBank,
+            uBankLit, uBankMid, uBankShadow, uBankInk, alpha
+          );
+          col = mix(col, cBank, alpha * 0.95);
+
           return col;
         }
 
         void main() {
           vec3 dir = viewRay();
           vec2 fc = gl_FragCoord.xy;
+          vec2 sp = domeSp(dir);
+          float wander = wanderField(sp);
+
+          vec3 col = skyGradient(dir, sp, wander, fc);
+          col = sunDisc(dir, col);
+          col = clouds(dir, sp, wander, col);
 
           if (uSkyDebug > 0.5) {
-            vec2 uvN = cloudUv(dir, 1.00, 0.46, vec2(0.0));
-            vec2 uvF = cloudUv(dir, 1.35, 0.58, vec2(0.0));
+            vec2 uvN = sp * 1.70 + vec2(0.5);
+            vec2 uvF = (dir.xz / (dir.y + 1.18)) * 2.60 + vec2(0.5);
+            vec2 uvB = bankUv(sp, 1.06, 4.00, vec2(0.0));
             vec3 d = vec3(0.0);
             if (uSkyDebug < 1.5)      d = vec3(texture(uCloudNear, uvN).a);
             else if (uSkyDebug < 2.5) d = vec3(texture(uCloudFar, uvF).a);
-            else if (uSkyDebug < 3.5) d = vec3(fract(uvN), 0.0);
-            else if (uSkyDebug < 4.5) d = vec3(cloudDetail(uvN));
-            else d = vec3(texture(uCloudNear, gl_FragCoord.xy / uResolution).a);
-            fragColor = vec4(d, 1.0);
-            return;
+            else if (uSkyDebug < 3.5) d = vec3(texture(uCloudBank, uvB).a);
+            else if (uSkyDebug < 4.5) d = vec3(wander + 0.5);
+            else if (uSkyDebug < 5.5) d = vec3(cloudDetail(uvN));
+            else d = vec3(texture(uCloudNear, fc / uResolution).a);
+            col = d;
           }
-
-          vec3 col = skyGradient(dir, fc);
-          col = sunDisc(dir, col);
-          col = clouds(dir, col);
 
           fragColor = vec4(col, 1.0);
         }
@@ -472,51 +637,49 @@ export class Sky {
   }
 
   /**
-   * God rays as explicit geometry.
+   * God rays as explicit geometry — a quantised fan, not a bloom.
    *
-   * ── WHAT WAS WRONG ──────────────────────────────────────────────────────────
-   * The previous build drew nine long quads in raw clip space at z = 0.999 with
-   * depthTest off. Three separate defects fell out of that, and they are worth
-   * naming because each one has a different cause:
+   * ── DEFECT: THE SHAFTS WERE THE LARGEST SMOOTH GRADIENT IN THE GAME ────────
+   * Two independent faults, and the visual one is not the interesting one.
    *
-   *  1. A HARD VERTICAL SEAM SPLITTING THE SKY. The quads were laterally
-   *     OFFSET from the sun (`off = (t - 0.5) * 2.2`) rather than radiating
-   *     from it, so their edges were not rays — they were near-parallel bands.
-   *     The first shaft's angle, -1.9 rad, is 71 degrees from horizontal, and
-   *     the hard `across` cut at 0.62..0.92 therefore drew a near-vertical rule
-   *     from the top of the frame down to mid-height with warmer sky on one
-   *     side of it. Nothing about that reads as light. It reads as a torn
-   *     framebuffer, which is exactly how the critic described it.
+   * 1. THE RADIAL PROFILE WAS A 74%-OF-LENGTH SMOOTH RAMP.
+   *      radial = smoothstep(0.015, 0.16, t) * (1.0 - smoothstep(0.26, 1.0, t))
+   *    Every other value in this game is quantised — four terrain bands, four
+   *    sky plateaus, three cloud values, a hard-thresholded bloom. A continuous
+   *    ramp 0.74 of a shaft long, on the widest object in the frame, was
+   *    therefore the ONLY smooth gradient left in the picture, and the eye goes
+   *    straight to it. It is now three hard radial steps and a hard terminal
+   *    cut, crossed with three hard angular wedges: nine flat values per shaft,
+   *    every boundary a drawn line.
    *
-   *  2. RECTANGULAR BLOCKING WITH TRUE 90-DEGREE CORNERS. Where a quad's hard
-   *     side cut met the frame edge, or met the `along` taper, the two straight
-   *     boundaries crossed at a right angle. A right angle in a sky is always a
-   *     bug: there is no physical or graphic reason for one to exist.
+   * 2. THE APEX WAS NOT WHERE THE COMMENT SAID IT WAS, WHICH IS WHY THEY LAY
+   *    ACROSS THE SLOPES. The previous build put the apex at
    *
-   *  3. A FULL-FRAME ADDITIVE WASH OVER THE RIDERS. Each quad ran 2.4 clip
-   *     units — more than the entire height of the screen — with depth testing
-   *     disabled, so pale wedges lay across the riders, the shadow field and
-   *     the whole lower frame.
+   *        vec3 apex = uSunView * uShaftDist;    // uShaftDist = 850
    *
-   * ── WHAT IT IS NOW ──────────────────────────────────────────────────────────
-   * A true fan of angular wedges sharing ONE apex, placed in the WORLD at a
-   * fixed distance along the sun direction, depth-tested against the scene.
+   *    and turned depth testing on, on the stated reasoning that a fan 850 m
+   *    away is behind the mid-ground and would be occluded by it. But that
+   *    expression does not put the apex 850 m away along the VIEW axis; it puts
+   *    it 850 m along the SUN direction, so its view-space depth is
+   *    850 * |sunView.z| — and sunView.z is only -1 when you are staring
+   *    straight into the sun. The gate that enables the effect admits anything
+   *    down to sunView.z = -0.08, so the fan was routinely drawn at a depth of
+   *    68 metres. Every slope beyond 68 m failed to occlude it. The flag was
+   *    right and the geometry was in the wrong place.
    *
-   *  - Sharing an apex means every edge in the effect is a ray through the sun.
-   *    A ray through the sun is the one straight line in a sky that reads
-   *    unambiguously as light, and it is impossible for two of them to meet at
-   *    a right angle.
-   *  - The wedge is built from an ANGLE, so its sides stay hard and straight —
-   *    it is still a flat-shaded quadrilateral of light, not a bloom — while
-   *    the radial profile fades to nothing well inside the geometry. The
-   *    polygon boundary is therefore never the visible boundary, at any edge.
-   *  - Placing the apex at ~850 m in view space and turning depth testing ON is
-   *    what removes the wash entirely. Riders, bikes, trail and mid-ground
-   *    terrain all sit in front of it and occlude it exactly. The shafts can
+   *    apex is now built so that apex.z is EXACTLY -uShaftDist whatever the sun
+   *    is doing, by scaling along the sun direction until it reaches that
+   *    plane. At 900 m the entire tree line, every rider, the trail and all
+   *    mid-ground terrain sit in front of it and cut it exactly. The shafts can
    *    only ever paint sky, which is the brief's "shafts through the tree
-   *    line": the trees cut them, they do not cut the trees.
+   *    line": the trees cut them, they do not cut the trees. It is also what
+   *    keeps them off the subject — a rider is never 900 m from the camera.
+   *
+   * The fan still shares ONE apex, because a ray through the sun is the one
+   * straight line in a sky that reads unambiguously as light, and it is
+   * impossible for two of them to meet at a right angle.
    */
-  buildShafts(count = 7): void {
+  buildShafts(count = 5): void {
     const positions: number[] = [];
     const uvs: number[] = [];
     const seeds: number[] = [];
@@ -524,21 +687,22 @@ export class Sky {
     const halves: number[] = [];
     const lens: number[] = [];
 
-    // The fan sweeps a 130-degree arc centred on straight down, so a sun above
+    // The fan sweeps a 118-degree arc centred on straight down, so a sun above
     // the frame rakes into the picture and a sun near the horizon still throws
     // its outermost shafts along the ridge line rather than into the ground.
     const FAN_CENTRE = -Math.PI * 0.5;
-    const FAN_SPREAD = 1.14;
+    const FAN_SPREAD = 1.03;
 
     for (let i = 0; i < count; i++) {
       const t = (i + 0.5) / count;
       // A deterministic, irrational-ish jitter so the fan is not a metronome.
       const j = Math.sin(i * 12.9898) * 43758.5453;
-      const jitter = (j - Math.floor(j) - 0.5) * (FAN_SPREAD / count) * 0.55;
+      const jitter = (j - Math.floor(j) - 0.5) * (FAN_SPREAD / count) * 0.65;
       const angle = FAN_CENTRE + (t - 0.5) * 2 * FAN_SPREAD + jitter;
       // Alternating thick/thin, which is how a background painter spaces them.
-      const half = (i & 1) === 0 ? 0.030 + t * 0.026 : 0.055 + t * 0.038;
-      const len = (i & 1) === 0 ? 1.35 - t * 0.30 : 0.95 - t * 0.22;
+      // Narrower than before: these are strokes of light, not floodlights.
+      const half = (i & 1) === 0 ? 0.022 + t * 0.016 : 0.036 + t * 0.024;
+      const len = (i & 1) === 0 ? 1.05 - t * 0.24 : 0.74 - t * 0.16;
 
       // One triangle per shaft: the apex on the sun, two corners at the tip.
       // position.x is the angular parameter (-1..1), position.y the radial one.
@@ -567,7 +731,8 @@ export class Sky {
       glslVersion: GLSL3,
       transparent: true,
       depthWrite: false,
-      // ON. This single flag is what stops the shafts washing the foreground.
+      // ON. Together with the corrected apex depth below, this is what stops
+      // the shafts washing the foreground.
       depthTest: true,
       blending: AdditiveBlending,
       side: DoubleSide,
@@ -575,12 +740,14 @@ export class Sky {
       uniforms: {
         uTime: NPR.uTime,
         uResolution: NPR.uResolution,
-        uColor: { value: new Color(0xffd9a0) },
+        uColor: { value: SKY.sunGlow.clone() },
+        uEdge: { value: SKY.sunDisc.clone() },
         uIntensity: { value: 0.0 },
         /** Sun direction in VIEW space. The apex sits along it. */
         uSunView: { value: new Vector3(0, 0, -1) },
-        /** How far down the sun direction the fan is anchored, metres. */
-        uShaftDist: { value: 850 },
+        /** VIEW-SPACE DEPTH of the fan plane, metres. Not a distance along the
+         *  sun ray — see the header. Everything nearer than this occludes it. */
+        uShaftDist: { value: 900 },
       },
       vertexShader: /* glsl */ `
         precision highp float;
@@ -597,17 +764,26 @@ export class Sky {
           vUv = uv;
           vSeed = aSeed;
 
-          // The apex, in view space, exactly along the sun direction — so it
-          // projects to exactly the sun's screen position, whatever the lens.
-          vec3 apex = uSunView * uShaftDist;
+          // The apex, in view space, ON the sun ray and ON the z = -uShaftDist
+          // plane. Scaling the sun direction until it reaches that plane is
+          // what makes the depth test mean what the header says it means; the
+          // previous build multiplied the direction by the distance instead,
+          // which put the plane anywhere from 72 m to 900 m depending on where
+          // the camera happened to be looking.
+          //
+          // It still projects to exactly the sun's screen position, whatever
+          // the lens, because the apex is still on the sun ray.
+          float toward = min(uSunView.z, -0.08);
+          vec3 apex = uSunView * (uShaftDist / -toward);
 
           // Half the screen height, in view units, at the apex's depth. Working
           // through this rather than through the aspect ratio means the fan
           // angles are true screen angles and the shafts are the same length
-          // relative to the frame on any window shape.
-          float halfH = abs(apex.z) / max(projectionMatrix[1][1], 1e-4);
+          // relative to the frame on any window shape. It is now constant,
+          // since apex.z is.
+          float halfH = uShaftDist / max(projectionMatrix[1][1], 1e-4);
 
-          float drift = sin(uTime * 0.17 + aSeed * 7.0) * 0.022;
+          float drift = sin(uTime * 0.17 + aSeed * 7.0) * 0.018;
           float a = aAngle + drift + position.x * aHalf;
           vec2 d = vec2(cos(a), sin(a));
 
@@ -620,32 +796,64 @@ export class Sky {
         ${GLSL_COMMON}
         ${GLSL_FRAG_OUT}
         uniform vec3 uColor;
+        uniform vec3 uEdge;
         uniform float uIntensity;
         uniform float uTime;
         in vec2  vUv;
         in float vSeed;
-        void main() {
-          // ACROSS: two flat values with hard cuts, painted not blurred. The
-          // outer cut sits at 0.82 of the wedge's angular half-width, so the
-          // triangle's own edge at 1.0 carries zero alpha and can never be the
-          // edge you see.
-          float across = abs(vUv.x - 0.5) * 2.0;
-          float w = max(fwidth(across), 0.0035);
-          float body = 1.0 - smoothstep(0.82 - w, 0.82 + w, across);
-          float core = 1.0 - smoothstep(0.36 - w, 0.36 + w, across);
 
-          // ALONG: on at the sun, off well before the tip. This is the only
-          // soft term in the shaft and it runs down the LENGTH, where a light
-          // shaft genuinely does thin out — never across it, where an animator
-          // would keep the cut.
+        // A hard step whose transition is exactly one pixel wide, and a line of
+        // the same width centred on it. Everything in this shader is built from
+        // these two: there is no smooth term anywhere in the effect.
+        float hstep(float x, float e) {
+          float w = max(fwidth(x) * 0.8, 0.0012);
+          return smoothstep(e - w, e + w, x);
+        }
+        float hline(float x, float e, float halfWidth) {
+          float w = max(fwidth(x) * 0.8, 0.0010);
+          return smoothstep(e - halfWidth - w, e - halfWidth + w, x)
+               * (1.0 - smoothstep(e + halfWidth - w, e + halfWidth + w, x));
+        }
+
+        void main() {
+          // ── ACROSS: three nested wedges, three flat values, drawn edges. ──
+          // The outermost cut sits at 0.86 of the triangle's angular half-width
+          // so the polygon's own edge at 1.0 carries zero alpha and can never
+          // be the edge you see.
+          float across = abs(vUv.x - 0.5) * 2.0;
+          float w1 = 1.0 - hstep(across, 0.30);
+          float w2 = 1.0 - hstep(across, 0.60);
+          float w3 = 1.0 - hstep(across, 0.86);
+          float wedge = 0.34 * w3 + 0.30 * w2 + 0.36 * w1;
+
+          // ── ALONG: three flat segments and a hard terminal cut. ──
+          // This replaces a smoothstep ramp that ran 74% of the shaft's length
+          // and was, after everything else in the game was quantised, the
+          // largest smooth gradient in the frame.
           float t = vUv.y;
-          float radial = smoothstep(0.015, 0.16, t) * (1.0 - smoothstep(0.26, 1.0, t));
+          float seg = 1.0 - 0.30 * hstep(t, 0.30) - 0.34 * hstep(t, 0.56);
+          float live = hstep(t, 0.045) * (1.0 - hstep(t, 0.80));
+          float radial = seg * live;
+
+          // ── DRAWN EDGES. A hot line on each wedge boundary and on the tip. ──
+          // A painted shaft has an inked side; without these the wedges are
+          // just three flat values butted together and the effect reads as
+          // banding rather than as drawing.
+          float edges =
+              hline(across, 0.86, 0.006)
+            + hline(across, 0.60, 0.005) * 0.75
+            + hline(across, 0.30, 0.004) * 0.55;
+          edges *= live;
+          float tip = hline(t, 0.80, 0.010) * w3 * 0.6;
 
           // Slow breathing so the shafts feel like light through moving canopy.
-          float breathe = 0.74 + 0.26 * sin(uTime * 0.55 + vSeed * 9.1);
-          float a = (body * 0.55 + core * 0.45) * radial * breathe * uIntensity;
-          if (a < 0.003) discard;
-          fragColor = vec4(uColor * a, a);
+          float breathe = 0.78 + 0.22 * sin(uTime * 0.55 + vSeed * 9.1);
+
+          float a = wedge * radial * breathe * uIntensity;
+          float e = (edges + tip) * breathe * uIntensity * 0.9;
+          if (a + e < 0.0025) discard;
+          vec3 c = uColor * a + uEdge * e;
+          fragColor = vec4(c, a + e);
         }
       `,
     });
@@ -657,6 +865,11 @@ export class Sky {
     this.shafts.userData.skipPrepass = true;
     this.shafts.userData.skipShadow = true;
     this.group.add(this.shafts);
+  }
+
+  /** Debug view on the dome. See the uSkyDebug uniform for the modes. */
+  setDebug(mode: number): void {
+    this.domeMat.uniforms.uSkyDebug.value = mode;
   }
 
   /**
@@ -671,6 +884,11 @@ export class Sky {
     // not optional bookkeeping — they ARE the sky's geometry.
     (this.domeMat.uniforms.uInvProjection.value as Matrix4).copy(camera.projectionMatrixInverse);
     (this.domeMat.uniforms.uCamWorld.value as Matrix4).copy(camera.matrixWorld);
+
+    // The ink contour is authored in device pixels, so it has to know how many
+    // device pixels there are. Reads the same uResolution the pipeline sets.
+    const res = NPR.uResolution.value as Vector2;
+    this.domeMat.uniforms.uInkPx.value = res.y > 1400 ? 2.6 : 1.7;
 
     if (this.shaftMat) {
       // Sun direction in view space. Reused, never reallocated.
@@ -690,10 +908,10 @@ export class Sky {
       const edge = Math.max(Math.abs(p.x), Math.abs(p.y));
       const gate = inFront ? 1 - Math.min(1, Math.max(0, (edge - 0.92) / 0.26)) : 0;
 
-      // 0.34 rather than 1.0: these are an accent in the sky, not an exposure
-      // event. At the old scale a single shaft added more light to the frame
-      // than the sun disc itself.
-      const target = gate * sunVisibility * 0.34;
+      // 0.24, and it is additive on top of an already-lit sky: these are an
+      // accent, not an exposure event. At the original scale a single shaft
+      // added more light to the frame than the sun disc itself.
+      const target = gate * sunVisibility * 0.24;
       const cur = this.shaftMat.uniforms.uIntensity.value as number;
       this.shaftMat.uniforms.uIntensity.value = cur + (target - cur) * 0.06;
     }

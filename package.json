@@ -3,14 +3,15 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Cel-shaded downhill BMX racing — zero external assets, everything generated in code.",
+  "description": "Cel-shaded downhill BMX racing \u2014 zero external assets, everything generated in code.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "node tools/check-glsl.mjs && tsc --noEmit && vite build",
     "preview": "vite preview --port 4173",
     "typecheck": "tsc --noEmit",
     "capture": "node tools/capture/capture.mjs",
-    "capture:install": "playwright install chromium"
+    "capture:install": "playwright install chromium",
+    "check:glsl": "node tools/check-glsl.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"

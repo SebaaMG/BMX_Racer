@@ -40,6 +40,7 @@ import {
   ClampToEdgeWrapping,
   DataTexture,
   NearestFilter,
+  NearestMipmapNearestFilter,
   RedFormat,
   UnsignedByteType,
 } from 'three';
@@ -472,25 +473,171 @@ function despeckle(zone: Uint8Array, size: number): void {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * The shader-samplable zone map.
+ * Tie-break order for the majority filter, most durable first.
  *
- * NearestFilter and no mipmaps, both mandatory. Interpolating a material INDEX
- * is meaningless — halfway between rock (0) and grass (2) is dirt (1), so a
- * linear filter would draw a one-texel stripe of dirt along every rock/grass
- * boundary in the world. Mipmaps would do the same thing at distance, and worse,
- * would do it differently at every LOD.
+ * A 2x2 block that splits two-two has no majority, and which of the two wins
+ * decides what a thin feature looks like from a kilometre away. Water and trail
+ * are RIBBONS one or two texels wide — the stream and the course — and if they
+ * lose every tie they evaporate at the second mip level and the valley loses
+ * both its river and its road. Snow and rock are the two kinds that carry the
+ * mountain's silhouette. Grass and dirt are the background field and can afford
+ * to give way, because there is always more of them.
+ */
+const MIP_PRIORITY: SurfaceKind[] = [
+  SurfaceKind.Water,
+  SurfaceKind.Trail,
+  SurfaceKind.Snow,
+  SurfaceKind.Rock,
+  SurfaceKind.Scree,
+  SurfaceKind.Dirt,
+  SurfaceKind.Grass,
+];
+
+/**
+ * A MAJORITY mip chain over the zone map.
+ *
+ * This is the single most important thing in this file, and it is not an
+ * optimisation — it is the only way a nearest-sampled material index can
+ * survive minification.
+ *
+ * The zone map is a 2 m grid of material INDICES. It cannot be linearly
+ * filtered (halfway between rock 0 and grass 2 is dirt 1) and it cannot be
+ * box-mipped for the same reason, so the shipping code sampled level 0 and
+ * tried to tame the resulting aliasing by snapping the LOOKUP to a
+ * power-of-two texel block sized from the screen-space derivative. That works
+ * exactly until the block size hits its clamp. Past that the block is smaller
+ * than a screen pixel, adjacent pixels resolve to blocks several apart, and the
+ * far field breaks into hard alternating stripes of two completely different
+ * ramps — the orange-and-lavender television static covering every oblique
+ * slope in these frames, and, on the summit, the white stipple that made the
+ * snowfields look like splatter.
+ *
+ * A majority filter is the correct reduction for an index field: it answers
+ * "what is this hillside made of" rather than "what is the average of these
+ * four material numbers", which is a meaningless question. Each level is the
+ * modal kind of its 2x2 parent, ties broken by MIP_PRIORITY, so a stream stays
+ * a stream all the way out and a snowfield minifies into a single flat shape
+ * with a drawn edge instead of dissolving into pepper.
+ *
+ * The chain is built lazily off `texture.version` (see makeZoneTexture) so the
+ * track carve, which rewrites texels and sets needsUpdate, cannot leave the
+ * coarse levels describing the mountain as it was before the trail was cut.
+ */
+export function buildZoneMips(
+  zone: Uint8Array,
+  size: number,
+): { data: Uint8Array; width: number; height: number }[] {
+  const levels: { data: Uint8Array; width: number; height: number }[] = [
+    { data: zone, width: size, height: size },
+  ];
+
+  const rank = new Int32Array(ZONE_KIND_COUNT);
+  for (let r = 0; r < MIP_PRIORITY.length; r++) rank[MIP_PRIORITY[r]] = r;
+
+  let src = zone;
+  let n = size;
+  while (n > 1) {
+    const m = n >> 1;
+    const dst = new Uint8Array(m * m);
+    for (let z = 0; z < m; z++) {
+      const r0 = (z * 2) * n;
+      const r1 = r0 + n;
+      const drow = z * m;
+      for (let x = 0; x < m; x++) {
+        const x0 = x * 2;
+        const a = src[r0 + x0];
+        const b = src[r0 + x0 + 1];
+        const c = src[r1 + x0];
+        const d = src[r1 + x0 + 1];
+
+        // Four samples: the mode is decided by hand rather than with a tally
+        // array, because this loop runs about five and a half million times at
+        // boot and an Int32Array.fill() per texel is most of that cost.
+        let best = a;
+        let bestN = 1;
+        // a's count
+        let cn = 1 + (b === a ? 1 : 0) + (c === a ? 1 : 0) + (d === a ? 1 : 0);
+        bestN = cn;
+        if (b !== a) {
+          cn = 1 + (c === b ? 1 : 0) + (d === b ? 1 : 0);
+          if (cn > bestN || (cn === bestN && rank[b] < rank[best])) {
+            best = b;
+            bestN = cn;
+          }
+        }
+        if (c !== a && c !== b) {
+          cn = 1 + (d === c ? 1 : 0);
+          if (cn > bestN || (cn === bestN && rank[c] < rank[best])) {
+            best = c;
+            bestN = cn;
+          }
+        }
+        if (d !== a && d !== b && d !== c) {
+          if (1 > bestN || (1 === bestN && rank[d] < rank[best])) {
+            best = d;
+            bestN = 1;
+          }
+        }
+        dst[drow + x] = best;
+      }
+    }
+    levels.push({ data: dst, width: m, height: m });
+    src = dst;
+    n = m;
+  }
+  return levels;
+}
+
+/**
+ * The shader-samplable zone map, with its majority mip chain attached.
+ *
+ * NearestMipmapNearest and NEVER a linear filter in either direction:
+ * interpolating a material INDEX is meaningless — halfway between rock (0) and
+ * grass (2) is dirt (1), so a linear filter would draw a one-texel stripe of
+ * dirt along every rock/grass boundary in the world. The mip chain is not
+ * three's (which is a box filter, and therefore that same average by another
+ * name) but the majority chain above, uploaded by hand.
+ *
+ * `mipmaps` is an ACCESSOR keyed to the texture's own version counter. three
+ * reads it once per upload, and the only writer of the zone field —
+ * `applyTrackCarve` — signals its edits the only way three understands, by
+ * setting needsUpdate. Rebuilding on read is therefore the one place that
+ * cannot be forgotten, and it costs nothing on the frames where nothing
+ * changed.
  */
 export function makeZoneTexture(zone: Uint8Array, size: number): DataTexture {
   const tex = new DataTexture(zone, size, size, RedFormat, UnsignedByteType);
-  tex.minFilter = NearestFilter;
+  tex.minFilter = NearestMipmapNearestFilter;
   tex.magFilter = NearestFilter;
   tex.wrapS = ClampToEdgeWrapping;
   tex.wrapT = ClampToEdgeWrapping;
   tex.generateMipmaps = false;
   tex.flipY = false;
   tex.name = 'terrain:zone';
+
+  let built = -1;
+  let chain: { data: Uint8Array; width: number; height: number }[] = [];
+  Object.defineProperty(tex, 'mipmaps', {
+    configurable: true,
+    get(): { data: Uint8Array; width: number; height: number }[] {
+      if (built !== tex.version) {
+        chain = buildZoneMips(zone, size);
+        built = tex.version;
+      }
+      return chain;
+    },
+    set(): void {
+      /* three assigns [] in the Texture constructor and on copy; ignored. */
+    },
+  });
+
   tex.needsUpdate = true;
   return tex;
+}
+
+/** Deepest mip level of the zone chain — log2(size). The shader clamps to it. */
+export function zoneMipLevels(size: number): number {
+  return Math.round(Math.log2(size));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

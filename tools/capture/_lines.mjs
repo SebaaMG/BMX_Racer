@@ -9,7 +9,8 @@ const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1600, height: 900 }, deviceScaleFactor: 2 });
 const page = await ctx.newPage();
 await page.goto('http://127.0.0.1:5173/?capture=1&pr=2', { waitUntil: 'load' });
-await page.waitForFunction(() => window.__DESCENT__ && window.__DESCENT__.game, { timeout: 60000 });
+await page.waitForFunction(() => !!window.__DESCENT__?.game?.capture, null, { timeout: 240000 });
+await page.evaluate(() => window.__DESCENT__.game.capture.takeControl());
 await page.evaluate((p) => window.__DESCENT__.game.capture.setPose(p), pose);
 const ok = await page.evaluate((m) => {
   const p = window.__DESCENT__.game.post;

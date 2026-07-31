@@ -607,6 +607,27 @@ export class BikePhysics {
     // ── Attitude control ────────────────────────────────────────────────────
     if (s.mode === BikeMode.Crashing) {
       this.updateCrash(dt);
+    } else if (s.mode === BikeMode.Recovering) {
+      // A rider picking themselves up does not resume race pace on the frame
+      // the tumble ends.
+      //
+      // `updateCrash` applies a strong horizontal ground friction; Recovering
+      // applied NONE and ran the full grounded control laws instead, so the
+      // instant the mode flipped the bike got full grip and gravity accelerated
+      // it down the hill. Measured on the crash capture: 29.7 km/h bleeding
+      // correctly to 0.7 while crashing, then JUMPING to 7.0 km/h one mode
+      // change later and reading as a crash that speeds up. That is the
+      // "+9 km/h while still lying on their side" the motion review caught.
+      //
+      // The drag ramps out across the recovery, so the bike is rolling normally
+      // by the time control returns rather than being released like a catapult.
+      const remain = 1 - clamp01(s.modeTime / Math.max(BODY_TUNE.recoverTime, 1e-3));
+      if (this.front.grounded || this.rear.grounded) {
+        _v.copy(s.velocity);
+        _v.y = 0;
+        this.force.addScaledVector(_v, -this.mass * 2.6 * remain);
+      }
+      this.controlGrounded(input, dt, this.groundRef);
     } else if (grounded) {
       this.controlGrounded(input, dt, this.groundRef);
     } else {

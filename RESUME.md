@@ -194,72 +194,127 @@ but safely on disk.
 
 ---
 
-## Critic pass 1 — stills (run 2026-07-31, full 16-frame set)
+## Where it stands
 
-Verdict: **none of the sixteen frames met the bar.** Full defect list is in the
-session; the code-level findings that were verified and FIXED:
+Three critic passes run (2 stills, 1 motion... then a 3rd stills + 2nd motion).
+Six specialist agents completed a repair round; seven more are running as of
+this writing. `npx tsc --noEmit` clean between agent edits. The game boots and
+plays end to end.
 
-- **F1 `applyQuantizedFog` multiplied the discrete plateau strength by the
-  continuous `t`** — restoring a gradient and defeating the entire "quantised
-  atmospheric depth" feature. One multiply. Removed.
-- **F2 Terrain shadow acne** rendered as hard corduroy because the two-step
-  penumbra quantisation turns dithered acne into a deliberate-looking pattern.
-  Root cause: constant world bias (0.045 m) is hopeless against a 21.5° sun.
-  Replaced with **normal-offset bias** + new `uShadowTexelWorld` uniform.
-  (The critic also claimed quantisation ran before the cascade blend — it did
-  not. That part of the diagnosis was wrong.)
-- **F3 Terrain read as a smooth gradient.** Two causes: squared half-Lambert
-  compressed the terrain's real N·L window into one band, and the ambient
-  bounce was tinted by a *continuous* `N.y`. Fixed with an exposure remap
-  (`ndlRaw * 1.15 + 0.16`), shadow applied as a band-index step-down instead of
-  a pre-ramp multiply, and `upness` quantised to 3 steps.
-- **F4 Sawtooth trail edge.** The trail zone was stamped by thresholding the
-  *height blend* weight, which falls off along-track between carve samples —
-  so the material boundary dipped once per sample. Now stamped from lateral
-  distance only, strictly inside the ribbon mesh.
-- **Zone classification**: snow blanketed the 630 m technical start. Added
-  slope-shed + sun-aspect scour to the snow rule (snow 8.3% → 3.3%, rock
-  46% → 49.3%); exempted snow from the deposition-fan override (the "orange
-  splats"); start plateau now marks Rock, not Dirt.
-- **Capture harness**: contact sheets embedded 30 retina PNGs in one page and
-  killed the renderer, taking the rest of the run with it. Now downscales one
-  frame at a time in-browser; sheet failures are non-fatal.
+**Both critics still say: zero of 16 stills and 1 of 8 sequences meet the bar.**
+(`launch` is the one sequence a critic passed outright.) Two stills are called
+"close enough that the gap is nameable": `rider-closeup` (the RIDER and BIKE
+meet the bar; the terrain behind them does not) and `crash` (composition good,
+disqualified by a ghosted AI pack and missing ridge ink).
 
-### Still open from critic pass 1 (not yet fixed)
-- Riders unidentifiable past ~40 px — no rim/saturation floor at distance.
-- Cast shadows missing on several riders entirely; soft blobs where present.
-- **Terrain has no silhouette outline** — ridgelines against sky are unlined
-  (terrain carries no hull, and Sobel has no depth discontinuity there).
-- Sky dome rectangular seam artefacts, top centre; sky gradient is continuous,
-  not four plateaus.
-- Palette drift: dirt reads hotter than authored; vignette multiplies toward
-  black instead of tinting toward `GRADE.shadowTint`.
-- Dead uniform stroke weight — no visible curvature/distance taper.
-- Outline tears: bike-detail right shoulder; a stray hairline from the rider to
-  the frame edge in switchback-lean (loose hull vertex).
-- **HUD text collisions** — "DESCENT PROFILE" over "TECHNICAL START" in 5+
-  frames, triple overlap in streambed. Shipping blocker.
-- Composition: finish gate occluded by a rival; horizons on the centre line.
-- **Capture poses are offset by ~one course section** — `crash` shows no crash,
-  `tabletop-air` shows no jump, `streambed` shows no water. Half the review set
-  is not testing what it claims. Fix the `t` values in `SITUATIONS` in Game.ts.
-- Ribbon skirt spikes as triangular teeth on steep cross-slopes.
-- Terrain interior Sobel lines are drawing the 2 m height-texel grid as
-  staircases across the snow.
+---
 
-## Next actions, in order
+## The bugs that mattered most, and what they teach
 
-1. **Terrain zone classification** — get rock on the technical start, kill the
-   dirt splats, make the boundaries read as deliberate hard cel edges.
-2. **Terrain cel banding** — the mountain must show 3–4 hard bands. This is the
-   single highest-leverage fix in the project.
-3. **Shadows onto the terrain.**
-4. **Quantised fog** so far ridges stack as flat paper layers.
-5. **Trail carve staircase** — decide ribbon-authoritative vs higher-res carve.
-6. **Wire the FX** so dust and speed lines actually fire.
-7. **Stand up both critic agents** and start the `/loop` cycles.
-8. **Play the bike** and tune `BODY_TUNE` for feel.
-9. Performance pass to locked 60 fps at retina.
+Written down because every one of them was invisible to typechecking, invisible
+to "does it run", and only fell out of MEASURING something.
 
-Self-assessment at pause: **~60% of the bar.** The skeleton is complete and the
-character work is genuinely good; the mountain it sits on is the problem.
+1. **`Game.render` fed a dimensionless multiplier where a frame delta was
+   expected.** `Effects.beginFrame` returned `timeScale`, not a scaled dt. The
+   entire visual half of the game advanced ONE SECOND per rendered frame
+   (`uFxTime` read 92 after 90 frames). Three agents found it independently.
+   It explains most of critic pass 1: the rig converging in two frames then
+   freezing, the landing stagger collapsing, and dust being emitted, pooled and
+   killed before surviving a single draw.
+2. **`applyTrackCarve` used `if (w > weight[k])` against a weight that
+   saturates at 1.0**, with carve points 3.5 m apart. Five or six consecutive
+   points tied at exactly 1.0; the strict `>` kept whichever was visited first;
+   the loop runs uphill-to-downhill. Every texel took its height from up to 5 m
+   back UP the course. Error -3.11..+5.00 m became -0.39..-0.01 m.
+3. **`TrackSpline.carveTabletop` added the mound height twice at one index** —
+   two loops sharing endpoint `iTake`. 4.2 m of rise inside a 0.5 m plan step =
+   83 degrees, which arc-length resampling then smeared into a centreline that
+   was MULTIVALUED IN XZ. No heightfield can represent that, so the physics saw
+   a mesa where the mesh drew a ramp and the bike fell through the mountain.
+4. **`TileableNoise` never tiled.** `fbm01` wrapped on grid size while no octave
+   frequency divided it (base: freqs 5,10,20,40,80 against a 32 lattice). Every
+   "tileable" texture in the project had a seam at u=1 and v=1.
+5. **The sky seam was the view ray's DERIVATIVE.** `vDir` was
+   `normalize(position)` interpolated across the dome's triangles. The direction
+   was fine; its derivative is piecewise-constant and jumps at every triangle
+   edge — and the GPU picks the cloud mip level from exactly that. A dome
+   meridian is a plane through the camera, so it projects to a dead-straight
+   line.
+6. **`applyQuantizedFog` multiplied the discrete plateau by the continuous t**,
+   restoring the gradient the quantisation existed to remove. AND the plateau
+   boundaries sat at 560/1175/1855 m while every shot occupies 200-900 m, so
+   nothing could ever cross one. Fixing only the first would have changed
+   nothing — which is what the critic caught on the next pass.
+7. **Net roll stiffness was ~zero.** The balance loop's `inertiaRoll * leanKp`
+   (2368 N.m/rad) was cancelled almost exactly by the gravitational tipping
+   moment `m*g*h` (2415). Roll was a free integrator; the first bump decided
+   which way the bike went. 27 degrees of lean with the stick centred.
+8. **Capture poses spawned the bike origin at the trail SURFACE**, but the
+   origin sits on the axle line one wheel radius above whatever it stands on.
+   Both wheels spawned 0.27 m underground, the suspension answered with ~14 kN,
+   and every frame ever captured was shot from a bike that had been launched.
+   No wheel ever touched the ground, so no tyre force ever solved and no dust
+   ever emitted.
+9. **Water declared `specPower: 160` at a 21.5 degree sun** where N.H tops out
+   near 0.4. `pow(0.4, 160)` is zero to every float in the machine. The stream
+   carried a full specular declaration that could never produce a lit pixel.
+10. **The terrain palette drain.** `plate` saturated at 0.43 by 58 m, mixing
+    26.6% pure cool SKY_BOUNCE into everything beyond; and `upness` quantised
+    `N.y = 1` to exactly 1.0, so on flat ground the bounce was pure sky and the
+    warm GROUND_BOUNCE could never contribute. Together they drained ~half the
+    committed chroma and rotated the trail hue up to 50 degrees off gold, past
+    red into magenta. The stills critic proved the LUT was NOT at fault by
+    re-running it by hand, then hand-propagated the authored colour through
+    these two lines and matched the measured screen pixel to within 3/255.
+
+### Standing rules this project learned the hard way
+- **NEVER put a backtick inside a GLSL template-literal comment.** It
+  terminates the template and breaks the TS parse with a cryptic error hundreds
+  of lines away. Cost three cycles. Now a build error: `npm run check:glsl`,
+  wired into `npm run build`.
+- Three.js GLSL3 emits NO `pc_fragColor` and NO `gl_FragColor` alias. Every
+  fragment shader declares its own output via the `GLSL_FRAG_OUT` chunk.
+- **Critics are excellent at FINDING defects and unreliable at ATTRIBUTING
+  them.** Every agent that dug in disproved part of its own brief — the sky
+  seam was not the shafts, the camera collapse was an opponent in the lens, the
+  trail sawtooth was ink not geometry. Always re-derive the cause.
+- **Agents measure in isolation and can be wrong about the shipped build.** The
+  camera agent measured a 254 px subject; the motion critic measured 110-150 px
+  in the actual captures. Verify through the real path.
+
+---
+
+## Critic pass 3 (stills) + pass 2 (motion) — open defects
+
+Ranked. Seven agents are working these now; anything still open when they
+report goes back on this list.
+
+- Terrain: the LARGEST surfaces still carry no bands (a column scan of the
+  `treeline-silhouette` dune found 90 distinct values over 420 rows and zero
+  hard steps).
+- Ridgeline contour ink is an intermittent 1-px hairline that DROPS OUT
+  mid-ridge (dips to lum 112 on one segment, 0 on the adjacent one; INK is 25).
+- Nested concentric arcs / comb ripples over uncreased flat ground — the
+  normal-Sobel has no scale invariance, so at raking angles it fires on a plane.
+- A dead-straight full-width horizontal band across the horizon that composites
+  OVER the clouds and slices them.
+- God-ray shafts are now the largest smooth gradient left in the game.
+- Motion smear still dissolves the rider in 5 of 16 frames, and reads as a
+  bloom halo rather than a drawn streak.
+- `bike-detail`: the camera is inside the dust volume; the bike renders as
+  X-ray line art through the puffs.
+- `ravine-gap`: no subject in frame, camera clipped into terrain.
+- `landing` sequence: subject absent for the first 583 ms.
+- AI riders past ~40 px are unidentifiable dark blobs — no chroma or rim floor.
+- Water still has no surface, no flow contour, no highlight.
+- HUD: the `7` tick descender cuts through `FINISH`; the speed numeral
+  overflows its panel; the gate callout is near-invisible in fast frames.
+- The rider has no face at close crop.
+- Helmet specular is a soft bloom — the one thing reading as PBR on the rider.
+- Trick 360 does not visibly rotate; impact frames still desaturate the frame.
+
+## Not started
+- Performance pass. Target is locked 60 fps at retina on an M5 Pro with no
+  spikes on jumps or crashes. Never measured in a real session.
+- Audio has never been listened to.
+- Replay / biggest-air cinematic wired but never exercised.
