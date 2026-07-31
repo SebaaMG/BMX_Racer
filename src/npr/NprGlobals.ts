@@ -48,6 +48,8 @@ export interface GlobalUniforms {
   uShadowMat1: IUniform<Matrix4>;
   uShadowSplit: IUniform<number>;
   uShadowTexel: IUniform<Vector2>;
+  /** World size of one shadow texel in each cascade, metres. */
+  uShadowTexelWorld: IUniform<Vector2>;
   uShadowStrength: IUniform<number>;
   uShadowBias: IUniform<number>;
 }
@@ -84,6 +86,7 @@ export const NPR: GlobalUniforms = {
   uShadowMat1: { value: new Matrix4() },
   uShadowSplit: { value: 70 },
   uShadowTexel: { value: new Vector2(1 / 2048, 1 / 2048) },
+  uShadowTexelWorld: { value: new Vector2(0.25, 1.2) },
   uShadowStrength: { value: 0.9 },
   uShadowBias: { value: 0.0016 },
 };
@@ -126,6 +129,7 @@ export function globalUniformBlock(): Record<string, IUniform> {
     uShadowMat1: NPR.uShadowMat1,
     uShadowSplit: NPR.uShadowSplit,
     uShadowTexel: NPR.uShadowTexel,
+    uShadowTexelWorld: NPR.uShadowTexelWorld,
     uShadowStrength: NPR.uShadowStrength,
     uShadowBias: NPR.uShadowBias,
   } as Record<string, IUniform>;
@@ -157,4 +161,12 @@ export const POST_STATE = {
   vignette: GRADE.vignetteStrength,
   /** Set to >0 on a crash to punch the whole frame toward the ink colour. */
   inkFlood: 0,
+  /**
+   * Master dial on the SCREEN-SPACE interior line pass. 0 leaves only the
+   * inverted-hull silhouettes, which is a legitimate look for a replay or a
+   * results screen; 1 is the normal drawn read. Does not touch the hulls.
+   */
+  lineOpacity: 1,
+  /** Paper grain amplitude in the final composite. A whisper — 0.016 default. */
+  grainStrength: 0.016,
 };

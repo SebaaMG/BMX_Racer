@@ -70,10 +70,22 @@ export const SKY = {
 // which is what makes a wide shot read as stacked paper cut-outs.
 export const FOG_BANDS = {
   count: 4,
-  near: 180,
-  far: 2600,
-  /** Colours from nearest band to furthest. Each step is a visible jump. */
-  colors: [c(0xb9c8dd), c(0xa9bcd8), c(0x9fb4d6), c(0x9db0d2)],
+  // Boundaries land at 40%, 63% and 82% of the near..far span after the
+  // pow(t, 0.78) curve. With near=180/far=2600 that put them at 560 m, 1175 m
+  // and 1855 m — while a typical composition here occupies 200-900 m, so every
+  // pixel in frame sat on plateau 0 and there was nothing to step between.
+  // Removing the continuous multiply was necessary but not sufficient: the
+  // plateaus also have to be REACHABLE from where the camera actually stands.
+  near: 45,
+  far: 1150,
+  /**
+   * Colours from nearest band to furthest. Each step must be a visible jump.
+   * These used to differ by ~9/255 per step, which is invisible even across a
+   * hard boundary. They now brighten and shift teal with distance, which is
+   * both real aerial perspective and the thing that makes a far ridge read as
+   * a separate sheet of paper laid behind the one in front of it.
+   */
+  colors: [c(0xa9bed6), c(0xb4cbe0), c(0xc0d7e8), c(0xcce2ef)],
   /** How much each band flattens toward its colour: 0 = clear, 1 = fully hazed. */
   strengths: [0.16, 0.44, 0.72, 0.94],
   /** Extra warmth injected on the sun side of each band. */

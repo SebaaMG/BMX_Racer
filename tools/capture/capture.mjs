@@ -197,7 +197,13 @@ async function main() {
       console.log(`  ✓ frames ${path.relative(process.cwd(), dir)}`);
 
       // Contact sheet — the artefact a reviewing agent can actually read.
-      await buildContactSheet(page, dir, path.join(OUTDIR, 'sheets', `${name}.png`), name, FPS);
+      // Never fatal: the frames are already on disk and are the real output,
+      // so a sheet failure must not cost us the remaining sequences.
+      try {
+        await buildContactSheet(page, dir, path.join(OUTDIR, 'sheets', `${name}.png`), name, FPS);
+      } catch (e) {
+        console.log(`  ⚠ sheet failed for ${name}: ${e.message.split('\n')[0]}`);
+      }
     }
   }
 
@@ -248,21 +254,43 @@ async function buildContactSheet(page, frameDir, outPath, title, fps) {
   const stride = Math.max(1, Math.ceil(files.length / MAX_CELLS));
   const picked = files.filter((_, i) => i % stride === 0).slice(0, MAX_CELLS);
 
-  const images = [];
-  for (const f of picked) {
-    const buf = await readFile(path.join(frameDir, f));
-    images.push({
-      src: `data:image/png;base64,${buf.toString('base64')}`,
-      label: `${f.replace(/\D/g, '')}  ·  ${(Number(f.replace(/\D/g, '')) / fps).toFixed(3)}s`,
-    });
-  }
-
-  const rows = Math.ceil(images.length / COLS);
   const CELL_W = 480;
   const CELL_H = Math.round((CELL_W * HEIGHT) / WIDTH);
   const LABEL_H = 22;
 
   const sheetPage = await page.context().newPage();
+
+  // Downscale EACH frame on its own, in the browser, before any of them go
+  // into the sheet. Embedding 30 retina PNGs as base64 and letting the page
+  // decode them all at once is ~120 MB of decoded bitmap and it kills the
+  // renderer — which then takes the rest of the capture run down with it.
+  // One image in flight at a time, re-encoded to a cell-sized JPEG, is ~40x
+  // smaller and never holds more than one full-res bitmap in memory.
+  await sheetPage.setViewportSize({ width: CELL_W, height: CELL_H + LABEL_H });
+  const images = [];
+  for (const f of picked) {
+    const buf = await readFile(path.join(frameDir, f));
+    const src = await sheetPage.evaluate(
+      async ([dataUrl, w, h]) => {
+        const img = new Image();
+        img.src = dataUrl;
+        await img.decode();
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        img.src = '';
+        return c.toDataURL('image/jpeg', 0.86);
+      },
+      [`data:image/png;base64,${buf.toString('base64')}`, CELL_W, CELL_H],
+    );
+    images.push({
+      src,
+      label: `${f.replace(/\D/g, '')}  ·  ${(Number(f.replace(/\D/g, '')) / fps).toFixed(3)}s`,
+    });
+  }
+
+  const rows = Math.ceil(images.length / COLS);
   await sheetPage.setViewportSize({
     width: COLS * CELL_W,
     height: rows * (CELL_H + LABEL_H) + 46,

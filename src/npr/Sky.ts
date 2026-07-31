@@ -18,6 +18,8 @@ import {
   DoubleSide,
   Float32BufferAttribute,
   GLSL3,
+  LinearFilter,
+  LinearMipmapLinearFilter,
   Mesh,
   Object3D,
   PerspectiveCamera,
@@ -42,6 +44,24 @@ export class Sky {
 
     const geo = new SphereGeometry(radius, 48, 32);
 
+    // The cloud masks are sampled through a projection that shears hard toward
+    // the horizon, so a single texel can cover many pixels there. Built with
+    // LinearFilter alone they had no mip chain at all, and the tileable mask
+    // aliased against itself into a hard rectangular grid across the lower sky
+    // — the "seam" that looked like a projection wrap and was in fact minified
+    // repeats beating against the pixel grid. Trilinear + anisotropic fixes the
+    // aliasing; the shader then re-thresholds the filtered alpha so the cloud
+    // contour goes back to being a hard cut rather than a blurred one.
+    const cloudNear = celCloudMask(1024, 'clouds-near', 0.46);
+    const cloudFar = celCloudMask(1024, 'clouds-far', 0.60);
+    for (const t of [cloudNear, cloudFar]) {
+      t.minFilter = LinearMipmapLinearFilter;
+      t.magFilter = LinearFilter;
+      t.generateMipmaps = true;
+      t.anisotropy = 8;
+      t.needsUpdate = true;
+    }
+
     this.domeMat = new ShaderMaterial({
       glslVersion: GLSL3,
       side: BackSide,
@@ -61,8 +81,8 @@ export class Sky {
         uCloudLit: { value: SKY.cloudLit.clone() },
         uCloudMid: { value: SKY.cloudMid.clone() },
         uCloudShadow: { value: SKY.cloudShadow.clone() },
-        uCloudNear: { value: celCloudMask(1024, 'clouds-near', 0.46) },
-        uCloudFar: { value: celCloudMask(1024, 'clouds-far', 0.60) },
+        uCloudNear: { value: cloudNear },
+        uCloudFar: { value: cloudFar },
         uCloudDrift: { value: 0 },
       },
       vertexShader: /* glsl */ `
@@ -100,20 +120,68 @@ export class Sky {
         }
 
         /**
-         * Banded vertical gradient. Four plateaus with a one-pixel transition,
-         * plus a dither on the boundary so the plateau edges never draw a hard
-         * horizontal seam across a clear sky.
+         * A projection of the view direction onto a plane above the camera,
+         * shared by the gradient's boundary wobble and both cloud layers.
+         *
+         * Dividing by (dir.y + k) rather than by dir.y is the whole fix for the
+         * cloud seam. The old form was singular at the horizon: as dir.y fell
+         * toward its clamp the uv magnitude ran away, the tileable mask
+         * repeated faster than one pixel could resolve, and the repeats beat
+         * against the pixel grid into a hard rectangular lattice across the
+         * lower sky. Adding k keeps the identical perspective read — overhead
+         * clouds large, horizon clouds compressed — while the mapping stays
+         * finite, single-valued and C-infinity over the entire upper
+         * hemisphere. There is no wrap anywhere in it, so there is no seam.
          */
-        vec3 skyGradient(float h, vec2 fc) {
-          float dither = (hash21(fc * 0.7) - 0.5) * 0.018;
-          float t = saturate1(h * 0.5 + 0.5 + dither);
-          // Compress the useful range into the upper hemisphere.
-          float k = pow(saturate1((t - 0.48) / 0.52), 0.72);
+        vec2 domePlane(vec3 dir, float k) {
+          return dir.xz / (dir.y + k);
+        }
+
+        /**
+         * Banded vertical gradient. Four plateaus, hard boundaries.
+         *
+         * Two defects fixed here, both visible at the horizon.
+         *
+         * The bands are now positioned directly in dir.y. The previous form ran
+         * dir.y through pow(x, 0.72) of a shifted range, and that has an
+         * INFINITE derivative at x = 0 — precisely where the sharpest boundary
+         * in the whole sky sits. fwidth() blew up there, so the one transition
+         * that most needed antialiasing was the one that could not get any.
+         *
+         * And the boundary perturbation is now low-frequency and locked to the
+         * world instead of a per-pixel screen-space hash. The reason to perturb
+         * a plateau edge is to stop it drawing a mathematically straight rule
+         * across a clear sky; a slow wander does that and reads as the edge of
+         * a brushstroke. A per-pixel hash does it by converting the edge into a
+         * thirty-pixel band of speckle — which is exactly what the "heavy
+         * dither near the horizon" was.
+         */
+        vec3 skyGradient(vec3 dir, vec2 fc) {
+          float h = dir.y;
+
+          // World-locked, roughly four cycles around the horizon. Locked to the
+          // world and not to the screen so the wander does not slide along the
+          // band edge when the camera pans.
+          float wob = fbm2(domePlane(dir, 0.62) * 2.6, 3) - 0.5;
 
           vec3 col = uBelow;
-          col = mix(col, uHorizon, smoothstep(0.00, 0.012, k));
-          col = mix(col, uUpper,   smoothstep(0.26, 0.275, k));
-          col = mix(col, uZenith,  smoothstep(0.63, 0.645, k));
+          col = mix(col, uHorizon, bandStepS(h + wob * 0.008, 0.004, 0.0018));
+          col = mix(col, uUpper,   bandStepS(h + wob * 0.022, 0.118, 0.0022));
+          col = mix(col, uZenith,  bandStepS(h + wob * 0.036, 0.500, 0.0030));
+
+          // A warm plateau hugging the horizon on the sun side. Dawn light does
+          // not wrap a sky evenly, and a gradient that is symmetric in azimuth
+          // reads as a lit dome rather than as a sky.
+          vec2 az    = normalize(dir.xz + vec2(1e-5, 0.0));
+          vec2 sunAz = normalize(uSunDir.xz + vec2(1e-5, 0.0));
+          float toward = saturate1(dot(az, sunAz));
+          float low = 1.0 - bandStepS(h + wob * 0.022, 0.086, 0.0025);
+          col = mix(col, mix(col, uSunGlow, 0.40), low * bandStepS(toward, 0.28, 0.16) * 0.55);
+
+          // A whisper of ordered noise, an order of magnitude below the old
+          // dither. This exists only to break 8-bit banding INSIDE a plateau
+          // and is far too small to disturb a boundary.
+          col += (hash21(fc) - 0.5) * 0.0022;
           return col;
         }
 
@@ -136,35 +204,62 @@ export class Sky {
         }
 
         /**
-         * Two cloud layers at different parallax depths. The far layer moves at
-         * a third the speed of the near one, which is what gives a flat dome
-         * genuine depth without any geometry.
+         * Two cloud layers at different parallax depths. The far layer drifts
+         * at a third the speed of the near one, which is what gives a flat dome
+         * genuine depth without a single triangle of geometry.
+         *
+         * WHY THE ALPHA IS RE-THRESHOLDED. The mask is now mip-mapped, which is
+         * what removed the aliasing lattice — but a filtered hard-edged mask is
+         * a SOFT-edged mask, and a soft cloud is the one thing an anime sky
+         * never has. So we filter to kill the aliasing and then put the hard
+         * contour straight back with a step whose width is the screen-space
+         * derivative of the alpha. The edge is therefore exactly one pixel wide
+         * at any distance: cut paper up close, cut paper at the horizon, no
+         * shimmer in between.
          */
-        vec3 clouds(vec3 dir, vec3 col, vec2 fc) {
-          if (dir.y < -0.02) return col;
+        vec3 clouds(vec3 dir, vec3 col) {
+          float h = dir.y;
+          if (h < -0.06) return col;
 
-          // Project the direction onto a plane above the camera. Dividing by y
-          // is what produces the perspective foreshortening toward the horizon.
-          float yy = max(dir.y, 0.035);
+          float drift = uTime;
 
-          // ── Far layer ──
-          vec2 uvFar = dir.xz / (yy * 3.4) * 0.16 + vec2(uTime * 0.0016, uTime * 0.0007);
+          // ── Far layer: flatter, duller, slower. Depth cue only. ──
+          vec2 uvFar = domePlane(dir, 0.62) * 0.30 + vec2(drift * 0.0011, drift * 0.0005);
           vec4 far = texture(uCloudFar, uvFar);
-          float fadeFar = smoothstep(0.0, 0.16, dir.y);
-          vec3 farCol = mix(uCloudShadow, uCloudMid, far.r);
-          col = mix(col, farCol, far.a * 0.62 * fadeFar);
+          float aFar   = bandStepS(far.a, 0.52, 0.0020);
+          float litFar = bandStepS(far.r, 0.80, 0.0020);
+          float fadeFar = smoothstep(0.012, 0.20, h);
+          col = mix(col, mix(uCloudShadow, uCloudMid, litFar), aFar * 0.56 * fadeFar);
 
           // ── Near layer ──
-          vec2 uvNear = dir.xz / (yy * 1.5) * 0.14 + vec2(uTime * 0.0052, uTime * 0.0021);
+          vec2 uvNear = domePlane(dir, 0.30) * 0.42 + vec2(drift * 0.0038, drift * 0.0016);
           vec4 near = texture(uCloudNear, uvNear);
-          float fadeNear = smoothstep(0.02, 0.22, dir.y);
+          float aNear   = bandStepS(near.a, 0.52, 0.0020);
+          float litNear = bandStepS(near.r, 0.80, 0.0020);
+          float fadeNear = smoothstep(0.028, 0.24, h);
 
-          // Sun side of a cloud is a hard-edged hot rim, not a gradient.
-          float sunAmt = saturate1(dot(dir, uSunDir));
-          vec3 nearCol = mix(uCloudShadow, uCloudLit, near.r);
-          nearCol = mix(nearCol, uCloudLit * 1.18, bandStepS(sunAmt, 0.86, 0.03) * near.r);
-          col = mix(col, nearCol, near.a * 0.88 * fadeNear);
+          // The hot sunward rim, built DIRECTIONALLY rather than from the
+          // alpha ramp. Probing the mask a short step toward the sun's azimuth
+          // and asking "is that point outside the cloud?" gives a rim of a
+          // controlled, constant width on the sun side only — which is how an
+          // animator inks a cloud. Deriving it from the alpha ramp instead
+          // gives a rim whose width is whatever the noise gradient happens to
+          // be, and it appears all the way round the contour.
+          vec2 sunStep = normalize(uSunDir.xz + vec2(1e-5, 0.0)) * 0.0075;
+          float aheadA = texture(uCloudNear, uvNear + sunStep).a;
+          float rim = aNear * (1.0 - bandStepS(aheadA, 0.52, 0.0020));
 
+          vec3 nearCol = mix(uCloudShadow, uCloudLit, litNear);
+          nearCol = mix(nearCol, uCloudLit * 1.16, rim * 0.85);
+          // The same probe run in the opposite direction gives the shadowed
+          // edge. Hot rim on the sun side, cool cut on the far side, flat
+          // two-value body in between: that is a cel cloud, and it is three
+          // texture fetches.
+          float behindA = texture(uCloudNear, uvNear - sunStep).a;
+          float shade = aNear * (1.0 - bandStepS(behindA, 0.52, 0.0020)) * (1.0 - rim);
+          nearCol = mix(nearCol, uCloudShadow * 0.88, shade * 0.60);
+
+          col = mix(col, nearCol, aNear * 0.90 * fadeNear);
           return col;
         }
 
@@ -172,9 +267,9 @@ export class Sky {
           vec3 dir = normalize(vDir);
           vec2 fc = gl_FragCoord.xy;
 
-          vec3 col = skyGradient(dir.y, fc);
+          vec3 col = skyGradient(dir, fc);
           col = sunDisc(dir, col);
-          col = clouds(dir, col, fc);
+          col = clouds(dir, col);
 
           fragColor = vec4(col, 1.0);
         }

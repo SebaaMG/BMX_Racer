@@ -144,6 +144,7 @@ export const GLSL_GLOBAL_UNIFORMS = /* glsl */ `
   uniform mat4  uShadowMat1;
   uniform float uShadowSplit;     // view distance where cascade 0 hands over
   uniform vec2  uShadowTexel;     // 1/size for each cascade
+  uniform vec2  uShadowTexelWorld;// world metres per shadow texel, per cascade
   uniform float uShadowStrength;
   uniform float uShadowBias;
 `;
@@ -316,23 +317,48 @@ export const GLSL_SHADOW = /* glsl */ `
    * Two cascades, hard-switched with a short blend so the seam never shows.
    * Returns 1.0 = fully lit, 0.0 = fully shadowed.
    */
-  float sunShadow(vec3 worldPos, float viewDist, float ndl) {
+  float sunShadow(vec3 worldPos, vec3 N, float viewDist, float ndl) {
     if (uShadowStrength <= 0.001) return 1.0;
 
-    // Slope-scaled bias: grazing surfaces need far more bias or they acne.
-    float slopeBias = uShadowBias * (1.0 + 3.0 * (1.0 - saturate1(ndl)));
+    // ── Normal-offset bias ───────────────────────────────────────────────────
+    // A depth bias alone cannot survive this sun. At 21.5° elevation the depth
+    // gradient across one shadow texel on near-flat ground is enormous, so the
+    // constant bias needed to stop self-shadowing is large enough to detach
+    // every shadow from its caster.
+    //
+    // Offsetting the SAMPLE POSITION along the surface normal instead scales
+    // automatically with the texel's world footprint, costs nothing, and does
+    // not peter-pan: the lookup simply moves to where the texel's depth is
+    // actually valid. It matters more here than in a realistic renderer,
+    // because the two-step penumbra quantisation below turns what would be
+    // soft dithered acne into crisp, deliberate-looking corduroy — the
+    // artefact is amplified by the very thing that makes the shadow graphic.
+    float grazing = 1.0 - saturate1(ndl);
+    // CLAMPED. Cascade 1's texel is 0.62 m of world, so an unclamped
+    // 1.1 + 2.6*grazing offset reached 2.29 m and walked the lookup clean off
+    // the caster: tree shadows tore into radiating needles and rider shadows
+    // detached from the wheels. The offset only has to cover one texel's depth
+    // slope, and past a few centimetres it stops fixing acne and starts
+    // deleting contact.
+    float texelWorld = viewDist < uShadowSplit ? uShadowTexelWorld.x : uShadowTexelWorld.y;
+    float offset = min(texelWorld * (1.1 + 2.6 * grazing), 0.42);
+    vec3 p = worldPos + N * offset;
+
+    // A much smaller depth bias on top, purely to cover the residual.
+    float slopeBias = uShadowBias * (1.0 + 1.5 * grazing);
 
     float s;
     if (viewDist < uShadowSplit) {
-      s = sampleShadowMap(uShadowMap0, uShadowMat0 * vec4(worldPos, 1.0), uShadowTexel.x, slopeBias);
+      s = sampleShadowMap(uShadowMap0, uShadowMat0 * vec4(p, 1.0), uShadowTexel.x, slopeBias);
       // Cross-fade into cascade 1 over the last 15% of the near range.
       float t = smoothstep(uShadowSplit * 0.85, uShadowSplit, viewDist);
       if (t > 0.0) {
-        float s1 = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(worldPos, 1.0), uShadowTexel.y, slopeBias * 2.5);
+        vec3 p1 = worldPos + N * min(uShadowTexelWorld.y * (1.1 + 2.6 * grazing), 0.42);
+        float s1 = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p1, 1.0), uShadowTexel.y, slopeBias * 2.0);
         s = mix(s, s1, t);
       }
     } else {
-      s = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(worldPos, 1.0), uShadowTexel.y, slopeBias * 2.5);
+      s = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p, 1.0), uShadowTexel.y, slopeBias * 2.0);
     }
 
     // Quantise the penumbra to two steps. A continuous penumbra is the fastest
@@ -378,7 +404,14 @@ export const GLSL_FOG = /* glsl */ `
     sunAmount = pow(sunAmount, 2.2);
     fogCol = mix(fogCol, uFogSunTint, sunAmount * uFogSunTintStrength);
 
-    return mix(color, fogCol, fogStr * saturate1(t * 1.15));
+    // The strength is the PLATEAU value and nothing else.
+    //
+    // This used to be multiplied by the continuous t, which quietly undid the
+    // whole point: the four discrete strengths were re-swept into a smooth ramp
+    // and every far ridge dissolved into the same grey wash instead of stacking
+    // as a flat paper layer. Picking a plateau and then scaling it by the very
+    // continuous variable it was quantised from is a gradient with extra steps.
+    return mix(color, fogCol, fogStr);
   }
 `;
 
@@ -408,7 +441,7 @@ export const GLSL_CEL_SURFACE = /* glsl */ `
     float ndl = ndlRaw * 0.5 + 0.5;
     ndl = ndl * ndl;                       // pull the terminator downhill a touch
 
-    float shadow = sunShadow(s.worldPos, s.viewDist, saturate1(ndlRaw));
+    float shadow = sunShadow(s.worldPos, N, s.viewDist, saturate1(ndlRaw));
     // Shadowing pushes the shading term down a whole band rather than scaling
     // brightness — that keeps cast shadows on the same palette as form shadows.
     float lit = ndl * mix(0.42, 1.0, shadow);
