@@ -52,7 +52,7 @@ import {
   type IRiderRig,
 } from './Contracts';
 import { clamp01 } from '../core/MathX';
-import { BIKE } from './WorldConstants';
+import { BIKE, COUNTDOWN_SECONDS } from './WorldConstants';
 
 export interface GameOptions {
   params: URLSearchParams;
@@ -580,6 +580,21 @@ export class Game {
     this.effects.reset();
 
     // Ride into the situation rather than being dropped into it.
+    // Make the CLOCK agree with the position we teleported to.
+    //
+    // A capture jumps the player straight to a fraction of the course without
+    // riding there, so the elapsed timer stayed near zero: the review set had
+    // frames reading DESCENT PROFILE 96% at 72 km/h beside TIME 0:00.19. A
+    // reviewer judging composition and readability is entitled to a frame whose
+    // own HUD is internally consistent, and a nonsense clock is a defect they
+    // will and did report. Estimated from the distance covered at a nominal
+    // pace rather than simulated, because simulating 3.8 km per pose would cost
+    // minutes per capture run.
+    const NOMINAL_PACE = 17.5; // m/s averaged over the descent
+    const covered = s.t * this.track.length;
+    this.race.raceTime = COUNTDOWN_SECONDS + covered / NOMINAL_PACE;
+    for (const r of this.race.racers) r.progress.raceTime = this.race.elapsed;
+
     const preroll = prerollOverride ?? s.preroll ?? 0;
     for (let i = 0; i < preroll; i++) this.race.fixedUpdate(1 / 120);
 

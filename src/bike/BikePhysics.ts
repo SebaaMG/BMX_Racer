@@ -308,6 +308,57 @@ const ZERO_INPUT: BikeInput = {
 };
 
 /**
+ * Per-step force/torque accounting, for the physics harness.
+ *
+ * "The speedo does something impossible" is not debuggable from the speedo. The
+ * only way to attribute a 1.7 g acceleration on a bicycle is to see every term
+ * that touched the velocity that step, including the DISCRETE ones — a landing
+ * that projects the velocity into the contact plane and a ground-hold that
+ * clips the normal component are not forces and never show up in a force sum.
+ *
+ * Off by default and write-only: nothing here is ever read back by the
+ * simulation, so enabling it cannot change a result. Fixed fields, no
+ * allocation, no branching that the physics depends on.
+ */
+export const BIKE_DIAG = {
+  enabled: false,
+  n: 0,
+  /** Force by source, newtons, world space. */
+  gx: 0, gy: 0, gz: 0,           // gravity
+  dx: 0, dy: 0, dz: 0,           // aero + surface drag
+  hx: 0, hy: 0, hz: 0,           // ground hug
+  sx: 0, sy: 0, sz: 0,           // suspension normal force
+  fx: 0, fy: 0, fz: 0,           // front tyre
+  rx: 0, ry: 0, rz: 0,           // rear tyre
+  cx: 0, cy: 0, cz: 0,           // crash / recovery drag
+  /** Drive demand actually asked of the rear contact, newtons. */
+  drive: 0,
+  /** Speed at the top of the step, after integration, and at the very end. */
+  speedPre: 0, speedInt: 0, speedFinal: 0,
+  /** Discrete, non-force velocity edits, m/s of |v| change. */
+  dvPen: 0, dvHold: 0, dvLand: 0, dvCrash: 0, dvImpulse: 0,
+  /** Attitude. */
+  targetLean: 0, lean: 0, pitch: 0,
+  rollServo: 0, tipRoll: 0, tipCancelled: 0, yawDampT: 0, yawRate: 0,
+  grounded: 0, airborne: 0, mode: 0,
+};
+
+/** Zero the per-step accumulators. Cheap enough to be unconditional. */
+function diagReset(): void {
+  const d = BIKE_DIAG;
+  d.gx = d.gy = d.gz = 0;
+  d.dx = d.dy = d.dz = 0;
+  d.hx = d.hy = d.hz = 0;
+  d.sx = d.sy = d.sz = 0;
+  d.fx = d.fy = d.fz = 0;
+  d.rx = d.ry = d.rz = 0;
+  d.cx = d.cy = d.cz = 0;
+  d.drive = 0;
+  d.dvPen = d.dvHold = d.dvLand = d.dvCrash = d.dvImpulse = 0;
+  d.rollServo = d.tipRoll = d.tipCancelled = d.yawDampT = 0;
+}
+
+/**
  * BikeState plus monotonic event counters.
  *
  * `landedThisStep` and `crashedThisStep` are latched for exactly ONE 120 Hz
@@ -356,6 +407,12 @@ export class BikePhysics {
 
   /** Where the rider rig, camera and FX read interpolated transforms from. */
   readonly object = new Object3D();
+
+  /**
+   * The shared per-step force accounting, reachable from an instance so the
+   * physics harness can switch it on without a module import. See BIKE_DIAG.
+   */
+  readonly diag = BIKE_DIAG;
 
   terrain: BikeTerrain;
   mass: number;
@@ -510,6 +567,11 @@ export class BikePhysics {
     _suspF.set(0, 0, 0);
     this.launchGrace = Math.max(0, this.launchGrace - dt);
 
+    if (BIKE_DIAG.enabled) {
+      diagReset();
+      BIKE_DIAG.speedPre = s.velocity.length();
+    }
+
     // ── Frames ──────────────────────────────────────────────────────────────
     _up.copy(UP).applyQuaternion(s.orientation);
     _fwd.copy(FWD).applyQuaternion(s.orientation);
@@ -575,12 +637,18 @@ export class BikePhysics {
 
     // ── Body forces ─────────────────────────────────────────────────────────
     this.force.y -= this.mass * BIKE.gravity;
+    if (BIKE_DIAG.enabled) BIKE_DIAG.gy = -this.mass * BIKE.gravity;
 
     // Aerodynamic drag, plus the surface's own drag term.
     if (s.speed > 0.05) {
       const surfDrag = this.rear.grounded ? this.rear.surface.drag : 0;
       const k = BIKE.dragK + surfDrag * 0.5;
       this.force.addScaledVector(s.velocity, -k * s.speed);
+      if (BIKE_DIAG.enabled) {
+        BIKE_DIAG.dx = -k * s.speed * s.velocity.x;
+        BIKE_DIAG.dy = -k * s.speed * s.velocity.y;
+        BIKE_DIAG.dz = -k * s.speed * s.velocity.z;
+      }
     }
 
     // Ground hug. A wheel running out of DROOP is a wheel about to leave the
@@ -601,7 +669,13 @@ export class BikePhysics {
       const excess = clamp01((extension - (1 - STATIC_SAG)) / STATIC_SAG);
       const fast = clamp01(s.speed / BODY_TUNE.crestHoldSpeed);
       const hug = BODY_TUNE.crestHold * excess * excess * fast;
-      if (hug > 0) this.force.addScaledVector(_n, -this.mass * BIKE.gravity * hug);
+      if (hug > 0) {
+        this.force.addScaledVector(_n, -this.mass * BIKE.gravity * hug);
+        if (BIKE_DIAG.enabled) {
+          const k = -this.mass * BIKE.gravity * hug;
+          BIKE_DIAG.hx = _n.x * k; BIKE_DIAG.hy = _n.y * k; BIKE_DIAG.hz = _n.z * k;
+        }
+      }
     }
 
     // ── Attitude control ────────────────────────────────────────────────────
@@ -626,6 +700,10 @@ export class BikePhysics {
         _v.copy(s.velocity);
         _v.y = 0;
         this.force.addScaledVector(_v, -this.mass * 2.6 * remain);
+        if (BIKE_DIAG.enabled) {
+          const k = -this.mass * 2.6 * remain;
+          BIKE_DIAG.cx = _v.x * k; BIKE_DIAG.cy = _v.y * k; BIKE_DIAG.cz = _v.z * k;
+        }
       }
       this.controlGrounded(input, dt, this.groundRef);
     } else if (grounded) {
@@ -636,6 +714,7 @@ export class BikePhysics {
 
     // ── Integrate ───────────────────────────────────────────────────────────
     this.integrate(dt);
+    if (BIKE_DIAG.enabled) BIKE_DIAG.speedInt = s.velocity.length();
 
     // ── Ground hold ─────────────────────────────────────────────────────────
     this.holdGround(grounded, _n, dt);
@@ -650,6 +729,17 @@ export class BikePhysics {
     s.modeTime += dt;
     this.lastSpeed = s.speed;
     this.wasGrounded = grounded;
+
+    if (BIKE_DIAG.enabled) {
+      const d = BIKE_DIAG;
+      d.speedFinal = s.speed;
+      d.targetLean = this.targetLean;
+      d.lean = s.lean;
+      d.pitch = s.pitch;
+      d.grounded = grounded ? 1 : 0;
+      d.airborne = s.mode === BikeMode.Airborne ? 1 : 0;
+      d.n++;
+    }
   }
 
   /**
@@ -701,7 +791,11 @@ export class BikePhysics {
       BODY_TUNE.holdRelease,
       -this.normalVelPre * BODY_TUNE.holdRestitution,
     );
-    if (vn > allowed) s.velocity.addScaledVector(n, allowed - vn);
+    if (vn > allowed) {
+      const pre = BIKE_DIAG.enabled ? s.velocity.length() : 0;
+      s.velocity.addScaledVector(n, allowed - vn);
+      if (BIKE_DIAG.enabled) BIKE_DIAG.dvHold += s.velocity.length() - pre;
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -786,7 +880,9 @@ export class BikePhysics {
       this.pumpFiredCharge = s.pumpCharge;
       if (grounded) {
         _n.copy(this.rear.grounded ? this.rear.contactNormal : this.front.contactNormal);
+        const pre = BIKE_DIAG.enabled ? s.velocity.length() : 0;
         s.velocity.addScaledVector(_n, BODY_TUNE.pumpImpulse * s.pumpCharge);
+        if (BIKE_DIAG.enabled) BIKE_DIAG.dvImpulse += s.velocity.length() - pre;
         this.launchGrace = BODY_TUNE.holdGrace;
       }
       s.pumpCharge = 0;
@@ -806,7 +902,9 @@ export class BikePhysics {
     if (input.wantHop && !this.hopPrev && grounded) {
       _n.copy(this.rear.grounded ? this.rear.contactNormal : this.front.contactNormal);
       const scale = 0.86 + s.preload * 0.46;
+      const pre = BIKE_DIAG.enabled ? s.velocity.length() : 0;
       s.velocity.addScaledVector(_n, BODY_TUNE.hopImpulse * scale);
+      if (BIKE_DIAG.enabled) BIKE_DIAG.dvImpulse += s.velocity.length() - pre;
       // A hop is a rear-first lift: nose up slightly so it looks like a hop and
       // not a lift on a string. Negative about LEFT is nose-up.
       _t.copy(_left).multiplyScalar(-BODY_TUNE.hopNoseLift);
@@ -819,10 +917,12 @@ export class BikePhysics {
   /** Spend an armed pump charge into vertical velocity. Idempotent per charge. */
   private payPumpBonus(): void {
     if (this.pumpFired < 0 || this.pumpFiredCharge <= 0) return;
+    const pre = BIKE_DIAG.enabled ? this.state.velocity.length() : 0;
     this.state.velocity.addScaledVector(
       this.groundRef,
       BODY_TUNE.pumpAirBonus * this.pumpFiredCharge,
     );
+    if (BIKE_DIAG.enabled) BIKE_DIAG.dvImpulse += this.state.velocity.length() - pre;
     this.pumpFired = -1e3;
     this.pumpFiredCharge = 0;
     this.launchGrace = BODY_TUNE.holdGrace;
@@ -864,6 +964,7 @@ export class BikePhysics {
       drive, brakeRear, s.lean, this.mass, dt,
     );
 
+    if (BIKE_DIAG.enabled) BIKE_DIAG.drive = drive;
     this.applyContactForce(this.front);
     this.applyContactForce(this.rear);
   }
@@ -876,6 +977,9 @@ export class BikePhysics {
       _t.copy(_r).cross(_f);
       this.torque.add(_t);
       _suspF.add(_f);
+      if (BIKE_DIAG.enabled) {
+        BIKE_DIAG.sx += _f.x; BIKE_DIAG.sy += _f.y; BIKE_DIAG.sz += _f.z;
+      }
       // Book the roll share for cancelTipMoment. Both contact points lie on the
       // bike's own centre plane, so the entire roll component of this moment is
       // load * lever * sin(lean) — pure destabilising gravity, nothing else.
@@ -890,9 +994,11 @@ export class BikePhysics {
     // the dirt is an inelastic event and must not bounce.
     if (out.penetration > 0.0015) {
       const s = this.state;
+      const pre = BIKE_DIAG.enabled ? s.velocity.length() : 0;
       s.position.addScaledVector(w.contactNormal, Math.min(out.penetration * 0.45, 0.035));
       const vn = s.velocity.dot(w.contactNormal);
       if (vn < 0) s.velocity.addScaledVector(w.contactNormal, -vn);
+      if (BIKE_DIAG.enabled) BIKE_DIAG.dvPen += s.velocity.length() - pre;
     }
   }
 
@@ -932,6 +1038,10 @@ export class BikePhysics {
    * through camber thrust, which is decision 2 in the header.
    */
   private cancelTipMoment(pitchIntent: number): void {
+    if (BIKE_DIAG.enabled) {
+      BIKE_DIAG.tipRoll = this.tipRoll;
+      BIKE_DIAG.tipCancelled = -this.tipRoll * BODY_TUNE.tipCancel;
+    }
     if (this.tipRoll !== 0) {
       this.torque.addScaledVector(_fwd, -this.tipRoll * BODY_TUNE.tipCancel);
     }
@@ -950,6 +1060,13 @@ export class BikePhysics {
 
   private applyContactForce(w: Wheel): void {
     if (!w.grounded || w.tyreForce.lengthSq() < 1e-8) return;
+    if (BIKE_DIAG.enabled) {
+      if (w === this.front) {
+        BIKE_DIAG.fx = w.tyreForce.x; BIKE_DIAG.fy = w.tyreForce.y; BIKE_DIAG.fz = w.tyreForce.z;
+      } else {
+        BIKE_DIAG.rx = w.tyreForce.x; BIKE_DIAG.ry = w.tyreForce.y; BIKE_DIAG.rz = w.tyreForce.z;
+      }
+    }
     this.force.add(w.tyreForce);
     _r.copy(w.contactPoint).sub(this.com);
     _t.copy(_r).cross(w.tyreForce);
@@ -1001,6 +1118,7 @@ export class BikePhysics {
     const kd = BODY_TUNE.leanKd * (1 + this.stability * 0.35);
     const rollTorque = BODY_TUNE.inertiaRoll * (leanErr * kp - rollRate * kd);
     this.torque.addScaledVector(_fwd, clamp(rollTorque, -9000, 9000));
+    if (BIKE_DIAG.enabled) BIKE_DIAG.rollServo = clamp(rollTorque, -9000, 9000);
 
     // ── Pitch: manual, endo, and the stabiliser, as ONE angle servo ─────────
     //
@@ -1053,6 +1171,10 @@ export class BikePhysics {
     // ── Yaw damping ─────────────────────────────────────────────────────────
     _v.copy(_up).multiplyScalar(-s.angularVelocity.dot(_up) * BODY_TUNE.yawDamp * BODY_TUNE.inertiaYaw);
     this.torque.add(_v);
+    if (BIKE_DIAG.enabled) {
+      BIKE_DIAG.yawRate = s.angularVelocity.dot(_up);
+      BIKE_DIAG.yawDampT = -BIKE_DIAG.yawRate * BODY_TUNE.yawDamp * BODY_TUNE.inertiaYaw;
+    }
 
     // Low-side. Past the lean limit with load on the wheels, the bike is down.
     if (Math.abs(s.lean) > BODY_TUNE.lowSideLean && s.speed > 5.5) {
@@ -1159,8 +1281,18 @@ export class BikePhysics {
       _v.copy(s.velocity);
       _v.y = 0;
       this.force.addScaledVector(_v, -this.mass * 3.2);
+      if (BIKE_DIAG.enabled) {
+        BIKE_DIAG.cx = _v.x * -this.mass * 3.2;
+        BIKE_DIAG.cy = _v.y * -this.mass * 3.2;
+        BIKE_DIAG.cz = _v.z * -this.mass * 3.2;
+      }
     } else {
       this.force.addScaledVector(s.velocity, -this.mass * 0.55);
+      if (BIKE_DIAG.enabled) {
+        BIKE_DIAG.cx = s.velocity.x * -this.mass * 0.55;
+        BIKE_DIAG.cy = s.velocity.y * -this.mass * 0.55;
+        BIKE_DIAG.cz = s.velocity.z * -this.mass * 0.55;
+      }
     }
 
     // A crash that accelerates cannot read as an impact — and one that pops the
@@ -1187,7 +1319,10 @@ export class BikePhysics {
     const s = this.state;
     const sp = s.velocity.length();
     this.crashSpeedCap = Math.min(this.crashSpeedCap, sp) * Math.pow(0.55, dt);
-    if (sp > this.crashSpeedCap && sp > 1e-4) s.velocity.multiplyScalar(this.crashSpeedCap / sp);
+    if (sp > this.crashSpeedCap && sp > 1e-4) {
+      s.velocity.multiplyScalar(this.crashSpeedCap / sp);
+      if (BIKE_DIAG.enabled) BIKE_DIAG.dvCrash += s.velocity.length() - sp;
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -1305,6 +1440,7 @@ export class BikePhysics {
 
   private resolveLanding(n: Vector3): void {
     const s = this.state;
+    const preSpeed = BIKE_DIAG.enabled ? s.velocity.length() : 0;
     _up.copy(UP).applyQuaternion(s.orientation);
 
     // Quality is the angle between the bike's up and the slope's normal. Nail
@@ -1344,6 +1480,7 @@ export class BikePhysics {
     const along = _v.length();
     _v.multiplyScalar(along > 1e-5 ? (along * keep) / along : 0);
     s.velocity.copy(_v);
+    if (BIKE_DIAG.enabled) BIKE_DIAG.dvLand += s.velocity.length() - preSpeed;
 
     // Kill the rotation the air gave us; the suspension takes the rest. Scaled
     // by the same consequence gate — a skim must not stop the balance loop dead.
