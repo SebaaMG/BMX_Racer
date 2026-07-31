@@ -436,7 +436,26 @@ export const GLSL_FOG = /* glsl */ `
     // retina does not read as noise — it resolves into a stable checkerboard
     // laid over every band boundary in the frame. One device pixel per sample
     // is the only spacing that dithers.
-    float dither = (hash21(fragCoord) - 0.5) * 0.035;
+    // A COHERENT carrier, gated to the band boundary.
+    //
+    // One device pixel per sample was chosen because a two-pixel hash lattice
+    // resolved into a stable checkerboard. But per-pixel white noise on the
+    // band INDEX is worse: it swaps whole fog plateaus between adjacent pixels,
+    // and a plateau swap is a 28-to-55 level jump. Measured over a flat patch
+    // it produced 43% single-pixel islands — the entire remaining "fine white
+    // stipple" on the snowfields, and it survived flat-shading the terrain,
+    // which is how it was isolated to here rather than to the material.
+    //
+    // Two changes. The carrier is smooth value noise on a ~2.6 px lattice, so
+    // neighbouring pixels agree and the break wanders instead of fizzing. And
+    // the amplitude is gated by distance to the nearest boundary: dither exists
+    // to hide the step, so it has no business acting in the middle of a
+    // plateau, which is where all the stipple was.
+    float fRaw = saturate1(t) * 3.999;
+    float edge = 1.0 - abs(fract(fRaw) - 0.5) * 2.0;
+    float carrier = vnoise(fragCoord * 0.38) - 0.5;
+    float dither = carrier * 0.055 * smoothstep(0.35, 1.0, edge);
+
     float f = saturate1(t + dither) * 3.999;
     int   i = int(floor(f));
     i = clamp(i, 0, 3);
