@@ -150,7 +150,7 @@ const SITUATIONS: Record<string, Situation> = {
   // ravine, peaks at 7.7 m, and falls PAST the far lip into the hole,
   // accelerating to 150 km/h inside the mountain. The gap is not currently
   // clearable. Framed on the approach until the jump itself is fixed.
-  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 96, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.22, dist: 19 } },
+  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 96, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.26, dist: 9.5 } },
   'ridge-exposure':     { t: 0.757, speed: 16, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
   streambed:            { t: 0.849, speed: 12, camera: CameraMode.Chase },
   // Short of the line, so the gate is ahead of the rider and in frame.

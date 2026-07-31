@@ -96,8 +96,23 @@ const DEPTH_QUANT_ULPS = 2.2;
  * interior lines still take the full fog strength (0.94 in the far band) and
  * still vanish; the silhouette stops here so a ridge at two kilometres is a
  * lighter stroke rather than no stroke.
+ *
+ * 0.12, not 0.30. The haze colour this mixes toward sits at 0.28 in linear
+ * light against the ink's 0.009, so the mix is steep: at 0.30 the ink arrived
+ * on the summit-wide skyline at sRGB luminance 85 — measured, not estimated —
+ * against a sky of 161 and snow of 241. A stroke has to be darker than BOTH
+ * sides of the edge it separates, and 85 against 241 is a grey smudge. At 0.12
+ * the same ink lands near 55, which clears the sky by a hundred values and the
+ * snow by nearly two hundred.
+ *
+ * The lightening-with-distance that the cap used to be responsible for has not
+ * been given up; it has been moved to where it belongs. An animator draws the
+ * far ridge with LESS PRESSURE of the same ink, not with a different, hazier
+ * ink — and less pressure is exactly what contourFade already applies, down to
+ * its 0.46 floor. Fading the alpha and holding the hue is the drawn behaviour;
+ * fading the hue toward the background is the photographic one.
  */
-const CONTOUR_FOG_CAP = 0.30;
+const CONTOUR_FOG_CAP = 0.12;
 
 export const LINE_DEBUG = {
   off: 0,
@@ -111,7 +126,7 @@ export const LINE_DEBUG = {
   probeContour: 7,
   /** Diagnostic packing: r nMagX, g nMagY, b spanX/4m, a spanY/4m. */
   probeNormal: 8,
-  /** Diagnostic packing: r dRel(sum)*200, g dRel(max)*200, b eDepth. */
+  /** Diagnostic packing: r dRel*200, g the raw max-axis response*200, b eDepth. */
   probeDepth: 9,
 } as const;
 
@@ -283,8 +298,8 @@ const FRAGMENT = /* glsl */ `
     //
     // The fix is to ask a second question the constant threshold cannot: how
     // much normal would a SMOOTH surface have turned across this span? A span
-    // A span of s metres on a surface of radius uCreaseRadius turns s/r of
-    // normal, and that is the number the observed step has to beat.
+    // of s metres on a surface of radius uCreaseRadius turns s/r of normal,
+    // and that is the number the observed step has to beat.
     // Anything below that is roundness, not a crease, however many degrees per
     // pixel it accumulates. The two tests are ANDed via max(), so the constant
     // still governs the near field — without it a 7 cm limb or a 2 cm frame
@@ -301,7 +316,6 @@ const FRAGMENT = /* glsl */ `
     float lapV = abs(w[1] + w[7] - 2.0 * wC);
     float lapD = abs(w[0] + w[8] - 2.0 * wC) * 0.5;
     float lapA = abs(w[2] + w[6] - 2.0 * wC) * 0.5;
-    float lapSum = lapH + lapV + lapD + lapA;
     // MAX, not SUM.
     //
     // A real step is a step in ONE direction: the edge it belongs to has an
@@ -379,17 +393,36 @@ const FRAGMENT = /* glsl */ `
     // what the hull's own targetPixels asks for on everything that has a hull.
     float contourE = max(contour, contourWide * 0.86) * uContourStrength * contourFade;
 
-    float edge = max(interior, contourE);
+    // ── Two inks, two opacity laws ──────────────────────────────────────────
+    //
+    // The INTERIOR field is a pen-pressure model: curvature drives the width
+    // (via the power below 1) and the darkness (via uStrength and the weight
+    // term), which is what makes a crease taper the way a drawn one does. But
+    // every factor in that chain is a MULTIPLIER BELOW ONE and they compound —
+    // uStrength 0.86, the weight term 0.95, and a power of 1/0.72 on a value
+    // already under 1 — so a fully-detected edge lands at 0.79 alpha, not 1.
+    //
+    // On a crease that is right. On a SILHOUETTE it is not, and the difference
+    // is measurable. Probed across the summit-wide skyline: the contour term
+    // fired at 255 on every one of 29 columns and the hull mask read 0 on all
+    // of them — the detector never dropped a single segment and nothing
+    // suppressed it — yet the stroke still arrived at 0.79 alpha, which over a
+    // snowfield reads as a 33-value dip. THAT is the intermittent hairline: not
+    // a hole in the detection, but a silhouette drawn at three quarters
+    // pressure and then, at the far end, mixed into the haze on top of that.
+    //
+    // The silhouette IS the drawing. It is laid down at the strength it was
+    // detected with, and only distance — contourFade, floored at 0.46 — is
+    // permitted to lighten it. The interior field keeps the pen-pressure model
+    // untouched, and the two are combined by taking whichever is stronger.
+    float interiorA =
+      pow(saturate1(interior), 1.0 / weight) * uStrength * mix(0.82, 1.0, weight);
+    float alpha = max(interiorA, contourE);
+
     // How much of this pixel's ink is silhouette rather than interior. Drives
     // the fog treatment below, and nothing else.
-    float contourShare = saturate1(contourE / max(edge, EPS));
-    // Raising the edge response to a power below 1 pushes more of the falloff
-    // above the visible threshold, which reads as a THICKER stroke; above 1 it
-    // reads as thinner. That is the pen-pressure model: curvature drives both
-    // the width and the darkness, exactly as it does on the hull.
-    edge = pow(saturate1(edge), 1.0 / weight);
+    float contourShare = saturate1(contourE / max(alpha, EPS));
 
-    float alpha = edge * uStrength * mix(0.82, 1.0, weight);
     // Characters carry heavier line work than backgrounds. The stylisation
     // mask is 1 on skinned geometry, which is exactly the rider.
     alpha *= mix(1.0, uCharacterBoost, saturate1(aC.z));

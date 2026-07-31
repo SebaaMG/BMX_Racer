@@ -125,38 +125,58 @@ const FRAGMENT = /* glsl */ `
     if (uSpeedIntensity > 0.001) {
       float sl = speedLines(uv, uSpeedFocus, uSpeedIntensity, uTime, aspect);
 
-      // ── QUANTISE THEM. THEY WERE THE LARGEST SMOOTH GRADIENT IN THE GAME. ──
+      // ── QUANTISE THE SHAPE. SCALE THE STRENGTH. THEY ARE NOT THE SAME AXIS. ─
       //
       // The critic's "broad radial spokes from screen centre laid continuously
       // across the slopes, the only smooth ramps left and the widest thing in
-      // frame" measures THIS, not the sky shafts — A/B captures of
-      // ridge-exposure with the shaft fan forced to zero intensity are
-      // pixel-identical, so the spokes are entirely the speed-line field.
+      // frame" measures THIS, and not the sky shafts. That was verified rather
+      // than assumed, and the verification is worth writing down because the
+      // first attempt at it was wrong in a way that is easy to repeat:
+      // PostPipeline.render() calls composite.syncState() immediately before it
+      // draws, and syncState reloads EVERY uniform in this file out of
+      // POST_STATE. An A/B that writes uSpeedIntensity = 0 and then renders
+      // therefore measures nothing at all. tools/capture/_ab.mjs now installs
+      // its override on syncState itself; with that in place, zeroing the speed
+      // field moves 10.8% of treeline-silhouette at a mean delta of 33/255 and
+      // takes every spoke in the frame with it, while the sky shaft fan is at
+      // intensity 0.000 in that pose and contributes nothing.
       //
-      // The cause is in the helper (ShaderChunks.GLSL_POST_HELPERS, not ours to
-      // edit) and it is two terms:
+      // The helper's own radial profile (ShaderChunks.GLSL_POST_HELPERS, not
+      // ours to edit) is two multiplied ramps:
       //
       //     along = smoothstep(inner, inner + 0.16, r) * ...
       //     taper = smoothstep(inner, outer, r)          // inner ~0.2, outer 0.95
       //
-      // The first is a ramp 16% of the frame long; the second is a ramp running
-      // three quarters of the way across it. Multiplied together they make each
-      // stroke a continuous radial gradient — in a picture where the terrain,
-      // the sky, the clouds and the bloom are all quantised to hard bands.
+      // — a gradient running three quarters of the way across the frame, in a
+      // picture where the terrain, the sky, the clouds and the bloom are all
+      // quantised. We cannot change the helper, but it returns a SCALAR, and a
+      // scalar can be posterised into three flat wedges with one-pixel cuts.
       //
-      // We cannot change the helper, but the helper returns a SCALAR and a
-      // scalar can be posterised. Three flat values with one-pixel cuts turns
-      // each ramp back into what the helper's own comment claims it is: a
-      // tapered brush stroke, drawn, with ends you can point at. fwidth is
-      // taken on the normalised value, so the cut is a screen-space pixel wide
-      // along the stroke and leaves the helper's already-hard cross-stroke edge
-      // exactly as it was.
+      // NORMALISING THE SHAPE IS CORRECT. DIVIDING OUT THE STRENGTH IS NOT.
+      // Dividing sl by the intensity to get a 0..1 shape is the right move —
+      // the quantisation thresholds then mean the same thing at every speed.
+      // But the intensity has to be MULTIPLIED BACK IN afterwards, and the
+      // previous pass never did: stroke * clear * 0.50 is independent of
+      // uSpeedIntensity, so a rider coasting at 47 km/h with intensity 0.073
+      // got exactly the same 50% wash of paper white as one at full boost.
+      // That is a twelvefold overdraw at the speeds these poses are captured
+      // at, and it is the whole of what the critic is looking at: strokes that
+      // should have been a whisper laid across the slopes at full strength.
       float slq = saturate1(sl / max(uSpeedIntensity, 1e-3));
       float qw = max(fwidth(slq) * 0.8, 0.012);
       float q1 = smoothstep(0.13 - qw, 0.13 + qw, slq);
       float q2 = smoothstep(0.36 - qw, 0.36 + qw, slq);
       float q3 = smoothstep(0.66 - qw, 0.66 + qw, slq);
       float stroke = 0.34 * q1 + 0.30 * q2 + 0.36 * q3;
+
+      // A DRAWN EDGE on the outermost cut. Three flat values butted together
+      // read as banding; the same three with a line down the join read as a
+      // brush stroke that someone put an edge on. One pixel wide, taken on the
+      // normalised value so it is a screen pixel at any stroke length.
+      float ew = max(fwidth(slq) * 0.8, 0.008);
+      float rim =
+          smoothstep(0.13 - ew, 0.13 + ew, slq)
+        * (1.0 - smoothstep(0.13 + ew, 0.13 + ew * 3.0, slq));
 
       // ── HOLD THEM OFF THE SUBJECT ───────────────────────────────────────────
       // The helper's own header promises strokes that are "absent in the centre
@@ -176,12 +196,16 @@ const FRAGMENT = /* glsl */ `
       // a flat value; adding light instead gives a glow that blows out the sky
       // and leaves nothing over dark trees.
       //
-      // 0.50, not 0.92. The paint colour is HUD_PALETTE.paper, applied in
-      // LINEAR light and then encoded — so 0.92 of it is very close to a white
-      // frame, and at the intensities a 70 km/h descent produces that is what
-      // it was doing. This is a stroke of paint over a picture, not a fade to
-      // white.
-      col = mix(col, uSpeedColor, stroke * clear * 0.50);
+      // The paint colour is HUD_PALETTE.paper, applied in LINEAR light and then
+      // encoded, so the coefficient is close to "fraction of the way to a white
+      // frame" and has to be read that way. 0.62 * intensity puts a coasting
+      // 47 km/h at 4.5%, the 72 km/h finish sprint at 21%, and only a boost at
+      // full chat anywhere near half. The strokes are still hard-edged at every
+      // one of those values — what changes with speed is how many of them you
+      // can see, which is the correct axis.
+      float paint = stroke * clear * uSpeedIntensity * 0.62;
+      float edge  = rim * clear * uSpeedIntensity * 0.85;
+      col = mix(col, uSpeedColor, saturate1(paint + edge));
     }
 
     if (uDebug > 2.5 && uDebug < 3.5) { fragColor = vec4(linearToSrgb(col), 1.0); return; }

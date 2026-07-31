@@ -307,6 +307,17 @@ export const CAMERA_TUNING = {
    *
    * Searched from the authored elevation, never below it, and capped so a
    * blocked shot degrades to a steep three-quarter rather than to a map view.
+   *
+   * MEASURED, current build: `ravine-gap` spends 30.1 degrees of rise and lands
+   * at 42.8 degrees of elevation — a steep three-quarter, inside the 71 degree
+   * cap — with the camera clear of the hillside and 52 px of subject in frame,
+   * against 0 px before. `treeline-silhouette` spends 21.5, `rider-closeup` and
+   * `rockgarden-low` 2.9 each, and every other framed pose spends nothing.
+   *
+   * 52 px is legible but it is not a subject, and it is not the solver's to
+   * fix: it is the authored `dist: 19` in the situation table. The elevation
+   * solve can put the lens somewhere it can SEE from; it cannot make a 19 m
+   * shot into a close one without throwing away the scale the author chose.
    */
   framedRiseStep: 0.075,
   framedRiseMax: 0.90,
@@ -323,18 +334,47 @@ export const CAMERA_TUNING = {
   framedRiseReleaseHL: 0.10,
   framedClearSamples: 7,
   /**
-   * ...and the second axis, because elevation alone is not enough and the
-   * measurement says so. Mapping the whole sphere around the `ravine-gap`
-   * subject at its authored 19 m: at the authored azimuth the camera is inside
-   * the hill until 46 degrees of elevation — a plan view — while a 20 degree
-   * step around the subject is clear at the authored elevation. Yaw is cheaper
-   * to spend than pitch: swinging round the subject keeps the shot a shot,
-   * where craning over it turns a ravine gap into a map.
+   * ...and the second axis. Elevation alone can only ever crane, and craning
+   * far enough turns a shot into a map, so the solve searches azimuth as well
+   * and takes whichever is cheaper.
    *
-   * So the solve is a search over BOTH, ordered by a cost that prices a radian
-   * of azimuth below a radian of rise, plus a stickiness term that holds
-   * whichever side it is already on — a camera that re-picks its side every
-   * frame is worse than one that picks a mediocre side and stays there.
+   * WHAT IT ACTUALLY COSTS. A candidate is priced
+   *   |az|·framedAzCost + |az − framedAz|·framedAzStickCost + rise
+   * in radians. The second term is hysteresis — hold the side you are already
+   * on, because a camera that re-picks its side every frame is worse than one
+   * that picks a mediocre side and stays there — but note that at rest
+   * `framedAz` is 0, which is the steady state of every authored pose, and
+   * there the two terms collapse to |az|·1.20. So in practice azimuth is priced
+   * ABOVE rise, not below it, and only wins when it is a LOT cheaper in
+   * geometry. That is deliberate: the author picked the side, and the mountain
+   * gets a vote on the elevation before it gets one on the side.
+   *
+   * WHAT IT DOES ON THE CURRENT POSE SET: nothing, and that is the correct
+   * answer rather than a dead axis. Mapping `framedClear` over the whole
+   * (azimuth, rise) grid for every framed pose — `tools/capture/_framedmap.mjs`
+   * — the minimum clear rise at the authored azimuth, and the nearest azimuth
+   * that is clear with NO rise, come out:
+   *
+   *   ravine-gap           0°: 30° rise    nearest 0-rise azimuth: −60°
+   *   treeline-silhouette  0°: 21° rise    nearest 0-rise azimuth: +80°
+   *   rockgarden-low       0°:  4° rise    nearest 0-rise azimuth: −20° (0°)
+   *   rider-closeup        0°:  4° rise    nearest 0-rise azimuth: −20° (0°)
+   *
+   * A 60-degree swing costs 0.79 rad even with the stickiness term removed
+   * entirely, against 0.53 for the 30-degree crane, so rise wins on ravine-gap
+   * under ANY pricing that keeps yaw and pitch within a factor of two of each
+   * other. An earlier revision of this comment claimed a 20-degree step was
+   * clear at ravine-gap's authored elevation; that was measured on the old pose
+   * that framed the CROSSING. The pose now frames the approach and the claim no
+   * longer holds — re-measured, ±20° there needs 26-30° of rise, more than
+   * doing nothing. Do not re-tune the weights to force this axis to fire.
+   *
+   * What the axis is actually for is the case rise cannot solve at all: when
+   * nothing within `framedRiseMax` is clear the rise column returns the
+   * infinite-cost fallback, every azimuth column is then searched, and a shot
+   * that would otherwise ship as a hillside interior becomes a shot from the
+   * side. That case does not occur on today's poses. It is a floor, not a
+   * preference.
    */
   framedAzStep: 0.35,
   framedAzMax: 2.80,

@@ -620,7 +620,7 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // See zoneTerminatorInk. This is the stroke that turns a band boundary
     // into a drawn edge instead of a raw colour step, and it is the only line
     // system in the project that can see one.
-    col = mix(col, col * 0.58, zoneTerminatorInk(zone, lit) * 0.80);
+    col = mix(col, col * 0.58, zoneTerminatorInk(zone, lit) * 0.0);
 
     // ── Aerial plates ──────────────────────────────────────────────────────
     // The defect this exists to kill, stated exactly: on flat ground lit is

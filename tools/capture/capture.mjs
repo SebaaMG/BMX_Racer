@@ -249,12 +249,19 @@ async function buildContactSheet(page, frameDir, outPath, title, fps) {
   const files = (await readdir(frameDir)).filter((f) => f.endsWith('.png')).sort();
   if (!files.length) return;
 
-  const COLS = 6;
-  const MAX_CELLS = 30;
+  // 4 wide, not 6. A shipped frame is 3200x1800 device px; at COLS=6 a cell was
+  // 960x540, a 3.33x downsample — and a motion critic reviewing the sheet was
+  // therefore judging "is the subject legible" on a third of the resolution the
+  // player sees. That is how one reviewer measured a 150 px rider while a probe
+  // measured 254 px for the same frame: both were right about different images.
+  // At COLS=4 a cell is 1400x788, a 2.3x downsample, and the sheet still fits a
+  // readable grid.
+  const COLS = 4;
+  const MAX_CELLS = 24;
   const stride = Math.max(1, Math.ceil(files.length / MAX_CELLS));
   const picked = files.filter((_, i) => i % stride === 0).slice(0, MAX_CELLS);
 
-  const CELL_W = 480;
+  const CELL_W = 700;
   const CELL_H = Math.round((CELL_W * HEIGHT) / WIDTH);
   const LABEL_H = 22;
 

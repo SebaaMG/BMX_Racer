@@ -306,18 +306,48 @@ export class Sky {
          * the wander does not slide along the edge when the camera pans, which
          * is what separates "the edge of a wash" from "a shader effect".
          *
-         * The amplitude is the whole point. The previous build perturbed the
-         * horizon boundary by +/-0.004 in dir.y. That is 0.23 degrees of
-         * elevation, six native pixels over a 3200-pixel frame, and the critic
-         * correctly measured the result as a screen-space letterbox bar. The
-         * amplitudes below are 15-20x that: +/-2 degrees, +/-60 native pixels,
-         * with a long swell and a shorter brush ripple on top of it. No
-         * boundary in this sky can be traced as a level rule any more.
+         * THE AMPLITUDE IS THE WHOLE POINT, AND IT HAS BEEN WRONG TWICE.
+         *
+         * The first build perturbed the horizon boundary by +/-0.004 in dir.y.
+         * That is 0.23 degrees, six native pixels over a 3200-pixel frame, and
+         * the critic correctly read the result as a letterbox bar.
+         *
+         * The second build raised the coefficient to 0.075 and its comment
+         * claimed "+/-2 degrees, +/-60 native pixels". It was not measured, and
+         * it was not true. fbm2 is a NORMALISED weighted sum of value noise:
+         * its output is not spread over 0..1, it clusters hard about 0.5 with a
+         * standard deviation near 0.13. So wanderField, which the comment
+         * treated as +/-0.5, actually delivers about +/-0.10, and 0.075 of that
+         * is +/-0.008 in dir.y. tools/capture/_bandtrace.mjs traces the
+         * cream-to-orange boundary by COLOUR IDENTITY (so cloud and terrain
+         * edges cannot capture the tracer) and measured exactly that on
+         * finish-sprint: standard deviation 11.4 native rows, total range 46
+         * rows across 3200 pixels. A boundary that moves 46 rows over the full
+         * width of the frame is a rule with a slight bend in it.
+         *
+         * The coefficients below are calibrated against that measurement rather
+         * than guessed. 1453 native rows per unit of dir.y at this field of
+         * view (11.45 rows measured / 0.00788 dir.y applied), so a boundary
+         * standard deviation of 45 rows needs a coefficient near 0.30.
+         *
+         * Every boundary rides the SAME swell so that no two of them can ever
+         * cross, and each carries its own independent fine brush ripple on top,
+         * so they are never parallel either — parallel edges read as a printing
+         * error, and crossed edges read as a bug.
          */
         float wanderField(vec2 sp) {
-          float swell  = fbm2(sp * 2.15 + 11.0, 3) - 0.5;
-          float ripple = fbm2(sp * 6.30 + 41.0, 2) - 0.5;
-          return swell * 0.76 + ripple * 0.24;
+          float swell  = fbm2(sp * 1.90 + 11.0, 3) - 0.5;
+          float ripple = fbm2(sp * 5.40 + 41.0, 2) - 0.5;
+          return swell * 0.74 + ripple * 0.26;
+        }
+
+        /**
+         * The per-boundary brush ripple. Higher frequency than the swell and
+         * uncorrelated between boundaries, so an edge reads as laid down with a
+         * loaded brush rather than as a contour of one smooth field.
+         */
+        float brushField(vec2 sp, float seed) {
+          return fbm2(sp * 12.5 + seed, 2) - 0.5;
         }
 
         /**
@@ -385,11 +415,15 @@ export class Sky {
         vec3 skyGradient(vec3 dir, vec2 sp, float wander, vec2 fc) {
           float h = dir.y;
 
-          // Different amplitudes per boundary so the three edges never run
-          // parallel — parallel edges read as a printing error.
-          float hHorizon = h + wander * 0.075;
-          float hUpper   = h + wander * 0.105;
-          float hZenith  = h + wander * 0.150;
+          // A shared swell plus an independent brush ripple each. The shared
+          // term is what makes crossing structurally impossible: the smallest
+          // gap between two thresholds is 0.122 (0.018 to 0.140), the swell
+          // coefficients differ by at most 0.045 of a field whose peak is 0.3,
+          // and the ripples are 0.055 of the same, so the worst case closes the
+          // gap by 0.02 out of 0.122.
+          float hHorizon = h + wander * 0.300 + brushField(sp, 63.0) * 0.055;
+          float hUpper   = h + wander * 0.285 + brushField(sp, 91.0) * 0.048;
+          float hZenith  = h + wander * 0.330 + brushField(sp, 27.0) * 0.042;
 
           vec3 col = uBelow;
           col = mix(col, uHorizon, bandStepS(hHorizon, 0.018, 0.0018));
@@ -469,28 +503,56 @@ export class Sky {
         // simply resolves to "inside" or "outside" with no shimmer.
 
         /**
-         * THE SCALLOP, AND WHY A CLOUD NEEDS ONE.
+         * THE SCALLOP, AND WHY IT HAS TO BE A DISPLACEMENT AND NOT A THRESHOLD.
          *
          * The critic's third note was that the clouds "use the same shape
          * language as the terrain so they do not separate as sky". That is
          * literally true of the source: celCloudMask thresholds an fBm field,
          * and so does the heightfield — a level set of fBm is a level set of
          * fBm whether you colour it rock or cloud, and the eye recognises the
-         * family instantly.
+         * family instantly. A cumulus edge is not a level set. It is a stack of
+         * BULGES, each one roughly circular, at a scale finer than the cloud.
          *
-         * A cumulus edge is not a level set. It is a stack of BULGES, each one
-         * roughly circular, at a scale far finer than the cloud itself. So the
-         * threshold gets a fine, world-locked, high-frequency perturbation:
-         * the same silhouette, re-cut with a scalloped edge. It is applied as a
-         * single offset per pixel and used by the contour AND by both light
-         * probes, so the shape stays self-consistent.
+         * The previous pass tried to buy that by perturbing the THRESHOLD:
+         *
+         *     thr = mix(1.03, 0.50, det * live) - (fbm2(uv * 9.5, 2) - 0.5) * 0.075
+         *
+         * That term cannot do anything, and the reason is worth writing down.
+         * celCloudMask does not store a smooth field in the alpha channel — it
+         * stores an ALREADY-THRESHOLDED one, clamp((d - k) / 0.045), so the
+         * alpha is binary apart from a ramp one or two texels wide. Moving a
+         * threshold through a binary field slides the contour by
+         * offset / |grad alpha|, and |grad alpha| here is of order 0.5 PER
+         * TEXEL. An offset of 0.010, which is what that expression actually
+         * produced once fbm2's true spread is accounted for, moves the contour
+         * by about a fiftieth of a texel. It was a no-op, which is why the
+         * clouds still read as fBm level sets after it went in.
+         *
+         * A DISPLACEMENT OF THE SAMPLE POINT moves the contour by exactly the
+         * displacement, in texels, with no dependence on the field's gradient
+         * at all. So the scallop is now a domain warp, and its magnitude is a
+         * BILLOW — fbm2 folded about its own midpoint, whose level sets are
+         * rounded arcs rather than filigree. Folded noise pushing along a
+         * slowly-turning direction field is the cheapest thing that produces
+         * stacked lobes on a silhouette.
+         *
+         * Returned as a vector and applied ONCE to the layer's uv, so the
+         * contour, the ink, the sunlit cap probe and the shaded belly probe all
+         * see the same warped shape and the drawing stays self-consistent.
          *
          * Attenuated by the same detail term everything else uses — a scallop
          * finer than a pixel is just noise on the contour, and noise on a
          * contour is the one thing more obviously wrong than no contour.
          */
-        float cloudScallop(vec2 uv, float detail) {
-          return (fbm2(uv * 9.5, 2) - 0.5) * 0.075 * detail;
+        vec2 cloudScallop(vec2 uv, float detail) {
+          float billow = 1.0 - abs(fbm2(uv * 5.20 + 3.1, 2) * 2.0 - 1.0);
+          vec2 dir = normalize(vec2(
+            fbm2(uv * 3.10 + 17.0, 2) - 0.5,
+            fbm2(uv * 3.10 + 53.0, 2) - 0.5
+          ) + vec2(1e-5, 1e-5));
+          // 0.018 of the tile is 18 texels at 1024, against cloud features of
+          // 80-150 texels: a lobe you can see on the edge, not a new cloud.
+          return dir * (billow - 0.45) * 0.018 * detail;
         }
 
         /** x = coverage 0..1, y = ink 0..1, z = signed pixel distance. */
@@ -503,26 +565,28 @@ export class Sky {
           return vec3(inside, ink, dpx);
         }
 
-        /** Binary interior test for the light-break probes. No AA wanted. */
-        float insideAt(sampler2D tex, vec2 uv, float thr) {
-          return step(thr, texture(tex, uv).a);
-        }
-
         /**
-         * The three-value interior.
+         * The three-value interior, WITH THE BREAK LINED.
          *
          * Marching the mask TOWARD the sun and asking "how far can I go before
          * I leave the shape" is a depth-from-the-lit-edge measurement, and the
          * band it produces is a lit CAP of controlled width on the sun side
          * only — which is how an animator paints a cloud. Deriving the break
-         * from the mask's own interior value instead (which is what the old
-         * one did) gives a break whose shape is whatever the noise gradient
+         * from the mask's own interior value instead (which is what the first
+         * version did) gives a break whose shape is whatever the noise gradient
          * happened to be, unrelated to the light, and speckled at the detail
          * frequency.
          *
-         * The same probe run backwards gives the shaded underside. Hot cap on
-         * the sun side, cool cut on the far side, flat body in between, ink all
-         * the way round: three texture fetches and one drawn cloud.
+         * The probes now go through cutMask rather than a bare step(), for one
+         * reason: cutMask returns a SIGNED PIXEL DISTANCE, and a signed
+         * distance is the only thing you can draw a line on. An animator inks
+         * the boundary between the sunlit cap and the body — that line is what
+         * separates a painted cloud from a two-tone silhouette, and it was the
+         * missing half of the critic's "no lit/shadow break". It costs nothing
+         * extra: the probe fetch was already being made.
+         *
+         * Hot cap on the sun side, cool cut on the far side, flat body between,
+         * a line on the cap boundary, and ink all the way round the outside.
          */
         vec3 celCloud(
           sampler2D tex, vec2 uv, vec2 toSun, float thr,
@@ -530,11 +594,24 @@ export class Sky {
         ) {
           vec3 m = cutMask(tex, uv, thr);
           alpha = m.x;
-          float capOut   = 1.0 - insideAt(tex, uv + toSun * 2.0, thr);
-          float bellyOut = 1.0 - insideAt(tex, uv - toSun * 1.3, thr);
+
+          vec3 mCap   = cutMask(tex, uv + toSun * 2.0, thr);
+          vec3 mBelly = cutMask(tex, uv - toSun * 1.3, thr);
+          float capOut   = 1.0 - mCap.x;    // outside when probed toward the sun
+          float bellyOut = 1.0 - mBelly.x;  // outside when probed away from it
+
           vec3 c = mid;
           c = mix(c, shd, bellyOut);   // within reach of the shaded edge
           c = mix(c, lit, capOut);     // the sunlit cap wins over it
+
+          // THE CAP LINE. Where the sun-side probe is sitting exactly on the
+          // contour, the cap boundary passes through this pixel. Drawn at
+          // slightly under the outer contour's weight and toward the shadow
+          // rather than to full ink, because it is a form line inside a lit
+          // shape and not the edge of the shape.
+          float capLine = 1.0 - smoothstep(uInkPx * 0.5, uInkPx * 0.5 + 1.2, abs(mCap.z));
+          c = mix(c, mix(ink, shd, 0.35), capLine * alpha * 0.62);
+
           c = mix(c, ink, m.y);
           return c;
         }
@@ -577,7 +654,8 @@ export class Sky {
           vec2 uvFar = (dir.xz / (dir.y + 1.18)) * 2.60 + vec2(0.5) + driftFar;
           float liveFar = saturate1((h + wander * 0.09 + 0.010) / 0.150);
           float detFar = cloudDetail(uvFar);
-          float thrFar = mix(1.03, 0.50, detFar * liveFar) - cloudScallop(uvFar, detFar);
+          uvFar += cloudScallop(uvFar, detFar);
+          float thrFar = mix(1.03, 0.50, detFar * liveFar);
           vec3 cFar = celCloud(
             uCloudFar, uvFar, toSun * 0.014, thrFar,
             uFarLit, uFarMid, uFarShadow, uFarInk, alpha
@@ -589,7 +667,8 @@ export class Sky {
           vec2 uvNear = sp * 1.70 + vec2(0.5) + driftNear;
           float liveNear = saturate1((h + wander * 0.10 + 0.004) / 0.135);
           float detNear = cloudDetail(uvNear);
-          float thrNear = mix(1.03, 0.50, detNear * liveNear) - cloudScallop(uvNear, detNear);
+          uvNear += cloudScallop(uvNear, detNear);
+          float thrNear = mix(1.03, 0.50, detNear * liveNear);
           vec3 cNear = celCloud(
             uCloudNear, uvNear, toSun * 0.020, thrNear,
             uCloudLit, uCloudMid, uCloudShadow, uCloudInk, alpha
@@ -609,13 +688,19 @@ export class Sky {
           // 8 degrees, and — like everything else here — the envelope drives a
           // THRESHOLD, so the strips thin out and close rather than being cut.
           vec2 driftBank = vec2(sin(t * 0.0031 + 1.4), sin(t * 0.0026 + 3.3)) * 0.016;
-          vec2 uvBank = bankUv(sp, 1.06, 4.00, driftBank);
-          float hb = h + wander * 0.085;
+          vec2 uvBank = bankUv(sp, 1.06, 3.40, driftBank);
+          // The stratus rides the SAME swell the horizon boundary does, at very
+          // nearly the same coefficient. That is not decoration: the band this
+          // layer exists to fill now undulates by about 45 native rows, and a
+          // layer that stayed level inside a band that does not would sit
+          // outside its own band over half the frame.
+          float hb = h + wander * 0.270 + brushField(sp, 39.0) * 0.040;
           float bankIn  = saturate1((hb + 0.055) / 0.045);
           float bankOut = 1.0 - saturate1((hb - 0.015) / 0.115);
           float liveBank = bankIn * bankOut;
           float detBank = cloudDetail(uvBank);
-          float thrBank = mix(1.03, 0.46, detBank * liveBank) - cloudScallop(uvBank, detBank);
+          uvBank += cloudScallop(uvBank, detBank);
+          float thrBank = mix(1.03, 0.46, detBank * liveBank);
           vec3 cBank = celCloud(
             uCloudBank, uvBank, toSun * 0.016, thrBank,
             uBankLit, uBankMid, uBankShadow, uBankInk, alpha
