@@ -309,8 +309,14 @@ export const RAMPS = {
     colors: [c(0x2b2440), c(0x4d4266), c(0x7d6f94), c(0xb6a8bf)],
     thresholds: [0.10, 0.40, 0.74],
     edgeSoftness: 0.006,
-    specStrength: 0.95,
-    specPower: 140,
+    // Reachable, and bounded below the bloom threshold.
+    //
+    // specPower 140 produced a smooth gradient bloom — the one thing on the
+    // rider that read as PBR. And GRADE.bloomThreshold is 0.82 with the core
+    // tier contributing 0.75x strength on a 0.55 base, so anything above about
+    // 0.33 gets pushed straight back through the bloom pass and softens again.
+    specStrength: 0.26,
+    specPower: 16,
     rimStrength: 0.85,
     rimPower: 3.2,
     outlineWidth: 0.0080,
@@ -509,6 +515,25 @@ export const LINES = {
    * through hue, which is what a photograph does.
    */
   contourFogCap: 0.12,
+  /**
+   * DISTANCE IDENTITY. `RIDER_COLORS` promises riders are "instantly
+   * distinguishable at 200 m in silhouette-plus-hue", and a plain Fresnel rim
+   * plus fog cannot keep that promise: below about 40 px the rim collapses and
+   * the grade desaturates the jersey toward the terrain.
+   *
+   * `fullPx` is the apparent size above which nothing is applied; `floorPx` is
+   * where the floors reach full strength. The rim exponent is deliberately
+   * OPEN (1.15, not the 0.85 that reads best up close) because measurement
+   * showed the tighter rim was a NET LOSS below 25 px — a 15 px jersey is 24
+   * pixels and a 23%-of-radius rim spent a third of them on cream, costing more
+   * chroma than the floor recovered.
+   */
+  identityFullPx: 150,
+  identityFloorPx: 14,
+  identityChroma: 0.72,
+  identityRim: 0.9,
+  identityRimExponent: 1.15,
+  identityInkFloor: 0.30,
   /**
    * Crease-detector scale invariance, in normal-difference per unit of
    * world-space span across a pixel. The normal Sobel had no scale invariance

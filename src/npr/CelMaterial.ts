@@ -118,13 +118,18 @@ export interface IdentityOptions {
   inkFloor?: number;
 }
 
+/**
+ * Distance-identity defaults. The tuning lives in `LINES` in Palette.ts with
+ * the rest of the art direction; only `height` is a geometric fact about the
+ * subject rather than a choice, so it stays here.
+ */
 const IDENTITY_DEFAULTS = {
   height: 1.7,
-  fullPx: 150,
-  floorPx: 14,
-  chroma: 0.72,
-  rim: 0.9,
-  inkFloor: 0.30,
+  fullPx: LINES.identityFullPx,
+  floorPx: LINES.identityFloorPx,
+  chroma: LINES.identityChroma,
+  rim: LINES.identityRim,
+  inkFloor: LINES.identityInkFloor,
 };
 
 export interface CelOptions {

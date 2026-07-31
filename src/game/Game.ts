@@ -539,6 +539,17 @@ export class Game {
     }
     dir.resetTo(this.race.player.bike.state);
 
+    // Wipe every stateful effect before the situation is set up.
+    //
+    // The harness shoots all 16 poses in ONE page, 12 settle frames apart. Any
+    // FX that latches therefore leaks from one review frame into the next, and
+    // that is invisible to a single-pose capture — which is how a motion smear
+    // pinned at 0.821 by the `crash` pose came to dissolve the rider in
+    // `rider-closeup`, a pose that asks for 0.0. The reviewer sees a defect in
+    // a frame whose own state is innocent. Any stateful system added here later
+    // needs to be wiped in this call too.
+    this.effects.reset();
+
     // Ride into the situation rather than being dropped into it.
     if (s.preroll) {
       for (let i = 0; i < s.preroll; i++) this.race.fixedUpdate(1 / 120);
