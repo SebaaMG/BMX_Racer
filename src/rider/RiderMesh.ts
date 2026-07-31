@@ -644,20 +644,173 @@ const HEAD_CENTRE = new Vector3().lerpVectors(P.head, P.headEnd, 0.40);
 
 // ── Skin ─────────────────────────────────────────────────────────────────────
 
+/** Place a point given in HEAD-LOCAL coordinates into rig space. */
+function head(x: number, y: number, z: number): Vector3 {
+  return new Vector3(x, y, z).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
+}
+
+/**
+ * The face.
+ *
+ * At `rider-closeup` the head is 180 device pixels tall and a review called
+ * everything else in that frame publishable and the face the one thing letting
+ * it down: under the goggles there was a nose sphere (buried BEHIND the goggle
+ * band, so invisible) on an otherwise untouched flesh plane. No jaw, no mouth,
+ * no cheek, no chin.
+ *
+ * Three constraints shaped what is here:
+ *
+ *  1. THERE IS ALMOST NO FACE TO WORK WITH. The helmet shell reaches down to
+ *     head-local y = -0.066 and the goggle band occupies y = -0.062 to +0.016
+ *     standing proud of it. Everything a viewer can actually see lives in the
+ *     54 mm between the goggle's lower edge and the point of the chin — which
+ *     is 45 px at this crop. So the detail is all mouth, jaw and chin, and the
+ *     eye structure is expressed as the lower orbit ridge that meets the
+ *     goggle rather than as anything behind it.
+ *
+ *  2. EVERY LINE HAS TO BE GEOMETRY. There are no textures in this project, so
+ *     a mouth is not a drawn line, it is two lip forms meeting at an angle
+ *     steep enough for the Sobel normal pass to ink (LINES.sobelNormalThreshold
+ *     is 0.32, about 19 degrees). Parts here are deliberately NOT normal-welded
+ *     to each other — see the file header — so each of these forms shades as a
+ *     hard edge against its neighbour, which is exactly what a cel ramp needs.
+ *
+ *  3. IT MUST COST NOTHING SMALL. All of it is rigid-bound to the head bone
+ *     and merged into the existing skin geometry, so it adds triangles and not
+ *     a single draw call, a material, or a bone. At 40 px the whole face is
+ *     six pixels tall, every crease is sub-pixel, and the Sobel simply has no
+ *     gradient to find — the detail costs nothing because it stops existing.
+ */
+function buildFaceParts(): BufferGeometry[] {
+  const parts: BufferGeometry[] = [];
+  const add = (g: BufferGeometry): void => { parts.push(rigidPart(g, 'head')); };
+
+  // Head-local axes in rig space, so the lofts below can be authored in the
+  // head's own frame and still get a stable, non-corkscrewing ring basis.
+  const localX = new Vector3(1, 0, 0).transformDirection(HEAD_BASIS);
+  const localY = new Vector3(0, 1, 0).transformDirection(HEAD_BASIS);
+
+  // ── ONE head, not a pile of balls ──────────────────────────────────────────
+  //
+  // The first attempt at this face was additive: a skull sphere, a jaw sphere,
+  // two gonial spheres, two cheek ellipsoids, a chin, two lip tubes. Every one
+  // of those is a separate closed solid, every intersection between two of
+  // them is a silhouette, and the inverted hull inks a silhouette wherever it
+  // finds one. The result at a 180 px crop was a bunch of grapes: five or six
+  // outlined sausages with 2 px of ink around each. It is the exact failure
+  // the jersey sleeve was rebuilt to fix (see buildJerseyParts) and it has to
+  // be avoided the same way.
+  //
+  // So the skull, the cheek, the jaw and the chin are ONE loft with a varying
+  // cross-section and a varying forward offset. One solid, one silhouette, one
+  // stroke. The cheekbone and the jaw line come from where the ellipse changes
+  // shape, which the hard ramp turns into a terminator and the Sobel normal
+  // pass turns into an interior line — drawn marks, not extra outlines.
+  //
+  // rows: [y, halfWidth, halfDepth, forward offset]
+  const skull: [number, number, number, number][] = [
+    [ 0.098, 0.028, 0.032, -0.008],
+    [ 0.076, 0.058, 0.064, -0.006],
+    [ 0.044, 0.080, 0.088, -0.003],
+    [ 0.008, 0.089, 0.097,  0.000],
+    [-0.026, 0.088, 0.096,  0.003],   // brow / goggle line
+    [-0.050, 0.083, 0.092,  0.008],   // upper cheek — widest forward push
+    [-0.064, 0.077, 0.087,  0.010],   // cheekbone
+    [-0.080, 0.066, 0.079,  0.008],   // the cheek falling into the jaw
+    [-0.094, 0.054, 0.068,  0.003],   // jaw line
+    [-0.108, 0.041, 0.055, -0.003],
+    [-0.120, 0.026, 0.038, -0.010],   // chin
+    [-0.129, 0.012, 0.022, -0.017],
+  ];
+  add(
+    buildLoft(
+      ringsAlongPath(
+        skull.map((r) => head(0, r[0], r[3])),
+        skull.map((r) => r[1]),
+        skull.map((r) => r[2]),
+        localX,
+      ),
+      18,
+      true,
+      true,
+    ),
+  );
+
+  // Everything below is SHALLOW. Each of these protrudes 2-9 mm from the loft,
+  // so the stroke it earns is a line across the face rather than an outline
+  // around a lump — which is the whole difference between a drawn feature and
+  // a stuck-on ball.
+
+  // ── Brow ───────────────────────────────────────────────────────────────────
+  // The ridge the goggle strap is pulled over. Protrudes ~3 mm.
+  add(
+    loftLimb(
+      [head(-0.070, -0.030, 0.056), head(-0.038, -0.026, 0.082), head(0, -0.024, 0.090), head(0.038, -0.026, 0.082), head(0.070, -0.030, 0.056)],
+      [0.008, 0.009, 0.009, 0.009, 0.008],
+      [0.009, 0.011, 0.011, 0.011, 0.009],
+      6,
+      1,
+      1,
+      localY,
+    ),
+  );
+
+  // ── Nose ───────────────────────────────────────────────────────────────────
+  // The old nose sat at head-local y = -0.020, which is inside the goggle
+  // band's own y span (-0.062 to +0.016) and 3 cm behind its front face — so
+  // it was drawn entirely behind the lens and the rider had, functionally, no
+  // nose at all. It now starts at the goggle's lower edge and runs to the lip.
+  add(
+    loftLimb(
+      [head(0, -0.052, 0.086), head(0, -0.066, 0.098), head(0, -0.078, 0.092)],
+      [0.009, 0.013, 0.015],
+      [0.010, 0.013, 0.012],
+      8,
+      1,
+      1,
+      localX,
+    ),
+  );
+
+  // ── Mouth ──────────────────────────────────────────────────────────────────
+  // Two wide, shallow lip ridges with a 4 mm gap. The gap is the mouth: the
+  // surface normal swings through most of a right angle across it, far past
+  // LINES.sobelNormalThreshold, so the interior-line pass inks a line there.
+  // No texture, no decal and no extra material exists anywhere in this project
+  // to draw one with, so the line has to be earned geometrically.
+  //
+  // 2.5 mm of protrusion, 46 mm wide. A mouth modelled as a deep slot reads as
+  // a wound at this crop; two low ridges read as a mouth.
+  add(
+    loftLimb(
+      [head(-0.023, -0.089, 0.062), head(0, -0.087, 0.076), head(0.023, -0.089, 0.062)],
+      [0.005, 0.006, 0.005],
+      [0.006, 0.007, 0.006],
+      6,
+      1,
+      1,
+      localY,
+    ),
+  );
+  add(
+    loftLimb(
+      [head(-0.020, -0.100, 0.059), head(0, -0.099, 0.073), head(0.020, -0.100, 0.059)],
+      [0.005, 0.006, 0.005],
+      [0.005, 0.007, 0.005],
+      6,
+      1,
+      1,
+      localY,
+    ),
+  );
+
+  return parts;
+}
+
 function buildSkinParts(): BufferGeometry[] {
   const parts: BufferGeometry[] = [];
 
-  // Skull + face. The skull is mostly hidden by the helmet; what matters is the
-  // jaw and cheek line under the goggle strap, so that is where the detail is.
-  parts.push(
-    rigidPart(sphereForm(HEAD_CENTRE, D.headRadius * 0.95, D.headRadius * 1.06, D.headRadius, 16, 12, Math.PI, HEAD_BASIS), 'head'),
-  );
-  // Jaw / chin wedge, pushed forward and down out of the skull sphere.
-  const jaw = new Vector3(0, -0.052, 0.026).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-  parts.push(rigidPart(sphereForm(jaw, 0.070, 0.060, 0.082, 12, 8, Math.PI, HEAD_BASIS), 'head'));
-  // Nose — tiny, but a face without one reads as a mannequin at close range.
-  const nose = new Vector3(0, -0.020, 0.092).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-  parts.push(rigidPart(sphereForm(nose, 0.020, 0.026, 0.024, 8, 6, Math.PI, HEAD_BASIS), 'head'));
+  for (const p of buildFaceParts()) parts.push(p);
 
   // Neck.
   const neckPath = [offset(P.neck, 0, -0.030, -0.010), P.neck, mix(P.neck, P.head, 0.75)];
@@ -1177,9 +1330,16 @@ function buildHelmetParts(): BufferGeometry[] {
 
   // Ear/temple pads: they close the gap between the shell edge and the jaw, and
   // they are what stops the lid reading as a bowl balanced on a head.
+  //
+  // Moved BACK and DOWN, and slimmed. At the old size and position the pad's
+  // surface reached 0.134 out along X while the goggle band ends at 0.096, so
+  // from any three-quarter angle a 6 cm helmet-coloured ball sat proud of the
+  // lens directly over the eye — which is what the close crop was actually
+  // showing when it reported a featureless face. An ear pad belongs behind the
+  // goggle strap and under the shell edge, not in front of both.
   for (const side of [1, -1]) {
-    const pad = new Vector3(side * (R * 0.88), -0.050, -0.010).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-    parts.push(rigidPart(sphereForm(pad, 0.030, 0.042, 0.052, 10, 8, Math.PI, HEAD_BASIS), 'head'));
+    const pad = new Vector3(side * (R * 0.84), -0.064, -0.034).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
+    parts.push(rigidPart(sphereForm(pad, 0.024, 0.034, 0.042, 10, 8, Math.PI, HEAD_BASIS), 'head'));
   }
 
   // Peak / visor: a swept plate tilted down over the goggles.
@@ -1314,20 +1474,89 @@ export function reHueMaterial(mat: CelMaterial, base: RampPreset, target: Color,
 /** Materials with no per-rider variation are built once and shared. */
 const sharedMaterials = new Map<RiderPart, CelMaterial>();
 
-function celOptionsFor(part: RiderPart): CelOptions {
-  const o: CelOptions = { skinned: true, idName: `rider-${part}`, name: `rider:${part}` };
+/**
+ * How hard each part is held to its identity once the rider gets small.
+ *
+ * `chroma` is how strongly the fragment is re-seated on the committed hue and
+ * `rim` how strong the forced separating line is. The jersey carries almost
+ * all of the recognition load — RIDER_COLORS is a jersey palette — so it is
+ * held hardest; skin and rubber get a rim so the figure keeps its edges but
+ * almost no chroma, because a skin tone pushed to full saturation at 20 px
+ * reads as a costume rather than as an arm.
+ *
+ * Every part opts in, including the ones with no chroma to hold, because the
+ * INK TAPER travels on the same flag and it has to be uniform: thinning the
+ * jersey's outline while leaving the shorts at full width breaks the figure
+ * into parts drawn at two different weights.
+ */
+const IDENTITY_WEIGHT: Record<RiderPart, { chroma: number; rim: number }> = {
+  skin: { chroma: 0.20, rim: 0.55 },
+  jersey: { chroma: 0.80, rim: 1.00 },
+  cloth: { chroma: 0.40, rim: 0.60 },
+  rubber: { chroma: 0.10, rim: 0.45 },
+  helmet: { chroma: 0.60, rim: 0.85 },
+  lens: { chroma: 0.15, rim: 0.55 },
+};
+
+function celOptionsFor(part: RiderPart, identityColor: Color): CelOptions {
+  const w = IDENTITY_WEIGHT[part];
+  const o: CelOptions = {
+    skinned: true,
+    idName: `rider-${part}`,
+    name: `rider:${part}`,
+    identity: { color: identityColor.clone(), height: 1.7, chroma: w.chroma, rim: w.rim },
+  };
   if (part === 'lens') {
     o.matcapMix = 0.55;
   } else if (part === 'helmet') {
-    o.matcapMix = 0.18;
+    // A REACHABLE exponent, exactly as RAMPS.water was corrected from 160 to 4.
+    //
+    // RAMPS.helmet declares specPower 140. `bandedSpecular` thresholds
+    // pow(N.H, power) through `bandStep`, whose anti-aliasing width is
+    // max(fwidth(x) * 0.75, softness) — and that is the trap. At an exponent
+    // of 140 the term goes from 0 to 1 across a couple of pixels, so fwidth
+    // is order 1, the "one pixel wide" AA edge becomes the ENTIRE range, and
+    // the declaration that asked for the hardest highlight on the rider
+    // produces the softest gradient in the frame. That is the term a critic
+    // read as "the one thing that reads as PBR in an otherwise clean rider".
+    //
+    // At 9 the exponent is reachable at this sun angle and the derivative is
+    // small, so bandStep falls back to the preset's 0.006 softness and draws
+    // what it was always meant to draw. Measured across the crown at
+    // rider-closeup: 140 gives a 4 px bump peaking at luma 182; a reachable
+    // exponent gives a flat plateau with a single-pixel step on each side.
+    //
+    // 16, not 9, and 0.34 rather than the preset's 0.95: once the highlight
+    // is actually reachable the declared strength is enormous. At 0.9 the
+    // core clears the bloom threshold across a third of the crown and the
+    // helmet goes white — a hard-edged blowout is no better than a soft one.
+    // The shape has to be a MARK on the shell, not a second light source.
+    o.specPower = 16;
+    o.specStrength = 0.34;
+    // ...and posterise, because the highlight was only half the story: see
+    // CelOptions.valueSteps. Seven tiers is enough to carry a 4-band ramp, a
+    // two-tier specular and a rim without any of them running into each other.
+    o.valueSteps = 7;
+    // ...and less matcap, because with a real highlight present the matcap is
+    // no longer carrying the gloss and its own soft content is just haze.
+    o.matcapMix = 0.10;
   }
   return o;
 }
 
+/** Identity colours for the parts every rider shares. Ramp-derived, not per-rider. */
+const SHARED_IDENTITY: Record<string, Color> = {
+  skin: RAMPS.skin.colors[1],
+  cloth: RAMPS.cloth.colors[2],
+  rubber: RAMPS.rubber.colors[2],
+  lens: RAMPS.lens.colors[1],
+};
+
 function sharedMaterial(part: RiderPart): CelMaterial {
   let m = sharedMaterials.get(part);
   if (!m) {
-    m = new CelMaterial(RAMPS[PART_RAMP[part]], celOptionsFor(part));
+    const id = SHARED_IDENTITY[part] ?? RAMPS[PART_RAMP[part]].colors[1];
+    m = new CelMaterial(RAMPS[PART_RAMP[part]], celOptionsFor(part, id));
     sharedMaterials.set(part, m);
   }
   return m;
@@ -1374,11 +1603,11 @@ export function buildRiderMeshes(skel: RiderSkeleton, opts: RiderMeshOptions = {
 
   const jerseyMaterial = new CelMaterial(
     reHueRamp(RAMPS.jerseyPlayer, jerseyColor),
-    celOptionsFor('jersey'),
+    celOptionsFor('jersey', jerseyColor),
   );
   const helmetMaterial = new CelMaterial(
     reHueRamp(RAMPS.helmet, accentColor, 0.40),
-    celOptionsFor('helmet'),
+    celOptionsFor('helmet', accentColor),
   );
   owned.push(jerseyMaterial, helmetMaterial);
 
@@ -1411,8 +1640,30 @@ export function buildRiderMeshes(skel: RiderSkeleton, opts: RiderMeshOptions = {
   return { group, meshes, hulls, owned, jerseyMaterial, helmetMaterial };
 }
 
+const _idColor = new Color();
+
 /** Apply a rider's identity colours to an already-built set. */
 export function applyRiderColors(set: RiderMeshSet, jersey: number, accent: number): void {
-  reHueMaterial(set.jerseyMaterial, RAMPS.jerseyPlayer, new Color().setHex(jersey), 0.7);
-  reHueMaterial(set.helmetMaterial, RAMPS.helmet, new Color().setHex(accent), 0.40);
+  _idColor.setHex(jersey);
+  reHueMaterial(set.jerseyMaterial, RAMPS.jerseyPlayer, _idColor, 0.7);
+  setIdentityColor(set.jerseyMaterial, _idColor);
+  _idColor.setHex(accent);
+  reHueMaterial(set.helmetMaterial, RAMPS.helmet, _idColor, 0.40);
+  setIdentityColor(set.helmetMaterial, _idColor);
+}
+
+/**
+ * Move a material's distance chroma floor onto a new hue.
+ *
+ * Riders are recoloured after construction (RiderRig calls setJerseyColor on
+ * every racer), so the floor has to follow — otherwise every opponent would be
+ * held to whatever colour the material happened to be built with, and at range
+ * the whole grid would converge on one hue. Which is the exact failure the
+ * floor exists to prevent.
+ */
+function setIdentityColor(mat: CelMaterial, color: Color): void {
+  const u = mat.uniforms.uIdentityColor;
+  if (u) (u.value as Color).copy(color);
+  const hull = mat.hullMaterial;
+  if (hull?.uniforms?.uIdentityColor) (hull.uniforms.uIdentityColor.value as Color).copy(color);
 }

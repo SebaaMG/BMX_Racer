@@ -213,6 +213,22 @@ export const CAMERA_TUNING = {
   boomShortenHL: 0.075,
   boomRecoverHL: 0.34,
 
+  /**
+   * Distance the subject may move between two rendered frames before the rig
+   * treats it as a TELEPORT rather than as motion, metres.
+   *
+   * Nothing legitimate comes close: `update` clamps dt at 0.1 s and the bike
+   * tops out around 47 m/s, so the worst honest step is 4.7 m. Past this the
+   * subject did not travel, it was MOVED — a respawn, a checkpoint reset, or
+   * the capture harness pre-rolling the simulation 130 physics steps without
+   * rendering a frame, which is exactly what the `landing` sequence does now.
+   * Springs cannot chase a discontinuity: the arm opens to 21 m and collapses
+   * over five frames while the look spring trails twenty metres behind, and for
+   * eleven frames the subject is BEHIND THE LENS. Measured, on the shipped
+   * sequence: viewZ +3.05 (behind) for f0000-f0010, zero subject pixels.
+   */
+  subjectJumpMax: 7.0,
+
   /** Radius of the subject's own body, for the near-fade and lift tests. */
   bodyRadius: 0.95,
   /**
@@ -296,8 +312,36 @@ export const CAMERA_TUNING = {
   framedRiseMax: 0.90,
   framedRiseMaxElev: 1.24,
   framedRiseAttackHL: 0.06,
-  framedRiseReleaseHL: 0.34,
+  /**
+   * Release is fast for a smoothing term — 0.10 s, not the 0.34 s the vertical
+   * escape uses. This correction is a SOLVED CONSTRAINT, not a spring: the
+   * moment the shot is legal again the authored framing is the right answer and
+   * every frame spent easing back to it is a frame of a shot nobody composed.
+   * It also has to converge inside the twelve frames the capture harness settles
+   * for, or every still ships a half-released correction.
+   */
+  framedRiseReleaseHL: 0.10,
   framedClearSamples: 7,
+  /**
+   * ...and the second axis, because elevation alone is not enough and the
+   * measurement says so. Mapping the whole sphere around the `ravine-gap`
+   * subject at its authored 19 m: at the authored azimuth the camera is inside
+   * the hill until 46 degrees of elevation — a plan view — while a 20 degree
+   * step around the subject is clear at the authored elevation. Yaw is cheaper
+   * to spend than pitch: swinging round the subject keeps the shot a shot,
+   * where craning over it turns a ravine gap into a map.
+   *
+   * So the solve is a search over BOTH, ordered by a cost that prices a radian
+   * of azimuth below a radian of rise, plus a stickiness term that holds
+   * whichever side it is already on — a camera that re-picks its side every
+   * frame is worse than one that picks a mediocre side and stays there.
+   */
+  framedAzStep: 0.35,
+  framedAzMax: 2.80,
+  framedAzCost: 0.75,
+  framedAzStickCost: 0.45,
+  framedAzAttackHL: 0.10,
+  framedAzReleaseHL: 0.12,
 
   /** Another rider begins dithering out at this range and is gone by `Full`. */
   nearFadeStart: 2.60,
@@ -487,6 +531,8 @@ export class CameraDirector implements ICameraDirector {
    * solver can only ever raise a shot, never drop it below what was authored.
    */
   private framedRise = 0;
+  /** Extra AZIMUTH applied to a hand-framed arm, radians, signed. */
+  private framedAz = 0;
   /** Last solved boom length, pivot to camera. */
   private boomLength = 0;
   /**
@@ -509,6 +555,10 @@ export class CameraDirector implements ICameraDirector {
 
   // Safe-area framing controller.
   private frameBias = 0;
+
+  // Subject continuity.
+  private lastSubject = new Vector3();
+  private subjectSeen = false;
 
   // Event edge detection.
   private prevAirborne = false;
@@ -687,6 +737,20 @@ export class CameraDirector implements ICameraDirector {
     this.subject = target;
     const d = clamp(dt, 0, 0.1);
     const rd = clamp(realDt ?? dt, 0, 0.1);
+
+    // A teleport is not a fast movement, and a spring told to treat it as one
+    // loses the subject completely for as long as it takes to catch up. Re-seat
+    // instead. See `subjectJumpMax`. Chase only: Orbit rebuilds its position
+    // from the subject every frame and has nothing to re-seat, and Replay is
+    // driven by the recorder rather than by this state at all.
+    if (this.subjectSeen && this.mode === CameraMode.Chase) {
+      _tmp.copy(target.position).sub(this.lastSubject);
+      if (_tmp.lengthSq() > CAMERA_TUNING.subjectJumpMax * CAMERA_TUNING.subjectJumpMax) {
+        this.resetTo(target);
+      }
+    }
+    this.lastSubject.copy(target.position);
+    this.subjectSeen = true;
 
     if (this.autoDetect) this.detectEvents(target, rd);
     this.updateCrashFocus(rd);
@@ -1308,6 +1372,7 @@ export class CameraDirector implements ICameraDirector {
 
     this.collisionLift = 0;
     this.framedRise = 0;
+    this.framedAz = 0;
     this.boomRetract = 0;
     this.frameBias = 0;
     this.shakeDur = 0;
@@ -1370,6 +1435,8 @@ export class CameraDirector implements ICameraDirector {
     this.boomDesired = Math.sqrt(d0 * d0 + pv0 * pv0);
     this.boomLength = this.boomDesired;
     this.subject = target;
+    this.lastSubject.copy(target.position);
+    this.subjectSeen = true;
     this.prevAirborne = target.mode === BikeMode.Airborne;
     this.prevCrashing = target.mode === BikeMode.Crashing;
     this.timeScale = 1;
@@ -1684,6 +1751,7 @@ export class CameraDirector implements ICameraDirector {
     }
 
     this.framedRise = 0;
+    this.framedAz = 0;
 
     // Vertical escape for what shortening could not fix — the camera end
     // sitting in rising ground, or a rider passing directly under the lens.
@@ -1758,47 +1826,97 @@ export class CameraDirector implements ICameraDirector {
     const len = Math.sqrt(h * h + dy * dy);
     if (len < 1e-3) {
       this.framedRise = 0;
+      this.framedAz = 0;
       return;
     }
     const e0 = Math.atan2(dy, h);
-    const ux = h > 1e-4 ? dx / h : -Math.sin(this.aimYaw);
-    const uz = h > 1e-4 ? dz / h : -Math.cos(this.aimYaw);
+    const az0 = h > 1e-4 ? Math.atan2(dx, dz) : this.aimYaw + Math.PI;
 
-    let want = 0;
-    if (!this.framedClear(pivot, len, ux, uz, e0)) {
-      const maxRise = Math.min(
-        CAMERA_TUNING.framedRiseMax,
-        Math.max(0, CAMERA_TUNING.framedRiseMaxElev - e0),
-      );
-      const step = CAMERA_TUNING.framedRiseStep;
-      // If nothing in the range clears, take the top of it: a steep shot that
-      // still has the mountain in the way is worth more than a shot buried in
-      // it, and the unconditional floor downstream will do the rest.
-      want = maxRise;
-      for (let r = step; r <= maxRise + 1e-6; r += step) {
-        if (this.framedClear(pivot, len, ux, uz, e0 + r)) {
-          want = r;
-          break;
-        }
+    const maxRise = Math.min(
+      CAMERA_TUNING.framedRiseMax,
+      Math.max(0, CAMERA_TUNING.framedRiseMaxElev - e0),
+    );
+    const rStep = CAMERA_TUNING.framedRiseStep;
+    const aStep = CAMERA_TUNING.framedAzStep;
+    const wa = CAMERA_TUNING.framedAzCost;
+    const ws = CAMERA_TUNING.framedAzStickCost;
+
+    // Fall back to the top of the rise range if nothing at all is clear: a
+    // steep shot with the mountain still in it beats a shot buried inside it,
+    // and the unconditional floor downstream will catch what is left.
+    let bestCost = Number.POSITIVE_INFINITY;
+    let bestRise = maxRise;
+    let bestAz = 0;
+
+    // Azimuth candidates in order of increasing deviation, 0, -a, +a, -2a, ...
+    // The column is skipped whole the moment its cheapest possible member is
+    // already more expensive than the best answer found — which is what keeps
+    // a two-axis search from being a two-axis cost.
+    const nAz = Math.floor(CAMERA_TUNING.framedAzMax / aStep);
+    for (let k = 0; k <= nAz * 2; k++) {
+      const i = (k + 1) >> 1;
+      const az = (k === 0 ? 0 : (k & 1 ? -i : i)) * aStep;
+      const floorCost = Math.abs(az) * wa + Math.abs(az - this.framedAz) * ws;
+      if (floorCost >= bestCost) {
+        // Every remaining candidate in this column and every column beyond it
+        // deviates further, so nothing left can win.
+        if (az !== 0 && Math.abs(az) * wa >= bestCost) break;
+        continue;
+      }
+      for (let r = 0; r <= maxRise + 1e-6; r += rStep) {
+        const cost = floorCost + r;
+        if (cost >= bestCost) break;
+        if (!this.framedClear(pivot, len, az0 + az, e0 + r)) continue;
+        bestCost = cost;
+        bestRise = r;
+        bestAz = az;
+        break;
       }
     }
 
     this.framedRise =
-      want > this.framedRise
-        ? dampHL(this.framedRise, want, CAMERA_TUNING.framedRiseAttackHL, dt)
-        : dampHL(this.framedRise, want, CAMERA_TUNING.framedRiseReleaseHL, dt);
+      bestRise > this.framedRise
+        ? dampHL(this.framedRise, bestRise, CAMERA_TUNING.framedRiseAttackHL, dt)
+        : dampHL(this.framedRise, bestRise, CAMERA_TUNING.framedRiseReleaseHL, dt);
+    this.framedAz = dampHL(
+      this.framedAz,
+      bestAz,
+      Math.abs(bestAz) > Math.abs(this.framedAz)
+        ? CAMERA_TUNING.framedAzAttackHL
+        : CAMERA_TUNING.framedAzReleaseHL,
+      dt,
+    );
+
+    // THE INTERMEDIATE STATE HAS TO BE LEGAL TOO.
+    //
+    // The search returns a discrete answer and the straight line between two
+    // legal answers is not itself legal: on `ravine-gap` the solver correctly
+    // found "step 20 degrees round the subject, no crane at all", and the
+    // half-damped pose on the way there — 13 degrees of crane, 10 degrees of
+    // yaw — was inside the hillside, which is precisely the frame that shipped.
+    // A damper is the right tool for a preference and the wrong one for a
+    // constraint. If the pose we are about to use cannot see the subject, take
+    // the solved one outright: a camera that arrives in one frame is a cut, and
+    // a cut is worth incomparably more than a frame with no subject in it.
+    if (
+      bestCost < Number.POSITIVE_INFINITY &&
+      !this.framedClear(pivot, len, az0 + this.framedAz, e0 + this.framedRise)
+    ) {
+      this.framedRise = bestRise;
+      this.framedAz = bestAz;
+    }
   }
 
   /**
-   * Can a camera at this elevation, on an arm of this length and azimuth, both
+   * Can a camera at this azimuth and elevation, on an arm of this length, both
    * stand clear of the ground and see the pivot? Pure query, no state.
    */
-  private framedClear(pivot: Vector3, len: number, ux: number, uz: number, elev: number): boolean {
+  private framedClear(pivot: Vector3, len: number, azim: number, elev: number): boolean {
     const ce = Math.cos(elev);
     const se = Math.sin(elev);
-    const cx = pivot.x + ux * ce * len;
+    const cx = pivot.x + Math.sin(azim) * ce * len;
     const cy = pivot.y + se * len;
-    const cz = pivot.z + uz * ce * len;
+    const cz = pivot.z + Math.cos(azim) * ce * len;
 
     if (this.terrain) {
       if (cy < this.terrain.heightAt(cx, cz) + CAMERA_TUNING.terrainMargin) return false;
@@ -1825,9 +1943,13 @@ export class CameraDirector implements ICameraDirector {
     return true;
   }
 
-  /** Rotate a solved framed arm up by `framedRise`, preserving length and azimuth. */
+  /**
+   * Swing a solved framed arm to the elevation and azimuth the search chose,
+   * preserving its LENGTH exactly. The length is the one thing the author
+   * unambiguously specified and the one thing the mountain has no opinion on.
+   */
   private applyFramedRise(cam: Vector3, pivot: Vector3): void {
-    if (this.framedRise <= 1e-4) return;
+    if (this.framedRise <= 1e-4 && Math.abs(this.framedAz) <= 1e-4) return;
     const dx = cam.x - pivot.x;
     const dy = cam.y - pivot.y;
     const dz = cam.z - pivot.z;
@@ -1835,11 +1957,13 @@ export class CameraDirector implements ICameraDirector {
     const len = Math.sqrt(h * h + dy * dy);
     if (len < 1e-3) return;
     const e = Math.min(Math.atan2(dy, h) + this.framedRise, CAMERA_TUNING.framedRiseMaxElev);
+    const a = (h > 1e-4 ? Math.atan2(dx, dz) : this.aimYaw + Math.PI) + this.framedAz;
     const ce = Math.cos(e);
-    const se = Math.sin(e);
-    const ux = h > 1e-4 ? dx / h : -Math.sin(this.aimYaw);
-    const uz = h > 1e-4 ? dz / h : -Math.cos(this.aimYaw);
-    cam.set(pivot.x + ux * ce * len, pivot.y + se * len, pivot.z + uz * ce * len);
+    cam.set(
+      pivot.x + Math.sin(a) * ce * len,
+      pivot.y + Math.sin(e) * len,
+      pivot.z + Math.cos(a) * ce * len,
+    );
   }
 
   /** Raise a point clear of the hillside. No amplification, no state. */

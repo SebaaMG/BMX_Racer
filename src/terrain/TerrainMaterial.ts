@@ -652,13 +652,20 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // 3% value multiply. Three or four levels out of 255. A step has to be a
     // step you can point at.
     //
-    // The ladder below is 5 m to 400 m in seven steps of 1.87x, which puts
-    // boundaries at 6.8, 12.8, 23.9, 44.6, 83.4, 156 and 291 m. Four of them
-    // are inside the first forty-five metres, which is the range that receding
-    // FLAT ground occupies in a chase or orbit shot, and three more cover the
-    // middle distance before the fog bands take over at 223 m.
-    float aerialT = saturate1(log2(clamp(s.viewDist, 5.0, 400.0) / 5.0) / 6.322);
-    float plate   = floor(aerialT * 7.0 + 0.5) / 7.0;
+    // THE LADDER HAS TO START UNDER THE WHEELS, and that is the correction the
+    // first attempt at this still got wrong. A plate map of the treeline frame
+    // showed the entire bottom 290 rows — a third of the picture — sitting on
+    // plate zero, because an orbit or chase camera puts the ground it is
+    // looking over between two and seven metres away and the ladder did not
+    // start until five. The nearest boundary has to be nearer than the nearest
+    // ground.
+    //
+    // 2.2 m to 420 m in nine steps of 1.83x: boundaries at 3.0, 5.4, 9.9, 18.2,
+    // 33.2, 60.7, 111, 203 and 371 m. Two land in the first six metres, five
+    // inside the first thirty-five, and the last three carry the middle
+    // distance up to where the fog bands take over at 223 m.
+    float aerialT = saturate1(log2(clamp(s.viewDist, 2.2, 420.0) / 2.2) / 7.577);
+    float plate   = floor(aerialT * 9.0 + 0.5) / 9.0;
 
     float hazeSun = saturate1(dot(normalize(-V), uSunDir));
     hazeSun = hazeSun * hazeSun;
@@ -680,8 +687,47 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // small — a quarter of what it was per step — and warms toward the sun
     // exactly as the fog does, because at a 21.5 degree sun the air between you
     // and a ridge you are looking INTO is gold, not blue.
-    col = mix(col, hazeCol, plate * 0.17);
-    col *= mix(0.93, 1.27, plate);
+    //
+    // 38% of value spread over nine steps is 4.2% a step, which at a band value
+    // of 175 is a jump of seven or eight levels across a hard boundary — an
+    // unmistakable terrace, and about what separates two adjacent greys on a
+    // painted background plate.
+    col = mix(col, hazeCol, plate * 0.18);
+    col *= mix(0.92, 1.30, plate);
+
+    // ── Ground shapes: the third value system, and the only one that works ──
+    // ── on the surface that defeats the other two ──────────────────────────
+    //
+    // A plate map of the treeline frame settled the argument. Below the crest,
+    // 385 consecutive rows — a third of the picture — sat on ONE aerial plate,
+    // because the far wall of a bowl is very nearly equidistant from the camera
+    // across its whole visible face. The ramp is constant there too: a dune
+    // face of uniform slope has a constant normal, so the lighting term cannot
+    // move either. Every quantised system in this shader was correctly
+    // returning the same answer for every pixel, and the correct answer was a
+    // flat wash covering a third of the frame.
+    //
+    // A background painter never leaves that surface flat. They break it into a
+    // handful of large tonal shapes — where the sand is coarser, where the wind
+    // has scoured, where an old slip has left a paler fan — and they draw an
+    // edge round each one. That is a fact about the GROUND, not about the light
+    // or the air, so it has to come from a spatial field, and this is the only
+    // term in the file that does.
+    //
+    // Two octaves, 34 m and 130 m, each cut into THREE flat levels by a pair of
+    // hard thresholds. At the distance a dune is normally seen the small octave
+    // gives it two or three shapes across its face and the large one gives the
+    // whole hillside two — which is the count a painter would use. Nothing here
+    // is continuous, so nothing here can put a gradient back on the mountain.
+    float shpA = fbm2(w * 0.029 + 5.1, 2);
+    float shpB = fbm2(w * 0.0077 + 91.3, 2);
+    float shapeA = bandStep(shpA, 0.455, 0.02) + bandStep(shpA, 0.552, 0.02) - 1.0;
+    float shapeB = bandStep(shpB, 0.455, 0.02) + bandStep(shpB, 0.552, 0.02) - 1.0;
+    // Both retire once their own wavelength stops resolving, or they would
+    // become the far field's noise floor instead of its drawing. Quantised, as
+    // everything that fades in this shader must be.
+    float shapeFade = detailFade(w * 0.029, 3.0);
+    col *= 1.0 + (shapeA * 0.034 * shapeFade + shapeB * 0.046) * (1.0 - isWater);
 
     // ── Surface detail ─────────────────────────────────────────────────────
     // Two vertical projections plus a horizontal one, blended by how the face

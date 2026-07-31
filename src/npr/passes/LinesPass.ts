@@ -82,6 +82,23 @@ import { FullscreenPass } from './Fullscreen';
  */
 const CREASE_RADIUS = 0.22;
 
+/**
+ * How many half-float ulps of depth the second-difference detector treats as
+ * noise. One ulp is what a single sample can be off by; two adjacent samples
+ * can differ by two, and the second difference weights the centre twice.
+ * Measured floor on flat ground is 1.0 ulp for the max-form response, so 2.2
+ * is a little over double the observed worst case.
+ */
+const DEPTH_QUANT_ULPS = 2.2;
+
+/**
+ * The furthest the contour's ink may be mixed toward the haze colour. The
+ * interior lines still take the full fog strength (0.94 in the far band) and
+ * still vanish; the silhouette stops here so a ridge at two kilometres is a
+ * lighter stroke rather than no stroke.
+ */
+const CONTOUR_FOG_CAP = 0.30;
+
 export const LINE_DEBUG = {
   off: 0,
   field: 1,
@@ -94,6 +111,8 @@ export const LINE_DEBUG = {
   probeContour: 7,
   /** Diagnostic packing: r nMagX, g nMagY, b spanX/4m, a spanY/4m. */
   probeNormal: 8,
+  /** Diagnostic packing: r dRel(sum)*200, g dRel(max)*200, b eDepth. */
+  probeDepth: 9,
 } as const;
 
 const FRAGMENT = /* glsl */ `
@@ -115,6 +134,8 @@ const FRAGMENT = /* glsl */ `
   // Anything rounder than this cannot be a crease no matter how many degrees
   // of normal it turns across a pixel — see the scale-invariance note below.
   uniform float uCreaseRadius;
+  /** Half-float ulps of depth noise the second difference is allowed to see. */
+  uniform float uDepthQuant;
   uniform vec2  uNormalEdge;         // threshold, knee
   uniform vec2  uDepthEdge;          // threshold, knee
   uniform float uIdThreshold;
@@ -126,6 +147,8 @@ const FRAGMENT = /* glsl */ `
   uniform float uHullSuppression;
   uniform vec2  uCurvature;          // weight, floor
   uniform float uContourStrength;
+  /** Ceiling on how far the CONTOUR's ink may travel toward the haze colour. */
+  uniform float uContourFogCap;
   uniform float uCharacterBoost;
   uniform vec3  uInkColor;
   uniform float uDebug;
@@ -250,17 +273,64 @@ const FRAGMENT = /* glsl */ `
     float sx  = sqrt(lat * lat + (dep[5] - dep[3]) * (dep[5] - dep[3]));
     float sy  = sqrt(lat * lat + (dep[7] - dep[1]) * (dep[7] - dep[1]));
 
-    float nMag = sqrt(mx * mx + my * my);
-    float eNormal = smoothstep(uNormalEdge.x, uNormalEdge.x + uNormalEdge.y, nMag);
+    // ── Scale invariance ────────────────────────────────────────────────────
+    // The depth detector is scale-free by construction; this one was not. Its
+    // threshold was a constant number of normal-units per PIXEL, and a pixel is
+    // not a fixed amount of surface: at a raking angle one pixel spans metres
+    // of ground, so it integrates metres of genuine, gentle undulation and
+    // reports it as a crease. The same terrain seen from above reports nothing.
+    // A detector whose answer depends on where you stand is not a detector.
+    //
+    // The fix is to ask a second question the constant threshold cannot: how
+    // much normal would a SMOOTH surface have turned across this span? A span
+    // A span of s metres on a surface of radius uCreaseRadius turns s/r of
+    // normal, and that is the number the observed step has to beat.
+    // Anything below that is roundness, not a crease, however many degrees per
+    // pixel it accumulates. The two tests are ANDed via max(), so the constant
+    // still governs the near field — without it a 7 cm limb or a 2 cm frame
+    // tube would qualify as a crease along its entire length.
+    float tx = max(uNormalEdge.x, sx / uCreaseRadius);
+    float ty = max(uNormalEdge.x, sy / uCreaseRadius);
+    float kx = uNormalEdge.y * (tx / uNormalEdge.x);
+    float ky = uNormalEdge.y * (ty / uNormalEdge.x);
+    float eNormal = max(smoothstep(tx, tx + kx, mx), smoothstep(ty, ty + ky, my));
 
     // ── Depth discontinuity ─────────────────────────────────────────────────
     float wC = w[4];
-    float lap =
-        abs(w[3] + w[5] - 2.0 * wC)
-      + abs(w[1] + w[7] - 2.0 * wC)
-      + abs(w[0] + w[8] - 2.0 * wC) * 0.5
-      + abs(w[2] + w[6] - 2.0 * wC) * 0.5;
-    float dRel = lap * dC;   // -> a step as a fraction of viewing distance
+    float lapH = abs(w[3] + w[5] - 2.0 * wC);
+    float lapV = abs(w[1] + w[7] - 2.0 * wC);
+    float lapD = abs(w[0] + w[8] - 2.0 * wC) * 0.5;
+    float lapA = abs(w[2] + w[6] - 2.0 * wC) * 0.5;
+    float lapSum = lapH + lapV + lapD + lapA;
+    // MAX, not SUM.
+    //
+    // A real step is a step in ONE direction: the edge it belongs to has an
+    // orientation, and the second difference across that orientation carries
+    // the whole signal while the other three axes carry almost none. Summing
+    // the four therefore adds one part signal to three parts nothing — and
+    // three parts of the QUANTISATION NOISE described below. Taking the
+    // strongest axis keeps the signal intact and divides the noise by three.
+    // Measured on flat ground in ridge-exposure: sum 0.0027, max 0.0009.
+    float lapMax = max(max(lapH, lapV), max(lapD, lapA));
+
+    // ── The precision floor, subtracted rather than thresholded around ──────
+    //
+    // The G-buffer depth channel is a HALF FLOAT. Ten mantissa bits give it a
+    // relative resolution of 2^-11..2^-10, so two adjacent samples on a
+    // perfectly smooth surface can land in different buckets and disagree by
+    // one ulp for no geometric reason at all. Run that through a second
+    // difference and a flat hillside returns 0.0027 against a 0.0016 threshold
+    // — which is why every wide shot carried nested iso-depth contour rings
+    // over ground with nothing in it. They were not creases and they were not
+    // dither: they were the depth channel's own mantissa, drawn.
+    //
+    // The floor is computed, not guessed. exp2(floor(log2(d)) - 10) is exactly
+    // one ulp of a half float at this depth, so this subtracts the largest
+    // response the surface could produce while still being smooth — the same
+    // move as the 1/z second difference itself, one level further down.
+    float dSafe = max(dC, 0.02);
+    float ulpRel = exp2(floor(log2(dSafe)) - 10.0) / dSafe;
+    float dRel = max(0.0, lapMax * dC - uDepthQuant * ulpRel);
     float eDepth = smoothstep(uDepthEdge.x, uDepthEdge.x + uDepthEdge.y, dRel);
 
     // ── Material id ─────────────────────────────────────────────────────────
@@ -301,9 +371,18 @@ const FRAGMENT = /* glsl */ `
     float contourFade = mix(1.0, uContourFloor, smoothstep(uContourFade.x, uContourFade.y, dC));
 
     float interior = max(max(eNormal, eDepth), eId * uIdWeight) * fade;
-    float contourE = max(contour, contourWide * 0.62) * uContourStrength * contourFade;
+    // 0.86, not 0.62. The inner band covers the pixels one texel from
+    // background and the second ring covers those two texels in; at 0.62 the
+    // second band survived pow() at roughly half the first's alpha, so the
+    // stroke measured 1.4 px on a retina frame and read as a hairline. At 0.86
+    // both bands land near full and the core is a genuine two pixels, which is
+    // what the hull's own targetPixels asks for on everything that has a hull.
+    float contourE = max(contour, contourWide * 0.86) * uContourStrength * contourFade;
 
     float edge = max(interior, contourE);
+    // How much of this pixel's ink is silhouette rather than interior. Drives
+    // the fog treatment below, and nothing else.
+    float contourShare = saturate1(contourE / max(edge, EPS));
     // Raising the edge response to a power below 1 pushes more of the falloff
     // above the visible threshold, which reads as a THICKER stroke; above 1 it
     // reads as thinner. That is the pen-pressure model: curvature drives both
@@ -323,7 +402,26 @@ const FRAGMENT = /* glsl */ `
     float t = saturate1((dC - uFogNear) / max(uFogFar - uFogNear, EPS));
     t = pow(t, 0.78);
     int fi = clamp(int(floor(saturate1(t) * 3.999)), 0, 3);
-    ink = mix(ink, uFogColors[fi] * 0.55, uFogStrengths[fi] * saturate1(t * 1.3));
+    float fogAmt = uFogStrengths[fi] * saturate1(t * 1.3);
+    // ── The contour is not allowed to dissolve ──────────────────────────────
+    //
+    // An INTERIOR line should disappear into the haze — a crease at a kilometre
+    // is not a thing an animator draws. A SILHOUETTE is the opposite: it is the
+    // shape of the mountain, it is the largest drawn form in the frame, and it
+    // is the only ink terrain will ever carry because terrain has no hull.
+    //
+    // Both used to share this one fog mix, and the far band's strength is 0.94,
+    // so at ridge distances the ink was mixed 94% into the haze colour. Measured
+    // in valley-vista at x=1400: the stroke was laid down at 80% alpha and
+    // still came out at luminance 167 against a 169 sky — an invisible stroke,
+    // fully drawn. THAT is the intermittent ridge line. It was never the
+    // detector: the contour term fired at every column tested. It was the ink
+    // arriving the same value as the thing it was supposed to separate.
+    //
+    // Capped, the contour keeps a fixed minimum contrast against whatever it
+    // borders, and still lightens with distance up to that cap.
+    fogAmt = mix(fogAmt, min(fogAmt, uContourFogCap), contourShare);
+    ink = mix(ink, uFogColors[fi] * 0.55, fogAmt);
 
     if (uDebug > 0.5) {
       // Two PACKED diagnostic channels sit above the single-value views. They
@@ -333,6 +431,11 @@ const FRAGMENT = /* glsl */ `
       // specific pixel.
       if (uDebug > 6.5 && uDebug < 7.5) {
         fragColor = vec4(contour, hull, 1.0, saturate1(alpha));
+        return;
+      }
+      if (uDebug > 8.5) {
+        fragColor = vec4(saturate1(dRel * 200.0), saturate1(lapMax * dC * 200.0),
+                         saturate1(eDepth), 1.0);
         return;
       }
       if (uDebug > 7.5) {
@@ -396,6 +499,8 @@ export class LinesPass {
       uCamPlanes: { value: new Vector2(0.12, 6000) },
       uPixelScale: { value: 2 * Math.tan((62 * Math.PI) / 360) / Math.max(height, 1) },
       uCreaseRadius: { value: CREASE_RADIUS },
+      uDepthQuant: { value: DEPTH_QUANT_ULPS },
+      uContourFogCap: { value: CONTOUR_FOG_CAP },
       uNormalEdge: { value: new Vector2(LINES.sobelNormalThreshold, LINES.sobelNormalKnee) },
       uDepthEdge: { value: new Vector2(LINES.sobelDepthThreshold, LINES.sobelDepthKnee) },
       uIdThreshold: { value: LINES.sobelIdThreshold },

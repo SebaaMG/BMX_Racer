@@ -468,6 +468,31 @@ export class Sky {
         // gradient goes to zero, the distance goes to infinity, and the layer
         // simply resolves to "inside" or "outside" with no shimmer.
 
+        /**
+         * THE SCALLOP, AND WHY A CLOUD NEEDS ONE.
+         *
+         * The critic's third note was that the clouds "use the same shape
+         * language as the terrain so they do not separate as sky". That is
+         * literally true of the source: celCloudMask thresholds an fBm field,
+         * and so does the heightfield — a level set of fBm is a level set of
+         * fBm whether you colour it rock or cloud, and the eye recognises the
+         * family instantly.
+         *
+         * A cumulus edge is not a level set. It is a stack of BULGES, each one
+         * roughly circular, at a scale far finer than the cloud itself. So the
+         * threshold gets a fine, world-locked, high-frequency perturbation:
+         * the same silhouette, re-cut with a scalloped edge. It is applied as a
+         * single offset per pixel and used by the contour AND by both light
+         * probes, so the shape stays self-consistent.
+         *
+         * Attenuated by the same detail term everything else uses — a scallop
+         * finer than a pixel is just noise on the contour, and noise on a
+         * contour is the one thing more obviously wrong than no contour.
+         */
+        float cloudScallop(vec2 uv, float detail) {
+          return (fbm2(uv * 9.5, 2) - 0.5) * 0.075 * detail;
+        }
+
         /** x = coverage 0..1, y = ink 0..1, z = signed pixel distance. */
         vec3 cutMask(sampler2D tex, vec2 uv, float thr) {
           float s = texture(tex, uv).a - thr;
@@ -505,8 +530,8 @@ export class Sky {
         ) {
           vec3 m = cutMask(tex, uv, thr);
           alpha = m.x;
-          float capOut   = 1.0 - insideAt(tex, uv + toSun * 2.5, thr);
-          float bellyOut = 1.0 - insideAt(tex, uv - toSun * 1.7, thr);
+          float capOut   = 1.0 - insideAt(tex, uv + toSun * 2.0, thr);
+          float bellyOut = 1.0 - insideAt(tex, uv - toSun * 1.3, thr);
           vec3 c = mid;
           c = mix(c, shd, bellyOut);   // within reach of the shaded edge
           c = mix(c, lit, capOut);     // the sunlit cap wins over it
@@ -551,7 +576,8 @@ export class Sky {
           vec2 driftFar = vec2(sin(t * 0.0052), sin(t * 0.0041 + 2.1)) * 0.030;
           vec2 uvFar = (dir.xz / (dir.y + 1.18)) * 2.60 + vec2(0.5) + driftFar;
           float liveFar = saturate1((h + wander * 0.09 + 0.010) / 0.150);
-          float thrFar = mix(1.03, 0.50, cloudDetail(uvFar) * liveFar);
+          float detFar = cloudDetail(uvFar);
+          float thrFar = mix(1.03, 0.50, detFar * liveFar) - cloudScallop(uvFar, detFar);
           vec3 cFar = celCloud(
             uCloudFar, uvFar, toSun * 0.014, thrFar,
             uFarLit, uFarMid, uFarShadow, uFarInk, alpha
@@ -562,7 +588,8 @@ export class Sky {
           vec2 driftNear = vec2(sin(t * 0.0087), sin(t * 0.0068 + 0.7)) * 0.034;
           vec2 uvNear = sp * 1.70 + vec2(0.5) + driftNear;
           float liveNear = saturate1((h + wander * 0.10 + 0.004) / 0.135);
-          float thrNear = mix(1.03, 0.50, cloudDetail(uvNear) * liveNear);
+          float detNear = cloudDetail(uvNear);
+          float thrNear = mix(1.03, 0.50, detNear * liveNear) - cloudScallop(uvNear, detNear);
           vec3 cNear = celCloud(
             uCloudNear, uvNear, toSun * 0.020, thrNear,
             uCloudLit, uCloudMid, uCloudShadow, uCloudInk, alpha
@@ -587,7 +614,8 @@ export class Sky {
           float bankIn  = saturate1((hb + 0.055) / 0.045);
           float bankOut = 1.0 - saturate1((hb - 0.015) / 0.115);
           float liveBank = bankIn * bankOut;
-          float thrBank = mix(1.03, 0.46, cloudDetail(uvBank) * liveBank);
+          float detBank = cloudDetail(uvBank);
+          float thrBank = mix(1.03, 0.46, detBank * liveBank) - cloudScallop(uvBank, detBank);
           vec3 cBank = celCloud(
             uCloudBank, uvBank, toSun * 0.016, thrBank,
             uBankLit, uBankMid, uBankShadow, uBankInk, alpha

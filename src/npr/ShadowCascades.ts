@@ -54,8 +54,12 @@ import { SUN_DIRECTION } from './Palette';
 import { LAYER_SHADOW, SceneRegistry } from './passes/RenderLists';
 
 export interface ShadowCascadeOptions {
-  /** Texture resolution per cascade. */
-  size?: number;
+  /**
+   * Texture resolution. One number applies to both cascades; a pair sizes them
+   * independently, which is usually what you want — the two cascades cover
+   * wildly different amounts of world for the same number of texels.
+   */
+  size?: number | [number, number];
   /** View distance covered by cascade 0, metres. Also the handover split. */
   nearRange?: number;
   /** View distance covered by cascade 1, metres. */
@@ -83,7 +87,9 @@ export class ShadowCascades {
   readonly targets: WebGLRenderTarget[] = [];
   readonly cameras: OrthographicCamera[] = [];
 
-  private opts: Required<ShadowCascadeOptions>;
+  private opts: Required<Omit<ShadowCascadeOptions, 'size'>>;
+  /** Resolved per-cascade resolution. */
+  private sizes: [number, number];
   private radii: [number, number] = [0, 0];
   private centerDist: [number, number] = [0, 0];
   private depthRange: [number, number] = [1, 1];
@@ -92,23 +98,42 @@ export class ShadowCascades {
 
   constructor(options: ShadowCascadeOptions = {}) {
     this.opts = {
-      size: options.size ?? 2048,
-      nearRange: options.nearRange ?? 70,
+      // 55, not 70.
+      //
+      // The screen-space size of a shadow texel is texelWorld / (viewDist *
+      // metresPerPixelPerMetre), so within ONE cascade the step size varies by
+      // the full ratio of the range it covers. Cascade 0 is the one a chase
+      // camera actually looks at — the rider is 6-9 m out — and shortening its
+      // range shrinks its texel proportionally at no cost to cascade 1, whose
+      // fitted sphere is centred on its own far plane and therefore does not
+      // depend on where the split sits at all.
+      nearRange: options.nearRange ?? 55,
       farRange: options.farRange ?? 420,
       castExtend: options.castExtend ?? [420, 1100],
       worldBias: options.worldBias ?? 0.045,
       referenceFovDeg: options.referenceFovDeg ?? 72,
       enabled: options.enabled ?? true,
     };
+    // 4096, not 2048.
+    //
+    // At 2048 with the old 70 m near range, one cascade-0 texel was 0.103 m of
+    // world and one cascade-1 texel was 0.62 m. A 0.62 m texel seen at 25 m is
+    // 30 device pixels, which is exactly the block size the dune shadow in
+    // treeline-silhouette was stepping in. Texel snapping cannot help with
+    // that — snapping is what stops the blocks CRAWLING, and a stable block is
+    // still a block. The only cure for the size of a block is more of them.
+    const s = options.size ?? [4096, 4096];
+    this.sizes = typeof s === 'number' ? [s, s] : [s[0], s[1]];
     this._enabled = this.opts.enabled;
 
     for (let i = 0; i < 2; i++) {
-      const depth = new DepthTexture(this.opts.size, this.opts.size, UnsignedIntType);
+      const size = this.sizes[i];
+      const depth = new DepthTexture(size, size, UnsignedIntType);
       depth.format = DepthFormat;
       depth.minFilter = NearestFilter;
       depth.magFilter = NearestFilter;
       depth.name = `shadowDepth${i}`;
-      const rt = new WebGLRenderTarget(this.opts.size, this.opts.size, {
+      const rt = new WebGLRenderTarget(size, size, {
         // The colour attachment is never read. R8 keeps it to 4MB instead of
         // the 16MB an RGBA8 would cost, twice over.
         format: RedFormat,
@@ -138,7 +163,7 @@ export class ShadowCascades {
 
     NPR.uShadowMap0.value = this.targets[0].depthTexture;
     NPR.uShadowMap1.value = this.targets[1].depthTexture;
-    NPR.uShadowTexel.value.set(1 / this.opts.size, 1 / this.opts.size);
+    NPR.uShadowTexel.value.set(1 / this.sizes[0], 1 / this.sizes[1]);
     NPR.uShadowSplit.value = this.opts.nearRange;
 
     this.recomputeFit();
@@ -222,7 +247,7 @@ export class ShadowCascades {
 
     // Snap the fitted window to whole texels. Everything else in this file
     // exists to make this line meaningful.
-    const texel = (2 * r) / this.opts.size;
+    const texel = (2 * r) / this.sizes[index];
     const cx = Math.round(_centerLs.x / texel) * texel;
     const cy = Math.round(_centerLs.y / texel) * texel;
 
@@ -286,8 +311,8 @@ export class ShadowCascades {
     NPR.uShadowBias.value = this.opts.worldBias / this.depthRange[0];
     // Normal-offset bias needs the texel footprint in world units, not in uv.
     NPR.uShadowTexelWorld.value.set(
-      (2 * this.radii[0]) / this.opts.size,
-      (2 * this.radii[1]) / this.opts.size,
+      (2 * this.radii[0]) / this.sizes[0],
+      (2 * this.radii[1]) / this.sizes[1],
     );
     NPR.uShadowSplit.value = this.opts.nearRange;
     NPR.uShadowStrength.value = this.strength;
@@ -295,7 +320,7 @@ export class ShadowCascades {
 
   /** World size of one shadow texel in each cascade — useful for debug HUDs. */
   texelWorldSize(): [number, number] {
-    return [(2 * this.radii[0]) / this.opts.size, (2 * this.radii[1]) / this.opts.size];
+    return [(2 * this.radii[0]) / this.sizes[0], (2 * this.radii[1]) / this.sizes[1]];
   }
 
   dispose(): void {

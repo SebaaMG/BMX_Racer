@@ -122,7 +122,7 @@ await page.evaluate(() => {
     const aLen = Math.hypot(ax, ay, az) || 1e-6;
     const ux = ax / aLen, uy = ay / aLen, uz = az / aLen;
 
-    let alive = 0, blockers = 0, nearBig = 0;
+    let alive = 0, blockers = 0, nearBig = 0, survivors = 0, hard = 0, hardSurvivors = 0;
     let worstCover = 0;
     const samples = [];
     for (let i = 0; i < cap; i++) {
@@ -154,14 +154,47 @@ await page.evaluate(() => {
       // Does this puff's disc cover the subject direction, from in front of it?
       if (along > 0.05 && along < aLen && perp < sz + 0.8) {
         blockers++;
+        // What the shader will actually do with it: angular near fade x lens
+        // corridor, quantised to thirds. A blocker that survives this is a
+        // blocker the reviewer sees.
+        const u = dust.material.uniforms;
+        const nearAng = u.uNearAng ? u.uNearAng.value : { x: 1e9, y: 1e9 };
+        const band = u.uLensBand ? u.uLensBand.value : { x: 1, y: 1 };
+        const subR = u.uSubject ? u.uSubject.value.w : 0;
+        const ss = (e0, e1, x) => { const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1); return t * t * (3 - 2 * t); };
+        const nf = Math.min(Math.max((nearAng.y - ang) / Math.max(nearAng.y - nearAng.x, 1e-3), 0), 1);
+        const s01 = along / aLen;
+        const reff = subR * Math.min(Math.max(s01, 0), 1);
+        const covSub = 1 - ss(0, sz + reff, perp);
+        const ahead = 1 - ss(band.x, band.y, s01);
+        const vNear = Math.floor(Math.min(Math.max(Math.min(nf, 1 - covSub * ahead), 0), 1) * 3 + 0.5) / 3;
+        // A HARD blocker is one whose disc genuinely covers the subject from
+        // the near part of the corridor: the thing that turns a portrait into
+        // an X-ray. Those are the ones that must not survive.
+        if (covSub * ahead > 0.4 || ang > nearAng.y) {
+          hard++;
+          if (vNear > 0) hardSurvivors++;
+        }
+        if (vNear > 0) survivors++;
         const cover = Math.min(1, (sz + 0.8 - perp) / (sz + 0.8)) * (1 - along / aLen);
         if (cover > worstCover) worstCover = cover;
         if (samples.length < 8) samples.push({ d: +d.toFixed(2), sz: +sz.toFixed(2), ang: +ang.toFixed(2), along: +along.toFixed(2), perp: +perp.toFixed(2) });
       }
     }
 
+    // Nearest opponent to the lens — the "rival filling a screen quadrant" test.
+    let nearestOpp = 1e9;
+    for (const r of g2.race.racers) {
+      if (r === g2.race.player) continue;
+      const d = cp.distanceTo(r.bike.state.position);
+      if (d < nearestOpp) nearestOpp = d;
+    }
+
     return {
       mode: dir.mode,
+      oppDist: +nearestOpp.toFixed(2),
+      framedRise: +(dir.framedRise ?? 0).toFixed(3),
+      framedAz: +(dir.framedAz ?? 0).toFixed(3),
       fracH: +fracH.toFixed(4),
       cssPx: +(fracH * 900).toFixed(1),
       devPx: +(fracH * 900 * 2).toFixed(1),
@@ -174,7 +207,7 @@ await page.evaluate(() => {
       subY: +st.position.y.toFixed(2),
       airH: +(st.airHeight ?? 0).toFixed(2),
       bikeMode: st.mode,
-      alive, blockers, nearBig,
+      alive, blockers, survivors, hard, hardSurvivors, nearBig,
       cover: +worstCover.toFixed(2),
       samples,
     };
@@ -228,9 +261,10 @@ for (const name of seqs) {
   console.log(`  offscreen frames: ${off.length ? `${off.length} [${off.slice(0, 12).join(',')}${off.length > 12 ? '…' : ''}]` : 'none'}`);
   console.log(`  clearance ${JSON.stringify(stats(rows.map((r) => r.clearance)))}`);
   console.log(`  dist   ${JSON.stringify(stats(rows.map((r) => r.dist)))}`);
-  console.log(`  blockers ${JSON.stringify(stats(rows.map((r) => r.blockers)))}  nearBig ${JSON.stringify(stats(rows.map((r) => r.nearBig)))}`);
+  console.log(`  blockers ${JSON.stringify(stats(rows.map((r) => r.blockers)))}  surviving ${JSON.stringify(stats(rows.map((r) => r.survivors)))}`);
+  console.log(`  HARD blockers ${JSON.stringify(stats(rows.map((r) => r.hard)))}  HARD surviving ${JSON.stringify(stats(rows.map((r) => r.hardSurvivors)))}`);
   if (args.per) {
-    rows.forEach((r, i) => console.log(`   f${String(i).padStart(4, '0')} px=${r.cssPx} on=${r.onScreen ? 1 : 0} d=${r.dist} boom=${r.boom} clr=${r.clearance} camY=${r.camY} cy=${r.cy} blk=${r.blockers} mode=${r.bikeMode}`));
+    rows.forEach((r, i) => console.log(`   f${String(i).padStart(4, '0')} px=${r.cssPx} on=${r.onScreen ? 1 : 0} d=${r.dist} boom=${r.boom} clr=${r.clearance} camY=${r.camY} cy=${r.cy} blk=${r.blockers}/${r.survivors} opp=${r.oppDist} mode=${r.bikeMode}`));
   }
 }
 

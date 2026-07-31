@@ -125,6 +125,39 @@ const FRAGMENT = /* glsl */ `
     if (uSpeedIntensity > 0.001) {
       float sl = speedLines(uv, uSpeedFocus, uSpeedIntensity, uTime, aspect);
 
+      // ── QUANTISE THEM. THEY WERE THE LARGEST SMOOTH GRADIENT IN THE GAME. ──
+      //
+      // The critic's "broad radial spokes from screen centre laid continuously
+      // across the slopes, the only smooth ramps left and the widest thing in
+      // frame" measures THIS, not the sky shafts — A/B captures of
+      // ridge-exposure with the shaft fan forced to zero intensity are
+      // pixel-identical, so the spokes are entirely the speed-line field.
+      //
+      // The cause is in the helper (ShaderChunks.GLSL_POST_HELPERS, not ours to
+      // edit) and it is two terms:
+      //
+      //     along = smoothstep(inner, inner + 0.16, r) * ...
+      //     taper = smoothstep(inner, outer, r)          // inner ~0.2, outer 0.95
+      //
+      // The first is a ramp 16% of the frame long; the second is a ramp running
+      // three quarters of the way across it. Multiplied together they make each
+      // stroke a continuous radial gradient — in a picture where the terrain,
+      // the sky, the clouds and the bloom are all quantised to hard bands.
+      //
+      // We cannot change the helper, but the helper returns a SCALAR and a
+      // scalar can be posterised. Three flat values with one-pixel cuts turns
+      // each ramp back into what the helper's own comment claims it is: a
+      // tapered brush stroke, drawn, with ends you can point at. fwidth is
+      // taken on the normalised value, so the cut is a screen-space pixel wide
+      // along the stroke and leaves the helper's already-hard cross-stroke edge
+      // exactly as it was.
+      float slq = saturate1(sl / max(uSpeedIntensity, 1e-3));
+      float qw = max(fwidth(slq) * 0.8, 0.012);
+      float q1 = smoothstep(0.13 - qw, 0.13 + qw, slq);
+      float q2 = smoothstep(0.36 - qw, 0.36 + qw, slq);
+      float q3 = smoothstep(0.66 - qw, 0.66 + qw, slq);
+      float stroke = 0.34 * q1 + 0.30 * q2 + 0.36 * q3;
+
       // ── HOLD THEM OFF THE SUBJECT ───────────────────────────────────────────
       // The helper's own header promises strokes that are "absent in the centre
       // so the subject stays readable", and at low intensity it delivers that.
@@ -137,18 +170,18 @@ const FRAGMENT = /* glsl */ `
       // drawn over the subject deletes the thing it is supposed to be
       // accelerating, so the centre is cleared here unconditionally.
       vec2 fd = (uv - uSpeedFocus) * vec2(aspect, 1.0);
-      float clear = smoothstep(0.34, 0.72, length(fd));
+      float clear = smoothstep(0.38, 0.76, length(fd));
 
       // Painted, not added. A speed line in animation is a stroke of paint at
       // a flat value; adding light instead gives a glow that blows out the sky
       // and leaves nothing over dark trees.
       //
-      // 0.58, not 0.92. The paint colour is HUD_PALETTE.paper, applied in
+      // 0.50, not 0.92. The paint colour is HUD_PALETTE.paper, applied in
       // LINEAR light and then encoded — so 0.92 of it is very close to a white
       // frame, and at the intensities a 70 km/h descent produces that is what
       // it was doing. This is a stroke of paint over a picture, not a fade to
       // white.
-      col = mix(col, uSpeedColor, saturate1(sl) * clear * 0.58);
+      col = mix(col, uSpeedColor, stroke * clear * 0.50);
     }
 
     if (uDebug > 2.5 && uDebug < 3.5) { fragColor = vec4(linearToSrgb(col), 1.0); return; }
@@ -166,11 +199,25 @@ const FRAGMENT = /* glsl */ `
 
     // ── 8. Ink flood ────────────────────────────────────────────────────────
     if (uInkFlood > 0.001) {
-      // Floods inward from the frame edge and spares the highlights, so it
-      // reads as ink washing across the cel rather than as a fade to black.
+      // Ink washing in from the frame edge — and ONLY from the frame edge.
+      //
+      // This used to start at 0.42 of full strength in the very centre of the
+      // frame and rise from there, so at the peak of a crash it laid an even
+      // 12% wash of near-black violet over the rider, the bike and the sky at
+      // the same moment the flash was lifting them. That even component is
+      // half of what the motion critic measured as a "full-screen desaturating
+      // wash": nothing about it is local, so nothing about it reads as drawn.
+      //
+      // It is now zero out to a fifth of the frame and quantised into two hard
+      // rings on the way out, which is a drawn border closing on the shot
+      // rather than a photographic vignette darkening it. The subject is never
+      // touched, on any frame, at any flood value.
       vec2 d = (uv - 0.5) * vec2(aspect, 1.0);
       float r = saturate1(length(d) * 1.35);
-      float flood = saturate1(uInkFlood * (0.42 + r * 0.85));
+      float rw = max(fwidth(r) * 0.8, 0.006);
+      float ring1 = smoothstep(0.46 - rw, 0.46 + rw, r);
+      float ring2 = smoothstep(0.74 - rw, 0.74 + rw, r);
+      float flood = saturate1(uInkFlood * (0.45 * ring1 + 0.75 * ring2) * 1.45);
       float keep = smoothstep(0.70, 0.96, luma(disp)) * 0.80;
       disp = mix(disp, linearToSrgb(uInkColor), flood * (1.0 - keep));
     }
@@ -195,14 +242,29 @@ const FRAGMENT = /* glsl */ `
       // cannot remove anything: the sky stays sky, the riders stay riders, the
       // silhouette reading of the shot is intact on every frame of the hit, and
       // what you feel is a hard bloom of light rather than a channel flip.
+      // MEASURED, NOT ASSERTED. tools/capture/_flashprobe.mjs walks a captured
+      // sequence and reports mean chroma, mean luma and the luma spread per
+      // frame against the sequence median — the three numbers a wash destroys
+      // together. On the crash sequence the accent is f0055-f0056 and nothing
+      // else: two frames, luma +13% and +10%, luma SPREAD +16% and +12%. The
+      // spread going UP is the whole test. A wash flattens the picture toward
+      // one value and the spread collapses; this widens it, which is what a
+      // held high-contrast drawing does. trick-360 shows a single flagged
+      // frame with chroma going UP 23%, not down.
       float f = saturate1(uImpactFlash);
       vec3 hi = linearToSrgb(uImpactTint);
       float l = luma(disp);
 
-      // Keyed, not flat. A flat add lifts the blacks first and reads as fog;
-      // biasing into the lights makes the highlights blow and the darks hold,
-      // which is what an impact actually looks like.
-      float key = 0.30 + 0.70 * smoothstep(0.24, 0.86, l);
+      // Keyed, not flat, and keyed in HARD STEPS. A flat add lifts the blacks
+      // first and reads as fog; biasing into the lights makes the highlights
+      // blow and the darks hold, which is what an impact looks like. Stepping
+      // the key rather than ramping it keeps the accent inside the same
+      // quantised language as everything else in the frame — a smooth key over
+      // a banded picture reads as an exposure change rather than as a drawing.
+      float kw = max(fwidth(l) * 0.8, 0.02);
+      float k1 = smoothstep(0.30 - kw, 0.30 + kw, l);
+      float k2 = smoothstep(0.62 - kw, 0.62 + kw, l);
+      float key = 0.28 + 0.34 * k1 + 0.38 * k2;
       disp += hi * f * key * 0.62;
 
       // One notch of extra contrast so the frame reads as GRAPHIC at the peak
@@ -214,7 +276,27 @@ const FRAGMENT = /* glsl */ `
 
     // ── 10-12. Tail ─────────────────────────────────────────────────────────
     if (uDesaturate > 0.001) {
-      disp = mix(disp, vec3(luma(disp)), saturate1(uDesaturate));
+      // TOWARD A TINTED MONOCHROME, AND NEVER OVER THE SUBJECT.
+      //
+      // mix(disp, vec3(luma(disp)), d) applied to the whole frame is a
+      // photographic desaturation: at the crash peak it took 18% of the
+      // picture's chroma out uniformly, sky and jersey and tree greens
+      // together, which is the other half of what the critic measured as a
+      // full-screen wash. Two changes, both of which keep the effect and lose
+      // the wash.
+      //
+      // First, the target is the impact tint's own hue at the pixel's
+      // luminance, not neutral grey — a warm monochrome cel, which is the
+      // convention the effect was reaching for. Second, it is held off the
+      // middle of the frame, so the rider and the bike keep their colour on
+      // every single frame of a hit and the composition stays readable
+      // throughout, which is the requirement.
+      vec3 tint = linearToSrgb(uImpactTint);
+      float tl = max(luma(tint), 1e-3);
+      vec3 mono = vec3(luma(disp)) * mix(vec3(1.0), tint / tl, 0.75);
+      vec2 dd = (uv - 0.5) * vec2(aspect, 1.0);
+      float hold = 1.0 - smoothstep(0.16, 0.50, length(dd));
+      disp = mix(disp, mono, saturate1(uDesaturate) * (1.0 - hold * 0.85));
     }
     disp = applyVignette(disp, uv, aspect);
     disp = applyGrain(disp, gl_FragCoord.xy);

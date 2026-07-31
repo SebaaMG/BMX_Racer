@@ -576,6 +576,35 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       uniform sampler2D uTrackProfile;
       uniform float uTrackLength;
       uniform float uUvAlong;
+
+      /**
+       * A texture fetch whose footprint is forced back toward ISOTROPIC.
+       *
+       * The trail is a near-flat plane running from under the wheels to the
+       * horizon, so most of its visible area is seen at a raking angle where
+       * one pixel covers tens of texels along the view direction and two or
+       * three across it. Hardware anisotropic filtering picks its mip level
+       * from the SHORT axis and then takes at most eight taps along the long
+       * one, so past an eight-to-one ratio it is sampling a sharp mip far too
+       * sparsely — which is exactly the one-pixel alternating scanline the
+       * review measured for two hundred consecutive rows on this surface.
+       *
+       * Growing the short axis until the ratio is inside what the sampler can
+       * resolve costs a little sharpness at a grazing angle and buys a surface
+       * that holds still. The same helper, for the same reason, is in
+       * TerrainMaterial; the two must agree or the trail and the ground beside
+       * it would go soft at different distances.
+       */
+      vec4 isoSample(sampler2D tex, vec2 uv) {
+        vec2 dx = dFdx(uv);
+        vec2 dy = dFdy(uv);
+        float lx = max(length(dx), 1e-9);
+        float ly = max(length(dy), 1e-9);
+        float need = max(lx, ly) * 0.1667;
+        dx *= max(1.0, need / lx);
+        dy *= max(1.0, need / ly);
+        return textureGrad(tex, uv, dx, dy);
+      }
     `,
     fragmentBody: /* glsl */ `
       // ── Trail surface detail ─────────────────────────────────────────────
@@ -603,7 +632,7 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
         vnoise(vec2(dAlong * 0.075, across * 2.1)),
         vnoise(vec2(dAlong * 0.075 + 13.1, across * 2.1))
       ) - 0.5;
-      vec4 tr = texture(uTrailTex, vUv + trailWarp * vec2(0.26, 0.075));
+      vec4 tr = isoSample(uTrailTex, vUv + trailWarp * vec2(0.26, 0.075));
       float wear = tr.r;
       float gravel = tr.g;
       float moisture = tr.b;
@@ -624,7 +653,15 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       // course with a real highlight — which is the entire warning.
       if (wet > 0.002) {
         vec3 wetCol = celCol * vec3(0.60, 0.68, 0.88);
-        float sheen = bandedSpecular(N, V, uSunDir, 110.0);
+        // POWER 4, NOT 110. With the committed sun at 21.5 degrees and a chase
+        // camera looking down about 25, N.H on level ground tops out near 0.4 —
+        // and pow(0.4, 110) is zero to every float in the machine. The one
+        // stretch of course that is supposed to be visibly WET carried a
+        // highlight declaration that could never produce a lit pixel. A cel
+        // highlight is a drawn shape, not a microfacet distribution: it only
+        // has to land where a painter would put it, and this exponent is the
+        // one the geometry can actually reach.
+        float sheen = bandedSpecular(N, V, uSunDir, 4.0);
         wetCol += vec3(0.42, 0.52, 0.60) * sheen * saturate1(dot(N, uSunDir) * 2.0);
         celCol = mix(celCol, wetCol, wet * mix(0.65, 1.0, moisture));
       }
@@ -653,12 +690,26 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       // varying along it and renders as one continuous wash — the largest
       // single shape in most frames in this game, painted as a gradient.
       //
-      // Boundaries at 6, 15, 37 and 90 metres, saturating there so the fog
-      // bands own everything past the range where they have any strength.
-      float aerialT = saturate1(log2(max(vViewDist, 4.0) * 0.25) / 9.0);
-      float plate = min(floor(aerialT * 7.0 + 0.5) / 7.0, 0.43);
-      celCol = mix(celCol, uSkyBounce * 1.28, plate * 0.62);
-      celCol *= mix(0.88, 1.06, plate / 0.43);
+      // THE SAME NINE-STEP LADDER THE TERRAIN USES, and it has to be the same
+      // one: the ribbon and the ground it is cut into meet along a line that
+      // runs the whole height of the frame, and two plate stacks with different
+      // boundaries would draw a value step on one side of that line and not the
+      // other. Boundaries at 3.0, 5.4, 9.9, 18.2, 33.2, 60.7, 111, 203, 371 m.
+      //
+      // What is NOT shared is the old strength. This block used to cap at 0.43
+      // and then mix 62% of THAT — 26.6% of a pure cool SKY_BOUNCE — into every
+      // pixel of the trail past sixty metres. On the surface the player looks at
+      // for the entire run, that is a quarter of the frame painted in sky blue:
+      // the trail measured 30% saturation against an authored 56%, and its hue
+      // had rotated as far as magenta. A value MULTIPLY carries the step
+      // instead, because it moves lightness without touching hue or chroma, and
+      // the haze mix left on top is a sixth of what it was.
+      float aerialT = saturate1(log2(clamp(vViewDist, 2.2, 420.0) / 2.2) / 7.577);
+      float plate = floor(aerialT * 9.0 + 0.5) / 9.0;
+      float hazeSun = saturate1(dot(normalize(-V), uSunDir));
+      hazeSun = hazeSun * hazeSun;
+      celCol = mix(celCol, mix(uSkyBounce * 1.30, uFogSunTint * 1.10, hazeSun * 0.72), plate * 0.18);
+      celCol *= mix(0.92, 1.30, plate);
     `,
   });
   // CelMaterial sets the NPR_VERTEX_COLOR define but three only declares the

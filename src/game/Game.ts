@@ -140,13 +140,17 @@ const SITUATIONS: Record<string, Situation> = {
   'rockgarden-low':     { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
   // Genuinely ballistic off the table, not parked in the air above it.
   // Placed on the run-in and ridden off the lip. No impulse.
-  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 130, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
+  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 145, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
   // Placed just short of the hole (0.675) and launched, so the rider is
   // arcing OVER the ravine rather than standing next to it.
   // The harness settles 12 frames (0.2 s) before the shutter, which carries the
   // rider ~4 m. Spawn that far SHORT of the near lip so the shutter opens with
   // the rider over the hole and still rising.
-  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 150, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.22, dist: 19 } },
+  // KNOWN BAD: at 22 m/s the rider launches off the natural rollover before the
+  // ravine, peaks at 7.7 m, and falls PAST the far lip into the hole,
+  // accelerating to 150 km/h inside the mountain. The gap is not currently
+  // clearable. Framed on the approach until the jump itself is fixed.
+  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 96, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.22, dist: 19 } },
   'ridge-exposure':     { t: 0.757, speed: 16, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
   streambed:            { t: 0.849, speed: 12, camera: CameraMode.Chase },
   // Short of the line, so the gate is ahead of the rider and in frame.

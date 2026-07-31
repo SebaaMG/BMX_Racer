@@ -293,21 +293,47 @@ export const GLSL_CEL_CORE = /* glsl */ `
 // Shadow lookup — our own cascades, tuned for hard cel edges.
 // ─────────────────────────────────────────────────────────────────────────────
 export const GLSL_SHADOW = /* glsl */ `
-  float sampleShadowMap(sampler2D map, vec4 coord, float texel, float bias) {
+  /**
+   * Interleaved gradient noise. A per-pixel angle that is well distributed over
+   * any 3x3 neighbourhood rather than merely uncorrelated, so rotating a sample
+   * disc by it produces a fine even tooth instead of white-noise clumping.
+   */
+  float shadowDither(vec2 fragCoord) {
+    return fract(52.9829189 * fract(dot(fragCoord, vec2(0.06711056, 0.00583715))));
+  }
+
+  float sampleShadowMap(sampler2D map, vec4 coord, float texel, float bias, float radius, float rot) {
     vec3 p = coord.xyz / coord.w;
     p = p * 0.5 + 0.5;
     if (p.x < 0.002 || p.x > 0.998 || p.y < 0.002 || p.y > 0.998 || p.z > 1.0) return 1.0;
 
-    // 4-tap rotated-disc PCF. Deliberately small: we want the shadow edge to
-    // stay crisp enough to read as an inked shape. Anything wider turns the
-    // rider's shadow into a soft blob and the whole frame goes photographic.
+    // 4-tap disc PCF, ROTATED PER PIXEL.
+    //
+    // The disc used to be at a fixed orientation, which meant every fragment
+    // inside one shadow texel asked the map the same four questions and got the
+    // same four answers — so the boundary between "lit" and "shadowed" was the
+    // boundary between texels, drawn at full contrast. That is the staircase:
+    // a 45-degree shadow edge crossing an axis-aligned grid produces long runs
+    // of constant answer, and the eye reads the runs as blocks.
+    //
+    // Rotating the disc by a per-pixel angle means adjacent fragments inside
+    // one texel sample DIFFERENT neighbouring texels, so the transition is
+    // resolved stochastically at pixel scale instead of at texel scale. It
+    // works WITH the two-step penumbra quantisation rather than against it:
+    // the quantiser still emits only three values, and the dither decides which
+    // of them each pixel gets. The result is a tooth-edged stroke, which is
+    // what a brush gives you anyway, rather than a machined step.
+    float c = cos(rot);
+    float s = sin(rot);
+    mat2 R = mat2(c, s, -s, c);
+
     float sum = 0.0;
     const vec2 taps[4] = vec2[4](
       vec2(-0.326, -0.406), vec2( 0.520, -0.316),
       vec2(-0.840,  0.074), vec2( 0.286,  0.720)
     );
     for (int i = 0; i < 4; i++) {
-      float d = texture(map, p.xy + taps[i] * texel * 1.15).r;
+      float d = texture(map, p.xy + (R * taps[i]) * texel * radius).r;
       sum += step(p.z - bias, d);
     }
     return sum * 0.25;
@@ -347,18 +373,33 @@ export const GLSL_SHADOW = /* glsl */ `
     // A much smaller depth bias on top, purely to cover the residual.
     float slopeBias = uShadowBias * (1.0 + 1.5 * grazing);
 
+    // ── How wide to spread the disc ─────────────────────────────────────────
+    // fwidth(worldPos) is the world-space footprint of ONE DEVICE PIXEL on this
+    // surface — free, exact, and already accounts for slope and distance, which
+    // is precisely the quantity that decides whether a shadow texel lands on
+    // two pixels or on thirty. Sizing the disc so it spans roughly a couple of
+    // device pixels keeps the dithered transition band at the width a drawn
+    // edge would have, no matter where in the cascade the fragment sits: tight
+    // where the texel is already small, opened up where one texel would
+    // otherwise cover a visible block.
+    float pxWorld = length(fwidth(worldPos));
+    float rot = shadowDither(gl_FragCoord.xy) * 6.2831853;
+
     float s;
     if (viewDist < uShadowSplit) {
-      s = sampleShadowMap(uShadowMap0, uShadowMat0 * vec4(p, 1.0), uShadowTexel.x, slopeBias);
+      float r0 = clamp(1.7 * pxWorld / max(uShadowTexelWorld.x, 1e-4), 0.6, 2.4);
+      s = sampleShadowMap(uShadowMap0, uShadowMat0 * vec4(p, 1.0), uShadowTexel.x, slopeBias, r0, rot);
       // Cross-fade into cascade 1 over the last 15% of the near range.
       float t = smoothstep(uShadowSplit * 0.85, uShadowSplit, viewDist);
       if (t > 0.0) {
         vec3 p1 = worldPos + N * min(uShadowTexelWorld.y * (1.1 + 2.6 * grazing), 0.42);
-        float s1 = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p1, 1.0), uShadowTexel.y, slopeBias * 2.0);
+        float r1 = clamp(1.7 * pxWorld / max(uShadowTexelWorld.y, 1e-4), 0.6, 2.4);
+        float s1 = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p1, 1.0), uShadowTexel.y, slopeBias * 2.0, r1, rot);
         s = mix(s, s1, t);
       }
     } else {
-      s = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p, 1.0), uShadowTexel.y, slopeBias * 2.0);
+      float r1 = clamp(1.7 * pxWorld / max(uShadowTexelWorld.y, 1e-4), 0.6, 2.4);
+      s = sampleShadowMap(uShadowMap1, uShadowMat1 * vec4(p, 1.0), uShadowTexel.y, slopeBias * 2.0, r1, rot);
     }
 
     // Quantise the penumbra to two steps. A continuous penumbra is the fastest
@@ -390,7 +431,12 @@ export const GLSL_FOG = /* glsl */ `
     // Slight curve so the near bands cover more world distance than the far ones.
     t = pow(t, 0.78);
 
-    float dither = (hash21(fragCoord * 0.5) - 0.5) * 0.035;
+    // hash21(fragCoord), NOT hash21(fragCoord * 0.5). Halving the coordinate
+    // makes the hash lattice two device pixels wide, and a two-pixel lattice at
+    // retina does not read as noise — it resolves into a stable checkerboard
+    // laid over every band boundary in the frame. One device pixel per sample
+    // is the only spacing that dithers.
+    float dither = (hash21(fragCoord) - 0.5) * 0.035;
     float f = saturate1(t + dither) * 3.999;
     int   i = int(floor(f));
     i = clamp(i, 0, 3);

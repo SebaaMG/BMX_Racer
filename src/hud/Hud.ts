@@ -110,8 +110,16 @@ export class Hud implements IHud {
     // clears the horizon in every pose in the set. It also ends at design x 608,
     // which puts 117 units of clean air between it and the clock's TIME label —
     // the second half of the header-collision fix.
+    // 572 x 158 at (24, 16). The 600 x 164 that replaced the original
+    // 880 x 210 was already clear of the horizon in all sixteen review poses —
+    // verified, not assumed: the panel's bottom edge lands at design y 182 and
+    // the highest horizon in the set is at y 300. So this pass is a trim rather
+    // than a rescue: 8% off the area, 30 design units pulled back from the
+    // right, and the slab is now sized so its SHEARED top-right corner lands
+    // inside the backing store instead of 15 units outside it, which is what
+    // was flattening that corner in every frame.
     this.profile = this.mount(new RouteProfileWidget(
-      new HudLayer('profile', place('top-left', 26, 18, 600, 164)),
+      new HudLayer('profile', place('top-left', 24, 16, 572, 158)),
     ));
     this.clock = this.mount(new ClockWidget(
       new HudLayer('clock', place('top', 0, 22, 470, 200)),
@@ -120,13 +128,17 @@ export class Hud implements IHud {
       new HudLayer('board', place('top-right', 26, 24, 430, 280)),
     ));
     this.corner = this.mount(new CornerWidget(
-      new HudLayer('corner', place('top', 0, 244, 340, 200)),
+      new HudLayer('corner', place('top', 0, 232, 300, 190)),
     ));
     this.place = this.mount(new PlaceWidget(
       new HudLayer('place', place('bottom-left', 26, 22, 480, 260)),
     ));
+    // 580 x 360. The dial band's polygon needs 1.089 * R of width and of height
+    // around its centre; at 560 x 340 it did not have it, and the band was
+    // delivered with its top and right razored off by the backing store. The
+    // extra 20 x 20 is what makes the gauge a whole object.
     this.speed = this.mount(new SpeedWidget(
-      new HudLayer('speed', place('bottom-right', 22, 18, 560, 340)),
+      new HudLayer('speed', place('bottom-right', 20, 16, 580, 360)),
     ));
     this.boost = this.mount(new BoostWidget(
       new HudLayer('boost', place('bottom', 0, 26, 680, 120)),
