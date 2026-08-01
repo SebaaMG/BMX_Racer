@@ -702,6 +702,52 @@ export const TRICK_ANCHORS: Record<TrickKind, TrickAnchorMotion> = {
  * calls out.
  */
 
+/**
+ * CRASH_BRACE — the first 100 ms, and the reason a crash reads as a fall rather
+ * than as a pose swap.
+ *
+ * A rider does not arrive on the floor. A crash measured at 60 fps runs:
+ * something lets go, the leading hand comes off the bar, the shoulder drops
+ * toward the impact, the hips slide off the back of the bike, and only THEN
+ * does the body rotate down onto the ground — a fall from saddle height takes
+ * 450 ms under gravity and cannot be faster. The previous crash went from
+ * upright and riding to fully prone in 167 ms, because there was exactly one
+ * crash pose and the blend into it was a 30 ms half-life.
+ *
+ * This pose is the first link. Note what it does NOT do: the trailing hand is
+ * still on the bar and BOTH feet are still on the pedals. The rider is still on
+ * the bike here. Everything after this is the fall.
+ */
+export const CRASH_BRACE = pose({
+  pelvisX: 0.070,
+  pelvisY: -0.070,
+  pelvisZ: -0.085,
+  pelvisPitch: 0.12,
+  pelvisRoll: -0.26,
+  pelvisYaw: 0.12,
+  spineSide: -0.28,
+  spineTwist: 0.24,
+  spineBend: 0.32,
+  chestBend: 0.12,
+  headYaw: -0.36,
+  headRoll: -0.24,
+  headPitch: 0.20,
+  headLook: 0,
+  handLockL: 0,
+  handLockR: 1,
+  handOffLX: 0.155,
+  handOffLY: -0.175,
+  handOffLZ: 0.095,
+  elbowOutL: 0.46,
+  elbowOutR: -0.12,
+  kneeOutL: 0.26,
+  kneeOutR: 0.05,
+  ankleFlexL: 0.18,
+  shrug: 0.22,
+  hemSwing: -0.45,
+  reachBias: 0.8,
+});
+
 /** Thrown over the bars: body pitched forward, arms out to break the fall. */
 export const CRASH_OTB = pose({
   pelvisY: 0.075,

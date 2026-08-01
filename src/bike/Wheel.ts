@@ -167,6 +167,26 @@ export interface TyreConfig {
   slidingRatio: number;
   /** Minimum lateral grip retained when longitudinal force saturates the circle. */
   ellipseFloor: number;
+  /**
+   * Mechanical trail, metres — how far behind the steering axis the contact
+   * patch sits. This is what makes a bicycle a bicycle rather than a shopping
+   * trolley: the lateral force acts BEHIND the pivot, so it always tries to
+   * point the wheel back down its own direction of travel.
+   *
+   * It is a pure consequence of the head angle already in BIKE_GEOM
+   * (radius / tan(74 degrees) = 77 mm), which is why the front number is not a
+   * free parameter. The rear wheel has none — it does not steer.
+   */
+  mechanicalTrail: number;
+  /**
+   * Pneumatic trail, metres. A tyre's lateral force is not centred on the
+   * contact patch: at small slip it acts a few centimetres behind it, and that
+   * offset COLLAPSES TO ZERO as the tyre passes its peak. That collapse is the
+   * one piece of tyre behaviour a rider feels directly — the bars go light just
+   * before the front lets go — and it is also why a saturated tyre stops
+   * stabilising the vehicle at exactly the moment it is needed.
+   */
+  pneumaticTrail: number;
 }
 
 export const FRONT_TYRE: TyreConfig = {
@@ -180,6 +200,10 @@ export const FRONT_TYRE: TyreConfig = {
   nominalLoad: 850,
   slidingRatio: 0.76,
   ellipseFloor: 0.14,
+  // wheelRadius / tan(head angle) = 0.267 / tan(74 deg). Not a free parameter:
+  // it falls out of the steering geometry already declared in BIKE_GEOM.
+  mechanicalTrail: 0.0766,
+  pneumaticTrail: 0.028,
 };
 
 export const REAR_TYRE: TyreConfig = {
@@ -193,6 +217,10 @@ export const REAR_TYRE: TyreConfig = {
   nominalLoad: 1050,
   slidingRatio: 0.74,
   ellipseFloor: 0.12,
+  // The rear wheel does not steer, so it has no mechanical trail. Its lateral
+  // force still acts slightly behind the contact patch.
+  mechanicalTrail: 0.0,
+  pneumaticTrail: 0.022,
 };
 
 export interface WheelConfig {

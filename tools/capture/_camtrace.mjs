@@ -81,18 +81,28 @@ async function ensureReady() {
       const tanHalf = Math.tan((cam.fov * Math.PI) / 360);
       const shakePx = dist > 0.01 ? (shakeM / dist) / (2 * tanHalf) * H : 0;
 
-      // Pixel delta off the render canvas, downsampled.
-      let delta = 0;
+      // Pixel delta off the render canvas, downsampled. `delta` is the whole
+      // frame (the critic's metric); `gdelta` is the ground band only — rows
+      // 50-88%, cols 15-85% — which is where the terrain actually is and which
+      // a widening lens does not dilute with sky.
+      let delta = 0, gdelta = 0;
       try {
         const src = document.querySelector('canvas');
         c2.drawImage(src, 0, 0, 400, 225);
         const img = c2.getImageData(0, 0, 400, 225).data;
         if (prev) {
-          let s = 0;
-          for (let i = 0; i < img.length; i += 4) {
-            s += Math.abs(img[i] - prev[i]) + Math.abs(img[i + 1] - prev[i + 1]) + Math.abs(img[i + 2] - prev[i + 2]);
+          let s = 0, gs = 0, gn = 0;
+          for (let y = 0; y < 225; y++) {
+            const inBand = y >= 112 && y <= 198;
+            for (let x = 0; x < 400; x++) {
+              const i = (y * 400 + x) * 4;
+              const d = Math.abs(img[i] - prev[i]) + Math.abs(img[i + 1] - prev[i + 1]) + Math.abs(img[i + 2] - prev[i + 2]);
+              s += d;
+              if (inBand && x >= 60 && x <= 340) { gs += d; gn++; }
+            }
           }
-          delta = s / (3 * (img.length / 4));
+          delta = s / (3 * 400 * 225);
+          gdelta = gn ? gs / (3 * gn) : 0;
         }
         prev = img.slice();
       } catch (err) { delta = -1; }
@@ -110,7 +120,9 @@ async function ensureReady() {
         dist, riderPx, cy, cxn, onScreen,
         speed: st.speed, mode: st.mode, air: st.airHeight, peak: st.peakAirHeight, vy: st.velocity.y,
         airTime: st.airTime, kick: dir.kick,
-        delta,
+        delta, gdelta,
+        buf: Math.hypot(dir.buffetOffset.x, dir.buffetOffset.y, dir.buffetOffset.z),
+        surge: dir.surge, sLag: dir.speedLag, arc: dir.swingArc,
         cxw: c.x, cyw: c.y, czw: c.z, px: p.x, py: p.y, pz: p.z,
       };
     };
@@ -164,17 +176,19 @@ for (const seq of SEQS) {
   console.log(`  crashFocus max ${Math.max(...col('cf')).toFixed(2)}   lift max ${Math.max(...col('lift')).toFixed(2)}   rise max ${Math.max(...col('rise')).toFixed(3)}`);
   const dl = col('delta').slice(1);
   console.log(`  pixel delta  min ${Math.min(...dl).toFixed(2)} med ${q(dl, 0.5).toFixed(2)} max ${Math.max(...dl).toFixed(2)}`);
+  console.log(`  buffet max ${Math.max(...col('buf')).toFixed(3)} m   surge ${Math.min(...col('surge')).toFixed(2)}..${Math.max(...col('surge')).toFixed(2)} m/s   boomRetract max ${Math.max(...col('bRet')).toFixed(2)}`);
   // Correlate delta with speed (first vs last third).
   const n = rows.length, a = rows.slice(2, Math.floor(n / 3)), b = rows.slice(Math.floor((2 * n) / 3));
   const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
   console.log(`  delta  first-third ${mean(a.map((r) => r.delta)).toFixed(2)} @ ${(mean(a.map((r) => r.speed)) * 3.6).toFixed(0)} km/h   last-third ${mean(b.map((r) => r.delta)).toFixed(2)} @ ${(mean(b.map((r) => r.speed)) * 3.6).toFixed(0)} km/h`);
+  console.log(`  gdelta first-third ${mean(a.map((r) => r.gdelta)).toFixed(2)}   last-third ${mean(b.map((r) => r.gdelta)).toFixed(2)}`);
 
   if (!QUIET) {
-    console.log('   f | speed  fov   boom  dist  ridPx  shkPx   ts   swing  roll   yaw    cf   delta  mode air');
+    console.log('   f | speed  fov   boom  dist  ridPx  shkPx   ts   swing  roll   yaw    cf   delta gdelta  mode air');
     for (let i = 0; i < rows.length; i += Number(args.every ?? 4)) {
       const r = rows[i];
       console.log(
-        `  ${String(i).padStart(3)}|${f2(r.speed * 3.6)} ${f2(r.fov)} ${f2(r.bLen)} ${f2(r.dist)} ${f2(r.riderPx)} ${f2(r.shakePx)} ${f2(r.ts)} ${f2(r.swing)} ${f3(r.roll)} ${f3(r.yaw)} ${f2(r.cf)} ${f2(r.delta)}  ${r.mode} ${r.air.toFixed(1)}`,
+        `  ${String(i).padStart(3)}|${f2(r.speed * 3.6)} ${f2(r.fov)} ${f2(r.bLen)} ${f2(r.dist)} ${f2(r.riderPx)} ${f2(r.shakePx)} ${f2(r.ts)} ${f2(r.swing)} ${f3(r.roll)} ${f3(r.yaw)} ${f2(r.cf)} ${f2(r.delta)} ${f2(r.gdelta)}  ${r.mode} ${r.air.toFixed(1)}`,
       );
     }
   }

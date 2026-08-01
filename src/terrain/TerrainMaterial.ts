@@ -76,7 +76,7 @@ import { globalUniformBlock } from '../npr/NprGlobals';
 import { RAMPS, RampPreset } from '../npr/Palette';
 import { barkTexture, paperGrain, trailSurface } from '../npr/GeneratedTextures';
 import { SurfaceKind } from '../game/Contracts';
-import { WORLD_HALF } from '../game/WorldConstants';
+import { WORLD_HALF, ZONE } from '../game/WorldConstants';
 import { ZONE_KIND_COUNT, zoneMipLevels } from './Zones';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,6 +390,147 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
     vec2 tcj = tc + jit * (mtex * uZoneJitter);
 
     return clamp(int(textureLod(uZoneTex, tcj / texels, lvl).r * 255.0 + 0.5), 0, kindCount - 1);
+  }
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The ground's own tonal ladder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Composite units of the tonal field between one tonal level and the next.
+ *
+ * The field below is a sum of four noise octaves, each with a standard
+ * deviation near 0.15, so the sum has one near 0.25. A rung of 0.26 is
+ * therefore about one sigma: the two middle levels take roughly a third of the
+ * ground each and the two outer ones about a sixth each, which is the spread a
+ * painter's four-value block-in has.
+ */
+const SHAPE_RUNG = 0.26;
+
+/**
+ * Value multiply per tonal level. MEASURED, not chosen.
+ *
+ * The previous round applied four INDEPENDENT ternary fields, one per octave,
+ * each multiplying the colour by 1 +- its own amplitude. Four independent
+ * three-level fields have eighty-one distinct products, so the surface came out
+ * as a dense stack of small steps: a 351-row column across the rock garden
+ * measured SIXTEEN plateaus with a largest jump of 8.7 luma levels and a 71%
+ * delta sign-flip rate. That is not a ramp, it is a wobble, and it is why the
+ * fix that worked on the one measured column did not generalise — the column it
+ * was tuned on happened to be bright enough (luma 150-200) that a single 10%
+ * step cleared the review's threshold, and every darker surface in the game
+ * (luma 85-125) could not.
+ *
+ * Summing the octaves FIRST and quantising ONCE gives what the brief actually
+ * asks for: four tonal levels, one rung between neighbours, and that rung big
+ * enough to survive the grade everywhere. Measured through the whole pipeline,
+ * a multiply of this size arrives as roughly 10 luma levels at a base of 95 and
+ * 13 at a base of 180 — the grade's shoulder gives back a little under half of
+ * whatever is asked for at the bright end and about two thirds at the dark end.
+ * The total spread, 3 rungs, is 1.55:1 across a hillside; the previous scheme's
+ * worst case was 1.96:1, delivered as illegible fizz.
+ */
+const SHAPE_STEP = 0.155;
+
+/**
+ * The third value system, and the only one that works on the surface that
+ * defeats the other two. Shared verbatim by the terrain and the track ribbon.
+ *
+ * A plate map of the treeline frame settled why it has to exist. Below the
+ * crest, 385 consecutive rows — a third of the picture — sat on ONE aerial
+ * plate, because the far wall of a bowl is very nearly equidistant from the
+ * camera across its whole visible face. The ramp is constant there too: a dune
+ * face of uniform slope has a constant normal, so the lighting term cannot move
+ * either. Every quantised system in this shader was correctly returning the
+ * same answer for every pixel, and the correct answer was a flat wash covering
+ * a third of the frame.
+ *
+ * A background painter never leaves that surface flat. They break it into a
+ * handful of large tonal shapes — where the sand is coarser, where the wind has
+ * scoured, where an old slip has left a paler fan — and they draw an edge round
+ * each one. That is a fact about the GROUND, not about the light or the air, so
+ * it comes from a spatial field, and this is the only term in the material that
+ * does.
+ *
+ * FOUR OCTAVES — 0.59 m, 4.8 m, 34 m and 130 m — because whatever distance the
+ * ground in front of the camera happens to be at, one of them is at the size a
+ * painter would have blocked in at that distance and the two either side are
+ * too big to see and too small to resolve. The shortest one is not optional: at
+ * the camera heights this game uses the bottom FORTY PER CENT of every frame is
+ * ground six to nine metres away spanning about 1.7 m of world — four hundred
+ * and forty rows of pixels over 1.7 m. Nothing keyed on distance can put a
+ * boundary in there, nothing keyed on the normal can either because it is flat,
+ * and a 34 m octave is constant across 1.7 m.
+ *
+ * THEY ARE SUMMED AND THEN QUANTISED ONCE. See SHAPE_STEP for why that is the
+ * whole difference between a ladder and a wobble. The sum is the right operator
+ * for a second reason too: the long octaves act as a BIAS on the short one, so
+ * wherever the short octave is the only thing moving — which is the entire near
+ * field — it still crosses rungs, because the rungs are uniformly spaced and
+ * repeat rather than being three fixed thresholds the bias can sit between.
+ *
+ * Each octave retires once its own wavelength stops resolving on screen, or it
+ * would become the far field's noise floor instead of its drawing. Because the
+ * terms are summed and then quantised, a retiring octave removes its own
+ * contribution from the sum without shifting the ladder — the field stays
+ * centred on zero at every distance. The 130 m octave never stops resolving
+ * inside the draw distance and so carries no fade.
+ */
+export const TERRAIN_GROUND_SHAPES = /* glsl */ `
+  /**
+   * How much of a world-space marking survives at this pixel, in THREE HARD
+   * STEPS. Quantised, because every fade in this project has to be: a
+   * continuous one is a gradient laid over the hard bands, which is the defect
+   * the bands exist to prevent.
+   */
+  float groundShapeFade(vec2 uv, float texSize) {
+    float fp = max(length(dFdx(uv)), length(dFdy(uv))) * texSize;
+    return floor(clamp(1.85 - fp * 0.55, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
+  }
+
+  /**
+   * The tonal level of the ground at this pixel: one of -1.5, -0.5, 0.5, 1.5,
+   * with an antialiased rung between neighbours and nothing continuous in it.
+   *
+   * The quantiser is written out rather than expressed as a pair of bandSteps
+   * because the rungs REPEAT. A pair of fixed thresholds can only ever cut a
+   * field into three levels at two specific values, and a near-field octave
+   * riding on a long-octave bias that happens to sit between them produces no
+   * boundary at all — which is exactly how a 350-row column came out with zero
+   * steps over ten levels. A uniform ladder has a rung within half a rung of
+   * wherever the field currently is, everywhere, by construction.
+   *
+   * The antialiasing is the screen-space derivative of the ladder coordinate
+   * with a floor of 0.0015 under it. The floor matters: at 0.02 the ramp is
+   * wider than the field's own slope over most of the frame, the outer levels
+   * are never reached and a 15% step arrives as two levels of 255; at 0.0015 it
+   * is below the field's per-pixel change nearly everywhere, so the derivative
+   * term takes over and the rung is one pixel wide and correctly antialiased —
+   * a boundary, drawn.
+   */
+  float groundShapeLevel(vec2 w) {
+    float shpN = fbm2(w * 1.70   + 61.7, 2);
+    float shpM = fbm2(w * 0.21   + 8.3,  2);
+    float shpA = fbm2(w * 0.029  + 5.1,  2);
+    float shpB = fbm2(w * 0.0077 + 91.3, 2);
+
+    float form = (shpN - 0.5) * 1.00 * groundShapeFade(w * 1.70,  40.0)
+               + (shpM - 0.5) * 0.92 * groundShapeFade(w * 0.21,  60.0)
+               + (shpA - 0.5) * 0.80 * groundShapeFade(w * 0.029,  3.0)
+               + (shpB - 0.5) * 0.66;
+
+    float t = form * ${(1 / SHAPE_RUNG).toFixed(5)};
+    float aa = max(fwidth(t) * 0.75, 0.0015);
+    // Shifting by aa centres the ramp ON the rung instead of starting it there.
+    float ts = t + aa;
+    float f = floor(ts);
+    return clamp(f - 0.5 + smoothstep(0.0, 2.0 * aa, ts - f), -1.5, 1.5);
+  }
+
+  /** The multiply the level above applies to a surface colour. */
+  float groundShapeGain(vec2 w) {
+    return 1.0 + groundShapeLevel(w) * ${SHAPE_STEP.toFixed(4)};
   }
 `;
 

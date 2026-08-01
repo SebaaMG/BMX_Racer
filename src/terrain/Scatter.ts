@@ -36,7 +36,6 @@ import {
   BufferGeometry,
   DynamicDrawUsage,
   Group,
-  IcosahedronGeometry,
   InstancedBufferAttribute,
   InstancedMesh,
   Matrix4,
@@ -745,46 +744,300 @@ export function buildInstanced(
 // Rock geometry
 // ─────────────────────────────────────────────────────────────────────────────
 
-const _v = new Vector3();
+/**
+ * A convex polyhedron under construction: one entry per face, each holding the
+ * face's outward plane normal and its vertex ring wound counter-clockwise as
+ * seen from outside.
+ */
+interface HullFace {
+  n: Vector3;
+  verts: Vector3[];
+}
+
+const HULL_EPS = 1e-6;
+
+/** The six faces of an axis-aligned cube, wound outward. Seed for the cutter. */
+function cubeFaces(h: number): HullFace[] {
+  const v = (x: number, y: number, z: number): Vector3 => new Vector3(x * h, y * h, z * h);
+  return [
+    { n: new Vector3(1, 0, 0), verts: [v(1, -1, 1), v(1, -1, -1), v(1, 1, -1), v(1, 1, 1)] },
+    { n: new Vector3(-1, 0, 0), verts: [v(-1, -1, -1), v(-1, -1, 1), v(-1, 1, 1), v(-1, 1, -1)] },
+    { n: new Vector3(0, 1, 0), verts: [v(-1, 1, 1), v(1, 1, 1), v(1, 1, -1), v(-1, 1, -1)] },
+    { n: new Vector3(0, -1, 0), verts: [v(-1, -1, -1), v(1, -1, -1), v(1, -1, 1), v(-1, -1, 1)] },
+    { n: new Vector3(0, 0, 1), verts: [v(-1, -1, 1), v(1, -1, 1), v(1, 1, 1), v(-1, 1, 1)] },
+    { n: new Vector3(0, 0, -1), verts: [v(1, -1, -1), v(-1, -1, -1), v(-1, 1, -1), v(1, 1, -1)] },
+  ];
+}
+
+/** Drop consecutive duplicates from a closed ring (including last-to-first). */
+function dedupeRing(ring: Vector3[]): Vector3[] {
+  const out: Vector3[] = [];
+  for (const p of ring) {
+    const last = out[out.length - 1];
+    if (last && last.distanceToSquared(p) < 1e-12) continue;
+    out.push(p);
+  }
+  while (out.length > 1 && out[0].distanceToSquared(out[out.length - 1]) < 1e-12) out.pop();
+  return out;
+}
+
+/**
+ * Close a cut with a new face.
+ *
+ * The intersection of convex sets is convex, so the loose points a cut leaves
+ * behind always form a convex ring and can be ordered by pure angle about the
+ * cutting normal — no edge-following, no winding ambiguity, and no way to
+ * produce a self-intersecting cap. `(u, v, n)` is built right-handed, so
+ * increasing angle is counter-clockwise seen from outside, which is the same
+ * winding every other face carries.
+ */
+function capFace(points: Vector3[], n: Vector3): HullFace | null {
+  const uniq: Vector3[] = [];
+  for (const p of points) {
+    let dup = false;
+    for (const q of uniq) {
+      if (q.distanceToSquared(p) < 1e-10) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) uniq.push(p);
+  }
+  if (uniq.length < 3) return null;
+
+  const centre = new Vector3();
+  for (const p of uniq) centre.add(p);
+  centre.divideScalar(uniq.length);
+
+  const u = new Vector3(0, 1, 0).cross(n);
+  if (u.lengthSq() < 1e-8) u.set(1, 0, 0).cross(n);
+  u.normalize();
+  const w = new Vector3().crossVectors(n, u);
+
+  const rel = new Vector3();
+  const keyed = uniq.map((p) => {
+    rel.subVectors(p, centre);
+    return { p, a: Math.atan2(rel.dot(w), rel.dot(u)) };
+  });
+  keyed.sort((x, y) => x.a - y.a);
+  return { n: n.clone(), verts: keyed.map((k) => k.p) };
+}
+
+/**
+ * Cut a convex polyhedron with the half-space `dot(p, n) <= d`.
+ *
+ * Sutherland–Hodgman on every face, collecting the intersection points as it
+ * goes, then closing the opening with one new planar face. The result is
+ * exactly as convex and exactly as closed as the input — which is the whole
+ * reason the boulders are built this way rather than by displacing a sphere.
+ */
+function clipHull(faces: HullFace[], n: Vector3, d: number): HullFace[] {
+  const out: HullFace[] = [];
+  const cut: Vector3[] = [];
+
+  for (const f of faces) {
+    const vs = f.verts;
+    const kept: Vector3[] = [];
+    for (let i = 0; i < vs.length; i++) {
+      const a = vs[i];
+      const b = vs[(i + 1) % vs.length];
+      const da = n.dot(a) - d;
+      const db = n.dot(b) - d;
+      if (da <= HULL_EPS) kept.push(a);
+      if ((da > HULL_EPS && db < -HULL_EPS) || (da < -HULL_EPS && db > HULL_EPS)) {
+        const t = da / (da - db);
+        const p = new Vector3().lerpVectors(a, b, t);
+        kept.push(p);
+        cut.push(p);
+      }
+    }
+    const ring = dedupeRing(kept);
+    if (ring.length >= 3) out.push({ n: f.n, verts: ring });
+  }
+
+  if (cut.length >= 3) {
+    const cap = capFace(cut, n);
+    if (cap) out.push(cap);
+  }
+  return out;
+}
 
 /**
  * A boulder.
  *
- * Built by pushing an icosahedron around with noise, then flattening its base.
- * Two details matter more than the silhouette:
+ * ── WHY THIS IS A PLANE CUTTER AND NOT A DISPLACED SPHERE ───────────────────
  *
- *  • The geometry stays FACETED. An icosahedron subdivision is non-indexed, so
- *    every triangle keeps its own normals and the cel ramp bands per facet.
- *    A smooth-shaded rock under a hard ramp reads as a potato; a faceted one
- *    reads as stone, because the value steps follow planes.
- *  • The base is flattened rather than left round, so the instance sits IN the
- *    ground instead of tangent to it. A sphere resting on a slope shows a
- *    crescent of daylight underneath from any low camera, and the whole scatter
- *    then reads as decals floating on the terrain.
+ * The obvious way to make a rock is to push a subdivided icosahedron around
+ * with noise. It has two failure modes and this project hit both.
+ *
+ * The first is fatal and shows up as the mesh EXPLODING. `IcosahedronGeometry`
+ * is already non-indexed: every triangle owns its own three vertices, and each
+ * corner of the solid appears five or six times over. Displace by anything that
+ * is not a pure function of the vertex POSITION — a per-vertex random, most
+ * obviously — and the copies separate. What renders is eighty disconnected
+ * triangles, and because the outline hull shares that geometry, every triangle
+ * facing away from the camera is drawn as a solid ink wedge poking out of
+ * nowhere. Welding cannot repair it afterwards: there is nothing left at a
+ * shared position TO weld.
+ *
+ * The second is subtler and is what a critic actually sees: even displaced
+ * correctly, an icosphere is eighty small triangles that are all slightly
+ * non-coplanar with their neighbours. The screen-space normal detector in
+ * LinesPass is doing its job when it inks every one of those boundaries — but
+ * eighty hairlines at one pixel each, inside a silhouette drawn at three, is a
+ * WIREFRAME. It reads as a paper cutout with the construction lines left on.
+ * No line-pass tuning fixes it, because every one of those edges is a genuine
+ * normal discontinuity. The geometry has to stop asking for them.
+ *
+ * So a boulder here is built the way a lapidary would describe one: a block cut
+ * by a dozen or so planes. Every face is EXACTLY planar, so the normal detector
+ * finds nothing inside it and interior ink appears only where two large facets
+ * genuinely meet — a handful of long creases instead of a mesh of hairlines.
+ * The body is convex and closed by construction, so the welded hull is one
+ * continuous contour with no possible tear, and the cel ramp bands each plane
+ * as a flat step, which is what makes it read as cut stone rather than as a
+ * lumpy potato.
+ *
+ * The base is cut flat by one more plane, so the instance sits IN the ground
+ * rather than tangent to it. A rounded rock on a slope shows a crescent of
+ * daylight underneath from any low camera and the whole scatter then reads as
+ * decals floating on the terrain.
  */
 export function buildRockGeometry(seed: string, detail: number, squash: number): BufferGeometry {
-  const geo = new IcosahedronGeometry(1, detail);
-  const pos = geo.getAttribute('position') as BufferAttribute;
-  const nA = new Noise2D(`${seed}:a`);
-  const nB = new Noise2D(`${seed}:b`);
+  const rng = new Rng(WORLD_SEED).fork(`rock-hull:${seed}`);
 
-  for (let i = 0; i < pos.count; i++) {
-    _v.fromBufferAttribute(pos, i);
-    // Two projections of the same 3D point through 2D noise. Duplicated
-    // vertices at a shared corner get identical input and therefore identical
-    // displacement, which keeps the mesh watertight.
-    const a = nA.fbm(_v.x * 1.6 + _v.y * 0.7, _v.z * 1.6 - _v.y * 0.5, 3);
-    const b = nB.fbm(_v.z * 3.1 - _v.x * 0.4, _v.y * 3.1 + _v.x * 0.8, 2);
-    const r = 1 + a * 0.34 + b * 0.13;
-    _v.multiplyScalar(r);
-    _v.y *= squash;
-    if (_v.y < -0.34) _v.y = -0.34 + (_v.y + 0.34) * 0.12;
-    pos.setXYZ(i, _v.x, _v.y, _v.z);
+  // Enough planes to read as cut stone, few enough that every crease is a
+  // decision. The far tier gets fewer still: at 250 m the difference between
+  // nine facets and fifteen is invisible and the creases are below a pixel.
+  const planeCount = detail >= 1 ? 15 : 9;
+
+  // The long axis. Water-worn and frost-shattered stone is almost never
+  // equiaxed, and an elongated boulder lying across a slope reads as having
+  // been PUT there by something.
+  const axis = new Vector3(rng.signed(), rng.signed() * 0.3, rng.signed());
+  if (axis.lengthSq() < 1e-6) axis.set(1, 0, 0);
+  axis.normalize();
+
+  let faces = cubeFaces(2.4);
+  const spin = rng.next() * Math.PI * 2;
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const dir = new Vector3();
+
+  for (let i = 0; i < planeCount; i++) {
+    // A Fibonacci sphere spreads the cutting planes evenly, which is what stops
+    // two of them landing almost on top of each other and shaving a sliver face
+    // that then reads as a crack. The jitter puts irregularity back without
+    // reintroducing near-duplicates.
+    const k = (i + 0.5) / planeCount;
+    const y = 1 - 2 * k;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const phi = i * golden + spin;
+    dir.set(Math.cos(phi) * r, y, Math.sin(phi) * r);
+    dir.x += rng.signed() * 0.17;
+    dir.y += rng.signed() * 0.17;
+    dir.z += rng.signed() * 0.17;
+    if (dir.lengthSq() < 1e-8) continue;
+    dir.normalize();
+
+    // Planes facing along the long axis sit further out, which stretches the
+    // solid along it. Doing it here rather than by scaling afterwards keeps
+    // every face exactly planar.
+    const elong = 1 + 0.30 * Math.abs(dir.dot(axis));
+    faces = clipHull(faces, dir, rng.range(0.82, 1.10) * elong);
   }
-  pos.needsUpdate = true;
-  geo.computeVertexNormals();
+
+  // The flat base, cut where the squash will leave it 0.30 below the origin.
+  faces = clipHull(faces, new Vector3(0, -1, 0), 0.30 / Math.max(squash, 0.2));
+
+  // ── Squash, once per unique vertex ────────────────────────────────────────
+  // Adjacent faces share vertex OBJECTS, so scaling per face would scale a
+  // shared corner as many times as it has faces. An affine scale maps planes to
+  // planes, so the facets stay exactly flat through it.
+  const seen = new Set<Vector3>();
+  for (const f of faces) {
+    for (const p of f.verts) {
+      if (seen.has(p)) continue;
+      seen.add(p);
+      p.y *= squash;
+    }
+  }
+
+  // Recentre on X/Z so the instance origin is the boulder's own axis rather
+  // than wherever the cutting happened to leave it — the placer sinks these by
+  // a fraction of their radius and that only works from a centred origin.
+  let cx = 0;
+  let cz = 0;
+  for (const p of seen) {
+    cx += p.x;
+    cz += p.z;
+  }
+  cx /= seen.size;
+  cz /= seen.size;
+  for (const p of seen) {
+    p.x -= cx;
+    p.z -= cz;
+  }
+
+  // ── Emit ──────────────────────────────────────────────────────────────────
+  // Non-indexed, one fan per face, every vertex of a face carrying that face's
+  // own plane normal. Flat shading is the point: the cel ramp then steps at the
+  // facet boundary instead of gradating across it.
+  const tri: number[] = [];
+  const nrm: number[] = [];
+  const uvs: number[] = [];
+  const e1 = new Vector3();
+  const e2 = new Vector3();
+  const fn = new Vector3();
+  const fu = new Vector3();
+  const fv = new Vector3();
+  const rel = new Vector3();
+
+  for (const f of faces) {
+    const vs = f.verts;
+    if (vs.length < 3) continue;
+    // Newell, so the emitted normal is the polygon's own plane after the
+    // squash rather than the pre-squash cutting direction.
+    fn.set(0, 0, 0);
+    for (let i = 0; i < vs.length; i++) {
+      const a = vs[i];
+      const b = vs[(i + 1) % vs.length];
+      fn.x += (a.y - b.y) * (a.z + b.z);
+      fn.y += (a.z - b.z) * (a.x + b.x);
+      fn.z += (a.x - b.x) * (a.y + b.y);
+    }
+    if (fn.lengthSq() < 1e-12) continue;
+    fn.normalize();
+
+    fu.copy(vs[1]).sub(vs[0]);
+    if (fu.lengthSq() < 1e-12) continue;
+    fu.normalize();
+    fv.crossVectors(fn, fu);
+
+    for (let i = 1; i < vs.length - 1; i++) {
+      const a = vs[0];
+      const b = vs[i];
+      const c = vs[i + 1];
+      e1.subVectors(b, a);
+      e2.subVectors(c, a);
+      if (e1.cross(e2).lengthSq() < 1e-14) continue; // sliver
+      for (const p of [a, b, c]) {
+        tri.push(p.x, p.y, p.z);
+        nrm.push(fn.x, fn.y, fn.z);
+        rel.copy(p).sub(a);
+        uvs.push(rel.dot(fu) * 0.5 + 0.5, rel.dot(fv) * 0.5 + 0.5);
+      }
+    }
+  }
+
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new BufferAttribute(new Float32Array(tri), 3));
+  geo.setAttribute('normal', new BufferAttribute(new Float32Array(nrm), 3));
+  geo.setAttribute('uv', new BufferAttribute(new Float32Array(uvs), 2));
+
   // maxWeldAngle 180: a boulder wants a continuous hull even across its hard
-  // facet creases, or the outline tears open at every edge.
+  // facet creases, or the outline tears open at every edge. The cut vertices
+  // are shared exactly between faces, so this weld is lossless — every corner
+  // collapses to one group and every copy gets the same averaged normal.
   return finalizeGeometry(geo, {
     tolerance: 1e-3,
     maxWeldAngle: 180,

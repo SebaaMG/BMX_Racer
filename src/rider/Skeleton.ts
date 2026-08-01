@@ -148,15 +148,67 @@ const AIM_NAME: Partial<Record<BoneName, BoneName>> = {
  * limbs, wide shoulders. These are the numbers the IK is parameterised by, so
  * changing one here changes the whole rig consistently.
  */
+/**
+ * The foot, in its own rest frame: origin at the ankle joint, +Z toward the
+ * toe, sole flat and horizontal.
+ *
+ * These numbers are shared by the three places that MUST agree or the foot
+ * leaves the pedal: the rest skeleton (which positions the ankle above the
+ * spindle), the shoe mesh (which is lofted from them), and the pedal contact
+ * the rig solves onto. They live here rather than in RiderMesh so there is
+ * exactly one definition of where the bottom of the shoe is.
+ *
+ * The rest foot is LEVEL. `poseLegs` writes the foot bone's rig rotation as the
+ * PEDAL's own rotation times the ankle-flex channel, so with flex at zero the
+ * shoe renders exactly as authored — which means "as authored" has to be the
+ * sole flat on the platform, not a foot pointed 22° at the ground, which is
+ * what it used to be.
+ */
+export const FOOT = {
+  /** Underside of the sole below the ankle joint. */
+  soleDrop: 0.090,
+  /** Pedal platform top above the spindle. BikeModel: 12.5 mm body, 7.5 mm pins. */
+  platform: 0.010,
+  /** Back of the heel, behind the ankle. */
+  heelBack: 0.078,
+  /** Tip of the toe, ahead of the ankle. `heelBack + toeAhead` = shoe length. */
+  toeAhead: 0.177,
+  /** Ball of the foot — where the spindle sits — ahead of the ankle. */
+  ballAhead: 0.078,
+  /** The toe BONE (metatarsal joint) relative to the ankle. */
+  toeJointAhead: 0.092,
+  toeJointDrop: 0.052,
+};
+
 export const LIMB = {
   upperArm: 0.285,
   forearm: 0.265,
   thigh: 0.425,
   shin: 0.405,
-  /** How far the pedal spindle sits below the ankle joint. */
-  ankleLift: 0.072,
-  /** Ankle sits slightly behind the spindle; the ball of the foot is on it. */
-  ankleBack: 0.010,
+  /**
+   * How far the ankle JOINT sits above the pedal spindle.
+   *
+   * This is not a free parameter, and it was previously wrong by 28 mm in the
+   * wrong direction. The sole of the shoe is `FOOT.soleDrop` below the ankle
+   * and the pedal's platform surface is `FOOT.platform` above its spindle, so
+   * for the sole to sit ON the platform the ankle must be exactly the sum of
+   * the two above the spindle. At the old 0.072 the sole passed 30 mm THROUGH
+   * the pedal and out the bottom of it — which, together with `ankleBack`
+   * below, is the whole of "the shoe hangs clear of the crank, sole facing
+   * nothing". The foot-to-anchor distance measured 0.0727 m and was reported as
+   * correct, because the number being measured was the ankle JOINT, and nobody
+   * checked where the rendered sole was relative to it.
+   */
+  ankleLift: FOOT.soleDrop + FOOT.platform,
+  /**
+   * How far the ankle sits BEHIND the spindle.
+   *
+   * A pedal spindle goes under the BALL of the foot, which on this rider is
+   * 78 mm forward of the ankle. The old value was 10 mm — the spindle
+   * effectively under the ankle bone — so the entire shoe hung out in front of
+   * the crank with nothing under it.
+   */
+  ankleBack: FOOT.ballAhead,
 };
 
 /** Radii and shape parameters the mesh builder needs. Metres. */
@@ -351,8 +403,11 @@ function buildRest(): RestTable {
   set('thighR', v(-0.098, 0.775, -0.128));
   set('footL', ankleL.clone());
   set('footR', ankleR.clone());
-  set('toeL', ankleL.clone().add(v(0, -0.046, 0.112)));
-  set('toeR', ankleR.clone().add(v(0, -0.046, 0.112)));
+  // The toe bone is the metatarsal joint, not the tip of the shoe: it is the
+  // hinge the front of the foot flexes about, so it belongs over the ball —
+  // which is to say directly over the spindle.
+  set('toeL', ankleL.clone().add(v(0, -FOOT.toeJointDrop, FOOT.toeJointAhead)));
+  set('toeR', ankleR.clone().add(v(0, -FOOT.toeJointDrop, FOOT.toeJointAhead)));
 
   const bendLegL = new Vector3();
   const bendLegR = new Vector3();

@@ -348,6 +348,7 @@ const DUST_VERT = /* glsl */ `
   out vec2  vQuad;
   out vec3  vTint;
   out float vAlpha;
+  out float vInk;
   out vec3  vWorldPos;
   out float vViewDist;
   out float vNear;
@@ -358,6 +359,7 @@ const DUST_VERT = /* glsl */ `
     vQuad = vec2(0.0);
     vTint = aTint;
     vAlpha = 0.0;
+    vInk = 0.0;
     vWorldPos = aOrigin;
     vViewDist = 1.0;
     vNear = 0.0;
@@ -388,18 +390,43 @@ const DUST_VERT = /* glsl */ `
     // Closed-form linear drag: p = p0 + v0 * (1 - e^-kt) / k. Analytic rather
     // than integrated so there is no per-frame CPU cost and no drift between
     // a 60Hz and a 120Hz machine.
-    float drag = mix(2.9, 1.15, isPlume);
+    float drag = mix(2.9, 1.6, isPlume);
     vec3 p = aOrigin + aVel * ((1.0 - exp(-drag * t)) / drag);
-    // Dust lifts on its own turbulence and then gives up.
+
+    // ── LIFT, THEN SETTLE ────────────────────────────────────────────────────
     //
-    // The plume multiplier used to be 1.5, which over a 2.4s life carried a
-    // puff nearly four metres straight up. That is a bonfire, not a wheel: a
-    // dust trail hangs at roughly rider height and is left BEHIND, and the
-    // vertical travel is what made the scree plume read as a smoke column
-    // standing over a stationary fire rather than as something a bike did.
-    // Ground-hugging is the whole silhouette of the effect.
-    float rise = mix(0.28, 0.72, aParams.z) * mix(0.85, 1.05, isPlume);
-    p.y += rise * t * (1.0 - 0.55 * age);
+    // This term used to be rise * t * (1 - 0.55 * age) — MONOTONIC. It only
+    // ever went up, and with the seed velocity's own vertical component behind
+    // it the measured result was a puff centroid 2.7 m above the rear contact
+    // patch on the scree run and individual puffs 5.5 m up: dust level with the
+    // rider's head, then above the HUD. A wheel does not make a bonfire. The
+    // whole silhouette of the effect is a plume that hangs LOW and is left
+    // BEHIND, and the far end of it is the part that has to be on the floor —
+    // it is also the oldest part, so a monotonic rise puts the tail of the
+    // trail in the sky and the trail reads as ending wherever it lifts out of
+    // the ground plane. Measured: the scree trail "died" at ~8 m for exactly
+    // this reason while its puffs were still alive at 20 m.
+    //
+    // So: a small saturating lift on the puff's own turbulence, and a
+    // quadratic settle that takes it back. The lift asymptotes at ~0.4 m within
+    // a third of a second; the settle is negligible early and eats all of it by
+    // the end of life. Net height over life is a low arc that ends on the
+    // ground, which is what a dispersing dust cloud actually does.
+    float rise = mix(0.14, 0.36, aParams.z) * mix(1.0, 1.35, isPlume);
+    float lift = rise * (1.0 - exp(-3.2 * t));
+    float settle = mix(0.34, 0.62, fract(aParams.z * 5.77)) * age * age;
+    p.y += lift - settle;
+
+    // ── LATERAL SPREAD ───────────────────────────────────────────────────────
+    // A trail that keeps its birth width for its whole life is a tube, and a
+    // tube reads as a pipe rather than as smoke. Each puff wanders off a
+    // per-instance world-space bearing, quadratically in age so the spread is
+    // invisible at the contact patch and obvious at the tail. World space, not
+    // camera space, or the whole plume swims when the camera moves.
+    float bear = fract(aParams.z * 31.73) * TAU;
+    float spread = mix(0.30, 0.95, fract(aParams.z * 12.41)) * age * age * mix(0.75, 1.25, isPlume);
+    p.x += cos(bear) * spread;
+    p.z += sin(bear) * spread;
 
     float sz = aShape.x * (1.0 + aShape.y * q) * uSizeScale;
     float ang = aShape.w + aShape.z * q;
@@ -416,10 +443,30 @@ const DUST_VERT = /* glsl */ `
     // ground, at 25%, over a fogged mid-value scree field, is below the
     // threshold at which anything is a picture element. Measured against a
     // dust-free frame the peak channel delta was single digits out of 255.
-    // Linear fade, quantised to thirds, holds the puff opaque through the
+    // Linear fade, quantised to quarters, holds the puff opaque through the
     // first half of its life, which is when it is meant to be read.
+    //
+    // AND IT REACHES ZERO. ceil(fade * 3) / 3 never did: the smallest value
+    // it can return for any live puff is 1/3, so every puff in the game was
+    // cut out of the frame at a third of full opacity with a full-strength ink
+    // ring still round it (see vInk below). Measured on the scree trail, that
+    // is "a column of identically-opaque round puffs with no fade" — because
+    // there genuinely was no fade, only a cut. ROUNDING to quarters gives four
+    // hard holds that end at nothing, which is an animator taking a cloud out
+    // in four beats rather than deleting it.
     float fade = 1.0 - q;
-    vAlpha = ceil(clamp(fade, 0.0, 1.0) * 3.0) / 3.0;
+    vAlpha = floor(clamp(fade, 0.0, 1.0) * 4.0 + 0.5) / 4.0;
+
+    // ── The contour's own staircase ──────────────────────────────────────────
+    // THE LINE OUTLIVES THE FILL — but it does not outlive the puff. Holding
+    // the ink at a flat 0.78 for the whole life (what the fragment stage used
+    // to do unconditionally) means the last thing you see of every puff is a
+    // hard black ring at full strength popping out of existence, which is the
+    // single loudest artefact a particle system can have. It holds through the
+    // first 55% of life and then steps out over three holds of its own, always
+    // above the fill, so the shape stays drawn while it dissolves.
+    float inkFade = 1.0 - smoothstep(0.55, 1.0, q);
+    vInk = floor(clamp(inkFade, 0.0, 1.0) * 3.0 + 0.5) / 3.0 * 0.78;
 
     // ── Billboard ────────────────────────────────────────────────────────────
     vec3 R = camRightWS();
@@ -536,6 +583,7 @@ const DUST_FRAG = /* glsl */ `
   in vec2  vQuad;
   in vec3  vTint;
   in float vAlpha;
+  in float vInk;
   in vec3  vWorldPos;
   in float vViewDist;
   in float vNear;
@@ -595,14 +643,15 @@ const DUST_FRAG = /* glsl */ `
     vec3 viewDir = normalize(vWorldPos - uCameraPos);
     col = applyQuantizedFog(col, vViewDist, viewDir, gl_FragCoord.xy);
 
-    // THE LINE OUTLIVES THE FILL. On the last two steps of a puff's life the
-    // fill drops to 2/3 then 1/3, and if the contour drops with it the puff
-    // stops being a drawing and becomes precisely the soft translucent smudge
-    // this entire system exists to avoid — the failure mode arrives at the end
-    // of every single puff's life rather than being designed out. An animator
-    // inking a dispersing cloud keeps the line at full strength and lets the
-    // interior go; the shape stays legible right up to the frame it is cut.
-    float alpha = mix(vAlpha, max(vAlpha, 0.78), isInk) * vNear * uOpacity;
+    // THE LINE OUTLIVES THE FILL. On the last steps of a puff's life the fill
+    // drops away, and if the contour drops with it the puff stops being a
+    // drawing and becomes precisely the soft translucent smudge this entire
+    // system exists to avoid. An animator inking a dispersing cloud keeps the
+    // line up and lets the interior go; the shape stays legible right up to
+    // the frame it is gone. vInk is that line's own staircase — always at or
+    // above the fill, and it reaches zero on the same beat the puff does, so
+    // nothing pops out at full strength. See the vertex stage.
+    float alpha = mix(vAlpha, max(vAlpha, vInk), isInk) * vNear * uOpacity;
 
     fragColor = vec4(col, alpha);
   }
@@ -747,12 +796,34 @@ export class DustSystem {
     _liveSystems.push(this);
   }
 
+  /**
+   * Tell the system where the camera is, BEFORE anything emits this frame.
+   *
+   * THIS IS NOT A CONVENIENCE. Emission is distance-culled against `_camPos`,
+   * and `_camPos` used to be sampled only at the END of the frame in update().
+   * On the frame the subject teleports — a respawn, a checkpoint reset, and
+   * every single capture pose and sequence — the camera has already been moved
+   * hundreds of metres but the dust system is still holding the PREVIOUS
+   * position, so every emission on that frame is culled as "too far".
+   *
+   * That is the entire reason the `crash` capture contained no dust at all.
+   * Measured: crashCount reaches 1 and the impact flash fires on the very
+   * first frame after setSequence, so notifyCrash() ran and dust.burst() was
+   * called — and countAlive() reports 0 puffs for the whole 120-frame
+   * sequence, because the burst was culled against a camera position 700 m up
+   * the mountain. The first dust that survived was emitted 1.3 s later, once
+   * update() had finally caught the camera up.
+   */
+  syncCamera(camera: PerspectiveCamera): void {
+    camera.getWorldPosition(_camPos);
+    this.haveCamera = true;
+  }
+
   /** Advance the FX clock. `dt` must be the SCALED dt so freezes freeze dust. */
   update(dt: number, camera: PerspectiveCamera): void {
     this.fxTime += dt;
     this.material.uniforms.uFxTime.value = this.fxTime;
-    camera.getWorldPosition(_camPos);
-    this.haveCamera = true;
+    this.syncCamera(camera);
     this.pool.flush();
     this.emittedThisFrame = 0;
   }
@@ -844,12 +915,30 @@ export class DustSystem {
    * a landing spray (faster, denser, flatter, shorter-lived), below it a skid
    * puff (slower, fewer, larger, lingering).
    */
-  burst(position: Vector3, normal: Vector3, velocity: Vector3, amount: number, surface: SurfaceProperties): void {
+  burst(
+    position: Vector3,
+    normal: Vector3,
+    velocity: Vector3,
+    amount: number,
+    surface: SurfaceProperties,
+    /**
+     * Floor under the surface's own dustAmount.
+     *
+     * A rolling wheel on rock genuinely throws almost nothing — 0.18 is the
+     * right number for a trail. A CRASH on rock does not: a body and a bike
+     * grinding across a rock garden tears up everything that is loose on top
+     * of it, and the review capture named `crash` is set at t=0.559, in the
+     * rock garden, where the honest surface multiplier turned a 16-puff impact
+     * burst into three. An impact passes a floor here so the hit is legible on
+     * every surface in the game.
+     */
+    minDust = 0,
+  ): void {
     const a = clamp01(amount);
     if (a <= 0.01) return;
     if (this.tooFar(position.x, position.y, position.z)) return;
 
-    const dustScale = surface.dustAmount;
+    const dustScale = Math.max(surface.dustAmount, minDust);
     if (dustScale <= 0.02) return;
 
     const spray = a > 0.55;
@@ -867,32 +956,52 @@ export class DustSystem {
 
     for (let i = 0; i < count; i++) {
       const ang = this.rng.range(0, Math.PI * 2);
-      const radial = spray ? this.rng.range(0.75, 1.0) : this.rng.range(0.35, 0.95);
-      const up = spray ? this.rng.range(0.18, 0.55) : this.rng.range(0.35, 0.95);
-      const speed = (spray ? 2.4 + a * 8.5 : 1.1 + a * 3.4) * this.rng.range(0.62, 1.35);
+      // IN-PLANE, NOT UP.
+      //
+      // `up` used to run to 0.95 and multiply a speed that reached 13 m/s,
+      // which with the old linear drag put a landing puff SEVEN METRES in the
+      // air before it had faded. Dust off a contact patch is thrown SIDEWAYS —
+      // the wheel is displacing material along the ground, not launching it —
+      // and everything vertical about the read should come from the shader's
+      // small saturating lift, which is bounded by construction. The radial
+      // term is correspondingly stronger: that is the lateral spread the
+      // effect was missing.
+      const radial = spray ? this.rng.range(0.95, 1.45) : this.rng.range(0.55, 1.15);
+      const up = spray ? this.rng.range(0.10, 0.30) : this.rng.range(0.12, 0.34);
+      const speed = (spray ? 2.2 + a * 6.0 : 1.0 + a * 2.8) * this.rng.range(0.62, 1.35);
 
-      // Radial component in the surface plane, plus a lift along the normal.
+      // Radial component in the surface plane, plus a small lift along the normal.
       _d.copy(_t).multiplyScalar(Math.cos(ang) * radial)
         .addScaledVector(_b, Math.sin(ang) * radial)
         .addScaledVector(_n, up);
       _d.multiplyScalar(speed);
 
       // A landing throws its dust forward with the bike; a skid drags it back.
-      _d.addScaledVector(velocity, spray ? 0.16 : -0.10);
+      _d.addScaledVector(velocity, spray ? 0.13 : -0.10);
       // Never let the seed velocity drive a puff into the ground.
       if (_d.y < 0 && vy < 0) _d.y *= 0.25;
 
       // Emission point jittered across the contact patch, not from a point.
-      const jr = this.rng.range(0, spray ? 0.55 : 0.30);
+      const jr = this.rng.range(0, spray ? 0.42 : 0.24);
       const ja = this.rng.range(0, Math.PI * 2);
       _v.copy(position)
         .addScaledVector(_t, Math.cos(ja) * jr)
         .addScaledVector(_b, Math.sin(ja) * jr)
-        .addScaledVector(_n, this.rng.range(0.02, 0.22));
+        .addScaledVector(_n, this.rng.range(0.02, 0.16));
 
-      const life = spray ? this.rng.range(0.55, 0.95) : this.rng.range(0.85, 1.35);
-      const scale = (spray ? this.rng.range(0.22, 0.42) : this.rng.range(0.26, 0.48)) * (0.8 + dustScale * 0.35);
-      const growth = spray ? this.rng.range(1.9, 2.8) : this.rng.range(1.2, 1.9);
+      // SIZED AGAINST THE WHEEL, which is the only ruler in the frame.
+      //
+      // The old birth scale reached 0.48, and `sz` is a HALF-EXTENT that the
+      // x2 atlas compensation doubles again, so a single fresh puff was 1.9 m
+      // across against a 0.53 m wheel. Measured at `tabletop-air`: individual
+      // puffs larger than the wheels, occluding both contact patches. Birth is
+      // now ~0.3-0.5 m across — smaller than a wheel — and the GROWTH ramp
+      // takes it to plume size over the puff's life, which is the read the
+      // critic asked for and the one that was never visible underneath the
+      // starting size.
+      const life = spray ? this.rng.range(0.80, 1.30) : this.rng.range(1.05, 1.70);
+      const scale = (spray ? this.rng.range(0.13, 0.24) : this.rng.range(0.15, 0.27)) * (0.85 + dustScale * 0.25);
+      const growth = spray ? this.rng.range(2.4, 3.6) : this.rng.range(1.9, 2.9);
       const spin = this.rng.signed() * (spray ? 1.6 : 0.9);
 
       this.write(_v.x, _v.y, _v.z, _d.x, _d.y, _d.z, life, kind, scale, growth, spin, tint);
@@ -902,16 +1011,16 @@ export class DustSystem {
     // behind the contact — the tail that sells the impact after the spray has
     // already gone.
     if (spray && dustScale > 0.9 && vLen > 6) {
-      const n2 = clamp(Math.round(a * 4 * dustScale), 1, 6);
+      const n2 = clamp(Math.round(a * 5 * dustScale), 1, 8);
       for (let i = 0; i < n2; i++) {
-        _d.copy(velocity).multiplyScalar(-0.16);
-        _d.addScaledVector(_n, this.rng.range(0.6, 1.6));
-        _d.addScaledVector(_t, this.rng.signed() * 0.9);
+        _d.copy(velocity).multiplyScalar(-0.14);
+        _d.addScaledVector(_n, this.rng.range(0.18, 0.50));
+        _d.addScaledVector(_t, this.rng.signed() * 1.1);
         this.write(
-          position.x + this.rng.signed() * 0.5, position.y + 0.15, position.z + this.rng.signed() * 0.5,
+          position.x + this.rng.signed() * 0.45, position.y + 0.10, position.z + this.rng.signed() * 0.45,
           _d.x, _d.y, _d.z,
-          this.rng.range(1.5, 2.3), DUST_PLUME,
-          this.rng.range(0.55, 0.95) * dustScale, this.rng.range(1.6, 2.4),
+          this.rng.range(1.8, 2.7), DUST_PLUME,
+          this.rng.range(0.22, 0.38) * (0.85 + dustScale * 0.25), this.rng.range(2.2, 3.2),
           this.rng.signed() * 0.55, tint,
         );
       }
@@ -935,11 +1044,13 @@ export class DustSystem {
     rate: number,
     dt: number,
     surface: SurfaceProperties,
+    /** Floor under the surface's own dustAmount. See burst(). */
+    minDust = 0,
   ): void {
     if (rate <= 0 || dt <= 0) return;
     if (this.tooFar(position.x, position.y, position.z)) return;
 
-    const dustScale = surface.dustAmount;
+    const dustScale = Math.max(surface.dustAmount, minDust);
     if (dustScale <= 0.02) return;
 
     const expected = rate * dustScale * dt;
@@ -967,29 +1078,41 @@ export class DustSystem {
 
     for (let i = 0; i < count; i++) {
       const ang = this.rng.range(0, Math.PI * 2);
-      const radial = this.rng.range(0.2, 0.8);
+      // The normal component was 0.5-1.2 and it was multiplied by a speed of
+      // up to 2.1 and again by 1.5 for a plume: 3.8 m/s straight up, which
+      // under the old drag is 3.3 m of climb. That is the whole of "the dust
+      // rises and never settles". A rolling contact throws material SIDEWAYS
+      // and the shader owns what little of it goes up.
+      const radial = this.rng.range(0.55, 1.35);
       _d.copy(_t).multiplyScalar(Math.cos(ang) * radial)
         .addScaledVector(_b, Math.sin(ang) * radial)
-        .addScaledVector(_n, this.rng.range(0.5, 1.2));
-      _d.multiplyScalar(this.rng.range(0.9, 2.1) * (plume ? 1.5 : 1.0));
+        .addScaledVector(_n, this.rng.range(0.10, 0.34));
+      _d.multiplyScalar(this.rng.range(0.85, 1.6) * (plume ? 1.25 : 1.0));
       // Dragged backward out of the contact patch.
-      _d.addScaledVector(velocity, -0.13);
+      _d.addScaledVector(velocity, -0.16);
 
-      const jr = this.rng.range(0, 0.26);
+      const jr = this.rng.range(0, 0.22);
       const ja = this.rng.range(0, Math.PI * 2);
       _v.copy(position)
         .addScaledVector(_t, Math.cos(ja) * jr)
         .addScaledVector(_b, Math.sin(ja) * jr)
-        .addScaledVector(_n, this.rng.range(0.03, 0.18));
+        .addScaledVector(_n, this.rng.range(0.03, 0.14));
 
       // Plumes were 0.45-0.85 base, which after the surface factor and the x2
       // atlas compensation put a single puff at over two metres across. Three
       // of those is a fog bank with no internal structure; the plume has to be
       // built out of MANY smaller drawings whose overlapping contours are what
       // give it a readable silhouette, exactly as it is drawn on paper.
-      const life = plume ? this.rng.range(1.5, 2.2) : this.rng.range(0.7, 1.15);
-      const scale = (plume ? this.rng.range(0.26, 0.50) : this.rng.range(0.18, 0.32)) * (0.85 + dustScale * 0.3);
-      const growth = plume ? this.rng.range(1.7, 2.5) : this.rng.range(1.1, 1.7);
+      //
+      // The birth size is now BELOW a wheel diameter and the growth ramp is
+      // what carries it: a fresh puff at the contact patch is a small mark and
+      // the tail of the trail is a big soft-edged one, which is the size ramp
+      // over life the critic could not find. Longer-lived too — at 23 m/s a
+      // 1.45 s puff is 33 m behind the wheel when it dies, which is what
+      // "hangs and streams 20 m or more" costs.
+      const life = plume ? this.rng.range(1.9, 2.9) : this.rng.range(1.05, 1.60);
+      const scale = (plume ? this.rng.range(0.14, 0.26) : this.rng.range(0.11, 0.20)) * (0.85 + dustScale * 0.3);
+      const growth = plume ? this.rng.range(2.4, 3.6) : this.rng.range(2.0, 3.0);
       const spin = this.rng.signed() * (plume ? 0.5 : 1.1);
 
       this.write(_v.x, _v.y, _v.z, _d.x, _d.y, _d.z, life, kind, scale, growth, spin, tint);

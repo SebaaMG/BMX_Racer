@@ -73,7 +73,7 @@ import {
 } from 'three';
 import { GLSL_COMMON, GLSL_FRAG_OUT } from './ShaderChunks';
 import { NPR } from './NprGlobals';
-import { INK, SKY, SUN_DIRECTION } from './Palette';
+import { FOG_BANDS, INK, SKY, SUN_DIRECTION } from './Palette';
 import { celCloudMask } from './GeneratedTextures';
 
 /** Scratch for the per-frame sun projection. Module scope so update() never allocates. */

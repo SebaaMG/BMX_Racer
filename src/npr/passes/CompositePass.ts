@@ -102,16 +102,38 @@ const FRAGMENT = /* glsl */ `
     }
 
     if (uRadialBlur > 0.0005) {
-      // Six taps toward the focus point. Enough to read as speed, few enough
-      // that it stays inside the budget when a boost and a landing land in the
-      // same frame.
-      vec2 toFocus = uSpeedFocus - uv;
-      vec3 acc = col;
-      for (int i = 1; i < 6; i++) {
-        float t = float(i) / 5.0;
-        acc += texture(uScene, uv + toFocus * t * uRadialBlur * 0.16).rgb;
-      }
-      col = acc * (1.0 / 6.0);
+      // ── SMEAR FRAMES, NOT A BLUR ──────────────────────────────────────────
+      //
+      // This was six evenly spaced taps averaged with equal weight — a box
+      // blur along the radius. It is worth being precise about what that does
+      // to this particular picture, because it was the single most
+      // wide-reaching cause of the stills critic's "zero steps above 4 across
+      // 750 pixels", and it is invisible in a screenshot of the effect alone.
+      //
+      // A box blur does not add a gradient. It DELETES EVERY EDGE IT CROSSES.
+      // Six equal taps spread over a 15-pixel radial span turn one hard cel
+      // boundary — the whole point of the renderer — into six sub-two-unit
+      // substeps three pixels apart, which is exactly a smooth ramp as far as
+      // any measurement or any eye is concerned. On ravine-gap at y = 1000,
+      // x 2400..3150, the terrain underneath genuinely carries steps of 9.9
+      // luminance units; through this filter the largest step anywhere in that
+      // 751-pixel run measured 1.07. The picture is quantised and then blurred
+      // back into a photograph in the last pass.
+      //
+      // Animation does not blur a fast object, it draws it several times. So
+      // this is now THREE DISCRETE GHOSTS at decreasing opacity, composited by
+      // mix() rather than averaged: every ghost is a full hard-edged copy of
+      // the frame, so a cel boundary that was one 40-unit step becomes three
+      // steps of 12, 7 and 21 units instead of a six-tap staircase. Same
+      // radial displacement, same read of speed, and the frame stays drawn.
+      //
+      // The offsets are unequal (0.42 / 1.0) so the ghosts do not stack into
+      // an evenly-spaced comb, which reads as a repeat rather than as motion.
+      vec2 toFocus = (uSpeedFocus - uv) * uRadialBlur * 0.22;
+      vec3 g1 = texture(uScene, uv + toFocus * 0.42).rgb;
+      vec3 g2 = texture(uScene, uv + toFocus).rgb;
+      col = mix(col, g1, 0.30);
+      col = mix(col, g2, 0.18);
     }
 
     // ── 2. Bloom, in linear light ───────────────────────────────────────────
@@ -162,21 +184,38 @@ const FRAGMENT = /* glsl */ `
       // That is a twelvefold overdraw at the speeds these poses are captured
       // at, and it is the whole of what the critic is looking at: strokes that
       // should have been a whisper laid across the slopes at full strength.
+      // ── QUANTISE THE WHOLE FIELD, INCLUDING THE CENTRE CLEAR ───────────────
+      //
+      // The previous pass quantised slq into three flat values and then
+      // MULTIPLIED THE RESULT by a smoothstep. That smoothstep is the defect.
+      //
+      //     clear = smoothstep(0.38, 0.76, length((uv - focus) * (aspect, 1)))
+      //
+      // Read it in device pixels. The argument is a radius in x-units, so on a
+      // 3200 x 1800 frame the ramp runs from 684 px to 1367 px from the focus:
+      // a SIX-HUNDRED-AND-EIGHTY-THREE PIXEL CONTINUOUS RAMP multiplying the
+      // brightest thing painted on the frame. Three flat values times a smooth
+      // envelope is a smooth envelope.
+      //
+      // MEASURED. tools/capture/_ab.mjs and _skyab.mjs install their override
+      // on syncState (writing a uniform and rendering measures nothing —
+      // PostPipeline.render calls syncState immediately before it draws, and
+      // syncState reloads every uniform out of POST_STATE). On ravine-gap the
+      // stills critic's trace at y = 900, x 2100..3150 carried 68.7 luminance
+      // units at a maximum single-pixel step of 3.93 and not one step above 4
+      // in 1051 pixels. Forcing uSpeedIntensity to 0 took it to 27.8 units and
+      // took every visible band with it. The sky shaft fan, which the critic
+      // suspected, measured uIntensity = 0.0000 in that pose and in every other
+      // still pose in the review set — it contributed nothing at all.
+      //
+      // The fix is one line of restructuring: the centre clear is folded into
+      // the shape BEFORE the posterise, so there is exactly ONE scalar and it
+      // is quantised exactly ONCE. The stroke can now only take the four values
+      // 0, 0.34, 0.64 and 1.0, and the radial envelope decides where those
+      // boundaries fall rather than scaling them. The strokes come out cut into
+      // hard radial segments — the same language as the sun shafts in Sky.ts,
+      // which is what they are supposed to rhyme with.
       float slq = saturate1(sl / max(uSpeedIntensity, 1e-3));
-      float qw = max(fwidth(slq) * 0.8, 0.012);
-      float q1 = smoothstep(0.13 - qw, 0.13 + qw, slq);
-      float q2 = smoothstep(0.36 - qw, 0.36 + qw, slq);
-      float q3 = smoothstep(0.66 - qw, 0.66 + qw, slq);
-      float stroke = 0.34 * q1 + 0.30 * q2 + 0.36 * q3;
-
-      // A DRAWN EDGE on the outermost cut. Three flat values butted together
-      // read as banding; the same three with a line down the join read as a
-      // brush stroke that someone put an edge on. One pixel wide, taken on the
-      // normalised value so it is a screen pixel at any stroke length.
-      float ew = max(fwidth(slq) * 0.8, 0.008);
-      float rim =
-          smoothstep(0.13 - ew, 0.13 + ew, slq)
-        * (1.0 - smoothstep(0.13 + ew, 0.13 + ew * 3.0, slq));
 
       // ── HOLD THEM OFF THE SUBJECT ───────────────────────────────────────────
       // The helper's own header promises strokes that are "absent in the centre
@@ -190,7 +229,32 @@ const FRAGMENT = /* glsl */ `
       // drawn over the subject deletes the thing it is supposed to be
       // accelerating, so the centre is cleared here unconditionally.
       vec2 fd = (uv - uSpeedFocus) * vec2(aspect, 1.0);
-      float clear = smoothstep(0.38, 0.76, length(fd));
+      float shape = slq * smoothstep(0.38, 0.76, length(fd));
+
+      float qw = max(fwidth(shape) * 0.8, 0.005);
+      float q1 = smoothstep(0.10 - qw, 0.10 + qw, shape);
+      float q2 = smoothstep(0.34 - qw, 0.34 + qw, shape);
+      float q3 = smoothstep(0.64 - qw, 0.64 + qw, shape);
+      float stroke = 0.34 * q1 + 0.30 * q2 + 0.36 * q3;
+
+      // A DRAWN EDGE on the outermost cut. Three flat values butted together
+      // read as banding; the same three with a line down the join read as a
+      // brush stroke that someone put an edge on. One pixel wide, taken on the
+      // quantised field so it is a screen pixel wherever the boundary lands.
+      float ew = max(fwidth(shape) * 0.8, 0.004);
+      float rim =
+          smoothstep(0.10 - ew, 0.10 + ew, shape)
+        * (1.0 - smoothstep(0.10 + ew, 0.10 + ew * 3.0, shape));
+
+      // ── AND NOTHING BELOW A SPEED WORTH DRAWING ────────────────────────────
+      // A per-frame scalar, uniform over every pixel, so it cannot put a
+      // gradient anywhere — it only decides whether the effect exists at all.
+      // At bike-detail's 8 m/s the field was painting a 2% wash whose only
+      // visible product was two dead-level dashed hairlines across clean blue
+      // sky at native y 405 and y 530 (confirmed by A/B: they vanish with
+      // uSpeedIntensity forced to 0, and they are strokes, not clouds). A
+      // stroke too faint to read as a stroke is dirt on the lens.
+      float live = smoothstep(0.035, 0.075, uSpeedIntensity);
 
       // Painted, not added. A speed line in animation is a stroke of paint at
       // a flat value; adding light instead gives a glow that blows out the sky
@@ -203,8 +267,8 @@ const FRAGMENT = /* glsl */ `
       // full chat anywhere near half. The strokes are still hard-edged at every
       // one of those values — what changes with speed is how many of them you
       // can see, which is the correct axis.
-      float paint = stroke * clear * uSpeedIntensity * 0.62;
-      float edge  = rim * clear * uSpeedIntensity * 0.85;
+      float paint = stroke * uSpeedIntensity * live * 0.62;
+      float edge  = rim * uSpeedIntensity * live * 0.85;
       col = mix(col, uSpeedColor, saturate1(paint + edge));
     }
 

@@ -479,7 +479,12 @@ const FRAGMENT = /* glsl */ `
       else if (uDebug < 4.5) v = eId;
       else if (uDebug < 5.5) v = hull;
       else                   v = aC.y;
-      fragColor = vec4(vec3(v), 1.0);
+      // The value goes in ALPHA as well as RGB. CompositePass's ink debug view
+      // displays vec3(ink.a) and nothing else, so writing 1.0 here made every
+      // single-value view show a flat white silhouette of the geometry — which
+      // is what made the previous investigation unable to tell a crease line
+      // from an id line. Both channels carry the value; either reader works.
+      fragColor = vec4(vec3(v), v);
       return;
     }
 

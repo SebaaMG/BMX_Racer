@@ -44,6 +44,33 @@
  * reads as a slow zoom and the player stops noticing it; a curve that does
  * nothing until you are genuinely fast and then opens hard reads as speed.
  *
+ * THE DOLLY. The standoff is not a number, it is whatever holds the subject at
+ * a CONSTANT apparent size against that FOV curve — `framingConstant` divided
+ * by tan(halfFov). It has to be, and the reason is measurable. The old rig
+ * added 1.35 m of standoff per unit of normalised speed on top of a lens that
+ * was opening at the same time, so the two compounded: the on-screen motion of
+ * a point at the subject's depth is v / (d·tan(halfFov)), and over the measured
+ * `scree-speed` run (70→83 km/h) d·tan went from 2.65 to 3.63 — 37% — against
+ * 19% more speed. THE PICTURE MOVED LESS THE FASTER YOU WENT. Measured
+ * frame-to-frame pixel delta: 4.88 in the first third at 72 km/h, 4.18 in the
+ * last third at 82 km/h. A camera that cancels its own speed cue is worse than
+ * a static one, because it costs a whole FOV curve to achieve nothing.
+ *
+ * Holding d·tan constant instead makes the screen flow exactly proportional to
+ * speed, and it fixes the framing at both ends for free: the old formula was
+ * CLOSEST at low speed (3.55 m behind a 62° lens) and that is where the subject
+ * blew out to 42% of frame height with the bike clipped off the bottom edge on
+ * `switchback`, and widest at speed where the subject was smallest. Both
+ * failures were the same sign error about which way the standoff should go.
+ *
+ * THE SURGE and THE BUFFET are the two things that make speed an EVENT rather
+ * than a state. The surge is a high-pass on the speed — the lens opens while
+ * you are gaining and narrows while you are scrubbing, and settles to nothing
+ * when you are merely fast. The buffet is a bounded, deterministic low-frequency
+ * jitter that only exists in the top half of the speed range. Neither is
+ * compensated by the dolly, on purpose: the dolly is fed the pure speed term so
+ * that the transients stay visible instead of being solved away.
+ *
  * THE SHAKE. Directional and impact-shaped, never a rumble. A primary
  * oscillation along the impact axis under an envelope with a visible rebound,
  * plus a decorrelated simplex wobble. Simplex rather than Math.random because
@@ -64,6 +91,11 @@
  * envelope that pulls the boom in to 60%, lifts and stiffens the rig so it
  * ARRIVES instead of whipping, kills the corner drift, narrows the lens, and
  * runs a short slow-mo. The subject gets bigger when it goes wrong, not smaller.
+ * In ORBIT the same envelope pulls the arc in, cranks the spin rate and lifts
+ * the elevation, because a rider on the ground is a horizontal subject and a
+ * 10-degree orbit is edge-on to it — which is precisely how the review set's
+ * `crash` shrank to 62 px of legible subject while the camera drifted serenely
+ * past at a constant rate.
  */
 
 import { Object3D, PerspectiveCamera, Quaternion, Vector3 } from 'three';
@@ -135,26 +167,83 @@ for (let i = 0; i < MAX_OCCLUDERS; i++) _occPos.push(new Vector3());
 export const CAMERA_TUNING = {
   fovBase: 62,
   fovTop: 78,
-  /** Exponent on normalised speed. High on purpose — see the header. */
+  /**
+   * SHAPE OF THE SPEED→FOV CURVE, as `1 − (1 − s)^fovSaturation`.
+   *
+   * This used to be `s^2.7` — flat at the bottom, opening hard at the top, on
+   * the argument that a lens which only moves when you are genuinely fast reads
+   * as speed. The argument is wrong, and it is wrong in a way that is
+   * measurable rather than arguable.
+   *
+   * Opening the lens REDUCES the on-screen motion of everything in the frame,
+   * by exactly the ratio of the tangents. The eight review sequences all live
+   * between 0.70 and 0.90 of reference speed, which is precisely where `s^2.7`
+   * does all of its work: over `scree-speed` the speed rises 19% and the old
+   * curve raised tan(halfFov) by 15%, so the picture moved 3% more for 19% more
+   * speed — and once the wider lens had also pushed the near ground toward the
+   * edges of the frame, the measured frame-to-frame pixel delta actually FELL,
+   * 4.50 to 3.90. A reviewer reported that the picture changes LESS the faster
+   * you go and they were reading the image correctly.
+   *
+   * Inverting the curve puts the movement where the speed is NOT: the lens does
+   * its opening through the technical, low-speed part of the course and is
+   * nearly saturated by race pace, so at race pace the flow is proportional to
+   * v and nothing is cancelling it. 1.35 leaves 75.4°→77.1° across the
+   * `scree-speed` band — 3% of tan against 19% of speed, so the picture now
+   * moves 15% more for 19% more speed — while still spending a full 13° between
+   * a standstill and 47 km/h, which is where a lens change is legible anyway.
+   *
+   * The FOV is still what says "fast". It says it by being wide, by NARROWING
+   * hard whenever speed is scrubbed, and through the surge — not by creeping
+   * open across a range the player never leaves.
+   */
+  fovSaturation: 1.35,
+  /** Retained for source compatibility. Nothing reads it. */
   fovExponent: 2.7,
   /** Speed treated as "flat out", m/s. */
   referenceSpeed: 26,
 
   /**
-   * Boom length at rest, metres, measured from the rider's CHEST (see
-   * `subjectPivotHeight`) rather than from the axle reference point.
+   * THE FRAMING CONSTANT. Standoff × tan(halfFov), metres.
    *
-   * This used to be 5.0 + 2.1·speed, which put the rider 7–8 m away and made
-   * him 105–176 px tall in a 900 px frame — 12–19% of frame height, a thumbnail.
-   * The rider rig is the highest-visibility craft in the game and it was being
-   * shot from the far side of the road. At 3.0 + 1.35·speed he lands around
-   * 27–33% of frame height, which is a legible subject, and the FOV curve
-   * (62°→78°) keeps the mountain in the shot behind him.
+   * The chase standoff is solved from this rather than authored, because the
+   * only quantity anybody actually cares about is how big the rider is on
+   * screen, and that is `subjectSpan / (2·d·tan(halfFov))`. Fixing the product
+   * fixes the framing at every speed and makes the on-screen flow — which is
+   * `v / (d·tan(halfFov))` — exactly proportional to v.
+   *
+   * 3.30 puts the 1.95 m rider box at 266 px of a 900 px frame (29.5%), which
+   * measures at 240-260 px of DRAWN silhouette. That is the size `scree-speed`
+   * shipped at and the size the motion review signed off on; `switchback` was
+   * shipping 330-376 with the cranks and both contact patches below the frame
+   * edge, and the orbit sequences 128-138.
+   */
+  framingConstant: 3.30,
+  /** Bounds on the solved standoff, metres. Floors above `boomMin` by design. */
+  chaseDistMin: 3.95,
+  chaseDistMax: 5.85,
+  /**
+   * Retained: the resting standoff and per-speed gain the dolly REPLACED.
+   * Kept only so the arithmetic in the header can be checked against them.
+   * Nothing reads these.
    */
   chaseDistance: 3.55,
   chaseDistanceSpeedGain: 1.35,
-  chaseHeight: 1.58,
-  chaseHeightSpeedGain: 0.52,
+  /**
+   * Boom height above the subject at rest, and the change per unit of
+   * normalised speed. The gain is NEGATIVE: the camera drops as the rider
+   * accelerates.
+   *
+   * It used to climb (+0.52), and climbing is the wrong direction for the same
+   * reason the standoff was: the on-screen speed of the ground is `v·h/(x²+h²)`
+   * for a point at horizontal distance x, so raising the eye pushes the nearest
+   * visible ground further away and slows everything in the lower half of the
+   * frame down. Dropping it brings the ground up under the lens where it can
+   * actually rush, and it is the framing a downhill run wants anyway — high and
+   * back is a spectator, low and close is a rider.
+   */
+  chaseHeight: 1.74,
+  chaseHeightSpeedGain: -0.52,
   /** Height above BikeState.position that the boom pivots on — the chest. */
   subjectPivotHeight: 0.95,
 
@@ -164,14 +253,68 @@ export const CAMERA_TUNING = {
   /** Look-at spring: critically damped and much stiffer, so framing stays solid. */
   lookOmega: 11.0,
   /** Heading lag half-life at rest and at reference speed, seconds. */
-  lagHalfLifeSlow: 0.16,
-  lagHalfLifeFast: 0.30,
-  /** Metres of outward drift per unit of lateral acceleration. */
-  cornerSwing: 0.11,
-  cornerSwingMax: 2.6,
-  /** Camera roll per unit of lateral acceleration, radians. */
-  rollGain: 0.0085,
-  rollMax: 0.12,
+  lagHalfLifeSlow: 0.19,
+  lagHalfLifeFast: 0.40,
+  /**
+   * Metres of outward drift per unit of lateral acceleration.
+   *
+   * Was 0.11 / 2.6. On the `switchback` sequence the yaw rate peaks at
+   * 0.55 rad/s at 13 m/s, so the old gain bought 0.79 m of drift on a 4.3 m
+   * arm — 10 degrees of arc, which is inside the noise of the rider's own lean.
+   * A reviewer looking at the sequence reported the camera "never leads the
+   * turn, never turns at all", and they were reading it correctly: it turned,
+   * but by an amount that could not be told apart from not turning.
+   */
+  cornerSwing: 0.24,
+  cornerSwingMax: 3.2,
+  /**
+   * Camera roll per unit of lateral acceleration, radians. Same story: 0.0085
+   * with a 0.12 cap gave 4.6 degrees at the peak of the sequence's hardest
+   * corner. 0.026 / 0.30 gives 9.5 degrees there and 17 at the cap.
+   */
+  rollGain: 0.026,
+  rollMax: 0.30,
+  /**
+   * How much of the aim's velocity lead is bent around the corner, as a
+   * fraction of `yawRate · leadTime`. The lead is a straight extrapolation of
+   * the velocity, which on a corner points at the outside of the exit; bending
+   * it with the yaw rate points it THROUGH the corner instead, which is the
+   * difference between a camera that follows and a camera that leads.
+   */
+  cornerLookArc: 0.75,
+
+  // ── Speed as an event ──────────────────────────────────────────────────────
+  /**
+   * The surge. A high-pass on speed: `speed − lagged(speed)`, in m/s, times
+   * `surgeFovGain` degrees. Positive while gaining speed, negative while
+   * scrubbing it, zero when merely fast — so it is the one FOV term that reads
+   * as an event rather than as a state.
+   */
+  surgeHalfLife: 0.45,
+  surgeFovGain: 2.4,
+  surgeFovMax: 4.5,
+  surgeFovMin: -3.0,
+  /**
+   * The buffet. Bounded deterministic jitter that only exists once you are
+   * genuinely quick, so that flat out does not look like cruising with a wider
+   * lens on. Amplitude in metres at the top of the speed range, ramping from
+   * `buffetFrom` on a 1.6 exponent. 0.075 m on a 4.1 m arm behind a 78° lens is
+   * about 10 px — present, not a rattle.
+   */
+  buffetMetres: 0.085,
+  buffetFrom: 0.45,
+  buffetRoll: 0.012,
+  /**
+   * Buffet noise rates, features per second. Deliberately in the 4-7 Hz band
+   * and not lower: a 2 Hz wobble of the same amplitude is a drift the eye
+   * integrates out and it contributes nothing to the frame-to-frame difference,
+   * which is the thing that was measured as flat. These are fast enough to
+   * change the picture every frame and slow enough to read as the rig being
+   * shaken rather than as dither.
+   */
+  buffetRateA: 5.9,
+  buffetRateB: 7.3,
+  buffetRateC: 4.1,
 
   // ── Boom safety ────────────────────────────────────────────────────────────
   /** The floor. The camera never gets closer to the chest pivot than this. */
@@ -394,8 +537,23 @@ export const CAMERA_TUNING = {
    * constantly correcting a subject that is already fine.
    */
   safeTop: 0.255,
-  safeBottom: 0.815,
+  safeBottom: 0.800,
   safeInnerPad: 0.045,
+  /**
+   * The subject box the framing loop measures, metres above and below
+   * `BikeState.position`. NOT the collision extents and not `riderTop`.
+   *
+   * It used to measure +1.75 / −0.48, and both ends were wrong in the same
+   * direction: the drawn silhouette's centre sits about 0.05 of frame height
+   * BELOW the centre of that box, because the head never reaches 1.75 and the
+   * wheels and their contact shadow go well past −0.48. So the loop was
+   * satisfied — measured, `switchback` held its modelled bottom at 0.823
+   * against a 0.815 limit — while the thing on screen was at 0.868 with both
+   * contact patches and the cranks under the boost bar. Measured from the
+   * difference-rendered silhouette on the shipped frames.
+   */
+  frameBoxTop: 1.58,
+  frameBoxBottom: -0.62,
   frameBiasMax: 3.0,
   /** Loop gain. Under 1 so the controller converges rather than ringing. */
   frameBiasGain: 0.6,
@@ -403,31 +561,54 @@ export const CAMERA_TUNING = {
   frameBiasRelaxHL: 0.55,
 
   // ── Air swing ──────────────────────────────────────────────────────────────
-  airSwingArc: 1.15,
   /**
-   * Was 0.55s of air before the swing would even be considered, and then a
-   * further requirement of 1.1s of flight REMAINING. A 7 m tabletop has about
-   * 1.5s of hang time total, so the first gate consumed most of the second one
-   * and the swing never fired once in the whole review set. Both are now sized
-   * against what the course actually launches you off.
+   * THE GATES ARE SIZED AGAINST WHAT THE COURSE ACTUALLY LAUNCHES YOU OFF, and
+   * that is a much smaller number than anybody writing this file has assumed.
+   *
+   * MEASURED, every sequence in the review set, peak air height and total hang:
+   *
+   *   switchback     1.97 m   0.30 s      tabletop-air   0.75 m   0.38 s
+   *   trick-360      0.71 m   0.36 s      landing        0.55 m   0.30 s
+   *   crash / launch / scree-speed / pack-race:  never leaves the ground
+   *
+   * The previous gates asked for 2.2 m of air AND 0.72 s of flight remaining
+   * AFTER 0.20 s had already elapsed — i.e. about 0.9 s of hang time, three
+   * times the longest jump on the mountain. The swing could not fire, has never
+   * fired, and an earlier report that it fired on 71 of 200 frames cannot have
+   * been measuring this code path. Same for the slow-mo's 5.5 m.
+   *
+   * These are not "lowered thresholds", they are the first ones that have ever
+   * been in range. 0.55 m of air with 0.26 s left is a real hop off a real
+   * feature; anything under it is suspension travel.
    */
-  airSwingMinAirTime: 0.20,
-  airSwingMinRemaining: 0.72,
-  airSwingMinPeak: 2.2,
-  airSwingBailout: 0.55,
-  airSwingCooldown: 2.2,
+  airSwingArc: 1.15,
+  airSwingMinAirTime: 0.06,
+  airSwingMinRemaining: 0.26,
+  airSwingMinPeak: 0.55,
+  airSwingBailout: 0.13,
+  airSwingCooldown: 1.5,
   airSwingRise: 1.4,
+  /**
+   * The arc is SCALED by the size of the jump, between these two peaks. A 66°
+   * whip around a 0.6 m hop is a camera having a seizure; the same whip around
+   * a 3 m table is the shot. Interpolated on the peak air height so the two
+   * cases get 28° and 66° respectively out of one code path.
+   */
+  airSwingScaleFrom: 0.55,
+  airSwingScaleTo: 3.2,
+  airSwingScaleMin: 0.42,
 
   // ── Slow-mo ────────────────────────────────────────────────────────────────
   /**
-   * Also never fired. The old apex test wanted `airTime > 0.85` AND
-   * `|velocity.y| < 1.8`; on a 7 m jump apex arrives at 0.75s, so the two
-   * windows barely overlapped and any jitter closed the gap. Detect the apex by
-   * the sign of the vertical velocity instead of by a clock.
+   * Rare by construction, and now reachable. 1.5 m is above every hop in the
+   * review set except the one genuine launch on `switchback`, so exactly one
+   * sequence in eight holds — which is what "on the biggest jumps" means. The
+   * apex is detected by the SIGN of the vertical velocity, never by a clock:
+   * the old `airTime > 0.85` window was wider than the whole flight.
    */
-  slowMoMinPeak: 5.5,
-  slowMoMinAirTime: 0.40,
-  slowMoMinRemaining: 0.35,
+  slowMoMinPeak: 1.5,
+  slowMoMinAirTime: 0.10,
+  slowMoMinRemaining: 0.08,
   slowMoScale: 0.38,
   slowMoAttack: 0.12,
   slowMoHold: 0.30,
@@ -449,6 +630,51 @@ export const CAMERA_TUNING = {
   crashSlowMoHold: 0.34,
   crashSlowMoRelease: 0.40,
   crashSlowMoCooldown: 4.0,
+
+  // ── The crash, seen from a hand-framed orbit ───────────────────────────────
+  /**
+   * `crashFocusPull` and `crashFocusRise` live on the chase arm and the review
+   * set's `crash` is shot from an ORBIT, so for the one sequence named after
+   * the event none of the crash language applied: measured, the orbit held a
+   * constant 8.00 m and a constant 0.35 rad/s for the whole 2 s while the
+   * subject fell to 62 px and the reviewer lost it outright.
+   *
+   * Three terms, all multiplied by the same envelope, all zero when nothing has
+   * gone wrong — so no still pose can be touched by them:
+   *
+   *   PULL   the arc closes to 55%. A wreck is the one moment the author's
+   *          standoff is definitely wrong.
+   *   SPIN   the arc accelerates 3.4×, ~150 degrees over the envelope. A
+   *          constant-rate orbit through a crash reads as indifference.
+   *   RISE   the elevation lifts 0.38 rad. A rider on the ground is a
+   *          HORIZONTAL subject and the authored 10 degrees is edge-on to it —
+   *          which is most of where the missing pixels went.
+   */
+  crashOrbitPull: 0.55,
+  crashOrbitSpin: 2.4,
+  crashOrbitRise: 0.38,
+  crashOrbitMaxPitch: 1.15,
+
+  // ── Orbit legibility ───────────────────────────────────────────────────────
+  /**
+   * A hand-framed orbit is authored as one of two completely different things
+   * and the number tells you which: `valley-vista` at 180 m and `summit-wide`
+   * at 52 m are COMPOSITIONS, where the subject being small is the point;
+   * `summit-rider` at 9 and `crash` at 8 are STANDOFFS, where the number is a
+   * guess at how far back you have to stand and the subject being 128 px is
+   * nobody's intent. Only the second kind is touched, and the gate is the
+   * authored distance itself.
+   *
+   * Inside the gate the arc closes until the subject's projected span reaches
+   * `orbitSubjectFrac` of frame height — the same 29.5% the chase dolly holds —
+   * never past `orbitCloseFloor` of what was authored, and never inside
+   * `framedMinDist`. It can only ever close: `rider-closeup` at 3.4 m is
+   * already larger than the target and is left exactly where it is.
+   */
+  orbitCloseMaxDist: 10.5,
+  orbitSubjectSpan: 1.95,
+  orbitSubjectFrac: 0.295,
+  orbitCloseFloor: 0.52,
 
   /** Retained for source compatibility; the boom solver supersedes them. */
   collisionSamples: 7,
@@ -511,6 +737,12 @@ export class CameraDirector implements ICameraDirector {
   private ly: SpringState = makeSpring();
   private lz: SpringState = makeSpring();
   private fovS: SpringState;
+  /**
+   * The lens the DOLLY is solved against — speed curve plus surge, on its own
+   * spring with the same constants as `fovS` so the arm and the lens never
+   * drift out of phase.
+   */
+  private dollyFovS: SpringState;
 
   // Composed each frame.
   private camPos = new Vector3(0, 5, 10);
@@ -528,6 +760,14 @@ export class CameraDirector implements ICameraDirector {
   private fovTop: number;
   private kick = 0;
   private prevBoosting = false;
+  /** Lagged speed. The surge is the difference. Negative until first seen. */
+  private speedLag = -1;
+  private surge = 0;
+
+  // Speed buffet. A lens wobble, so it is applied where the shake is applied
+  // and never enters the boom solve or the springs.
+  private buffetOffset = new Vector3();
+  private buffetRoll = 0;
 
   // Shake.
   private shakeAmp = 0;
@@ -545,6 +785,8 @@ export class CameraDirector implements ICameraDirector {
   private swingDir = 1;
   private swingAmount = 0;
   private swingCooldown = 0;
+  /** Arc of the CURRENT swing, radians. Scaled by the size of the jump. */
+  private swingArc: number = CAMERA_TUNING.airSwingArc;
 
   // Slow-mo. The envelope shape is captured at trigger time so a crash hold and
   // a big-air hold can have different timing without two state machines.
@@ -648,6 +890,7 @@ export class CameraDirector implements ICameraDirector {
     this.fovBase = opts.fovBase ?? CAMERA_TUNING.fovBase;
     this.fovTop = opts.fovTop ?? CAMERA_TUNING.fovTop;
     this.fovS = makeSpring(this.fovBase);
+    this.dollyFovS = makeSpring(this.fovBase);
     this.camera.fov = this.fovBase;
     this.camera.updateProjectionMatrix();
     this.camPos.copy(this.camera.position);
@@ -798,7 +1041,7 @@ export class CameraDirector implements ICameraDirector {
 
     switch (this.mode) {
       case CameraMode.Chase:
-        this.updateChase(target, d);
+        this.updateChase(target, d, time);
         break;
       case CameraMode.Cinematic:
         this.updateCinematic(target, d, time);
@@ -823,9 +1066,73 @@ export class CameraDirector implements ICameraDirector {
     this.compose(target, d);
   }
 
+  // ── Speed shaping ─────────────────────────────────────────────────────────
+
+  /**
+   * The speed-driven FOV in degrees, before kicks, surge, air and crash terms.
+   *
+   * Split out because the DOLLY is fed this and not `camera.fov`. Feeding it the
+   * composed FOV would make the standoff compensate every transient — a boost
+   * kick would open the lens and pull the camera in by exactly enough to cancel
+   * it, and the kick would be invisible. The dolly answers the speed curve; the
+   * transients are meant to survive it.
+   */
+  private speedFov(speed: number): number {
+    const s01 = clamp01(speed / CAMERA_TUNING.referenceSpeed);
+    const k = 1 - Math.pow(1 - s01, CAMERA_TUNING.fovSaturation);
+    return this.fovBase + (this.fovTop - this.fovBase) * k;
+  }
+
+  /**
+   * Standoff that holds the subject at a constant apparent size, for a given
+   * lens. See the header.
+   */
+  private chaseStandoff(fovDeg: number): number {
+    const t = Math.tan(fovDeg * DEG * 0.5);
+    return clamp(
+      CAMERA_TUNING.framingConstant / Math.max(t, 1e-3),
+      CAMERA_TUNING.chaseDistMin,
+      CAMERA_TUNING.chaseDistMax,
+    );
+  }
+
+  /** The surge, in degrees of lens, clamped. Shared by the FOV and the dolly. */
+  private surgeFov(): number {
+    return clamp(
+      this.surge * CAMERA_TUNING.surgeFovGain,
+      CAMERA_TUNING.surgeFovMin,
+      CAMERA_TUNING.surgeFovMax,
+    );
+  }
+
+  /**
+   * The buffet. Deterministic simplex, no allocation, evaluated on the sim
+   * clock so two runs of the capture harness produce identical frames.
+   *
+   * Written into `buffetOffset` rather than added to `camPos`, because anything
+   * added before `resolveBoom` is written back into the springs and becomes a
+   * permanent part of the arm rather than a wobble on the lens.
+   */
+  private updateBuffet(speed01: number, time: number, right: Vector3): void {
+    const from = CAMERA_TUNING.buffetFrom;
+    const k = clamp01((speed01 - from) / Math.max(1 - from, 1e-3));
+    const amp = Math.pow(k, 1.6) * CAMERA_TUNING.buffetMetres * (1 - this.crashFocus);
+    if (amp < 1e-5) {
+      this.buffetOffset.set(0, 0, 0);
+      this.buffetRoll = 0;
+      return;
+    }
+    const a = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateA, 31.7);
+    const b = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateB, 47.3);
+    const c = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateC, 63.9);
+    this.buffetOffset.copy(right).multiplyScalar(a * amp);
+    this.buffetOffset.y += b * amp * 0.8;
+    this.buffetRoll = c * amp * (CAMERA_TUNING.buffetRoll / CAMERA_TUNING.buffetMetres);
+  }
+
   // ── Chase ─────────────────────────────────────────────────────────────────
 
-  private updateChase(t: BikeState, dt: number): void {
+  private updateChase(t: BikeState, dt: number, time: number): void {
     _flatVel.copy(t.velocity);
     _flatVel.y = 0;
     const planar = _flatVel.length();
@@ -851,6 +1158,30 @@ export class CameraDirector implements ICameraDirector {
     const speed01 = clamp01(spd / CAMERA_TUNING.referenceSpeed);
     const cf = this.crashFocus;
 
+    // THE SURGE, and the lens the DOLLY is solved against.
+    //
+    // The dolly sees the speed curve and the surge, and nothing else. That
+    // split is the whole design of both terms:
+    //
+    //   IN  — the surge, because a lens transient that is not matched by the
+    //         arm is just a slow zoom that eats optical flow. Matched, it
+    //         becomes a dolly zoom: the subject holds its size to the pixel
+    //         while the mountain behind it stretches and contracts. That is
+    //         both the more dramatic effect and the one that does not cancel
+    //         the speed cue it was added to express.
+    //   OUT — the crash narrowing, the airborne narrowing and the boost kick,
+    //         all of which are supposed to change the framing. Feeding the
+    //         crash's 7° of narrowing to the dolly would lengthen the arm by
+    //         14% and cancel the 12% push-in almost exactly.
+    //
+    // Smoothed on its own spring rather than read back off `camera.fov`,
+    // because `camera.fov` carries the three terms above. Same omega, so the
+    // arm and the lens are always in phase.
+    if (this.speedLag < 0) this.speedLag = spd;
+    this.speedLag = dampHL(this.speedLag, spd, CAMERA_TUNING.surgeHalfLife, dt);
+    this.surge = spd - this.speedLag;
+    springStep(this.dollyFovS, this.speedFov(spd) + this.surgeFov(), 8.5, dt);
+
     // Yaw rate from the TRUE heading, before the lag is applied — this is the
     // corner signal, and reading it off the lagged anchor would smear it.
     const dYaw = shortAngle(this.prevYaw, travelYaw);
@@ -874,8 +1205,11 @@ export class CameraDirector implements ICameraDirector {
 
     this.updateAirSwing(t, dt);
 
+    // THE DOLLY. Solved against the speed FOV, so the product that sets the
+    // subject's apparent size — and the reciprocal of it, which sets the screen
+    // flow — is constant across the whole speed range. See the header.
     const dist =
-      (CAMERA_TUNING.chaseDistance + CAMERA_TUNING.chaseDistanceSpeedGain * speed01 + airPull) *
+      (this.chaseStandoff(this.dollyFovS.value) + airPull) *
       lerp(1, CAMERA_TUNING.crashFocusPull, cf);
     const height =
       CAMERA_TUNING.chaseHeight +
@@ -883,10 +1217,12 @@ export class CameraDirector implements ICameraDirector {
       airLift +
       CAMERA_TUNING.crashFocusRise * cf;
 
-    const anchorYaw = this.aimYaw + this.swingAmount * this.swingDir * CAMERA_TUNING.airSwingArc;
+    const anchorYaw = this.aimYaw + this.swingAmount * this.swingDir * this.swingArc;
     _dirV.set(Math.sin(anchorYaw), 0, Math.cos(anchorYaw));
     // right = dir x up.
     _rightV.set(-_dirV.z, 0, _dirV.x);
+
+    this.updateBuffet(speed01, time, _rightV);
 
     // Lateral acceleration proxy. Positive yawRate turns toward +X from +Z,
     // which is a LEFT turn, whose outside is +right — so the drift sign is
@@ -915,7 +1251,11 @@ export class CameraDirector implements ICameraDirector {
     // whatever `chaseDistanceSpeedGain` says it is and nothing else.
     const lead = 2 * zeta / omega + dt;
 
-    const rise = height + this.swingAmount * CAMERA_TUNING.airSwingRise;
+    const rise =
+      height +
+      this.swingAmount *
+        CAMERA_TUNING.airSwingRise *
+        (this.swingArc / CAMERA_TUNING.airSwingArc);
     _desired
       .copy(t.position)
       .addScaledVector(_dirV, -dist)
@@ -941,9 +1281,29 @@ export class CameraDirector implements ICameraDirector {
     // rider, then add a small genuine LEAD on top so the frame shows where they
     // are going rather than where they have been. The crash focus removes the
     // lead — mid-wreck there is no "going".
+    const leadT = 2 / lookOmega + dt + 0.06 * (1 - cf);
     _lookWanted.copy(t.position);
     _lookWanted.y += 1.05;
-    _lookWanted.addScaledVector(t.velocity, 2 / lookOmega + dt + 0.06 * (1 - cf));
+
+    // THE CORNER LEAD. A straight extrapolation of the velocity aims at the
+    // OUTSIDE of a corner exit — the faster you take it the further outside it
+    // points, which is the opposite of leading. Bend the horizontal part of the
+    // lead by the yaw rate over the lead time and it points down the arc the
+    // rider is actually on. The vertical component is left alone; gravity is
+    // not part of the corner.
+    _tmp.copy(t.velocity).multiplyScalar(leadT);
+    const bend = this.yawRate * leadT * CAMERA_TUNING.cornerLookArc * (1 - cf);
+    if (Math.abs(bend) > 1e-4) {
+      const cb = Math.cos(bend);
+      const sb = Math.sin(bend);
+      // Rotate about +Y. `yawRate` is measured as atan2(x, z), so a positive
+      // rate turns +Z toward +X and the rotation matrix follows that sign.
+      const nx = _tmp.x * cb + _tmp.z * sb;
+      const nz = -_tmp.x * sb + _tmp.z * cb;
+      _tmp.x = nx;
+      _tmp.z = nz;
+    }
+    _lookWanted.add(_tmp);
     if (airborne) _lookWanted.y -= clamp(airH * 0.10, 0, 1.6);
     springStep(this.lx, _lookWanted.x, lookOmega, dt);
     springStep(this.ly, _lookWanted.y, lookOmega, dt);
@@ -1005,8 +1365,20 @@ export class CameraDirector implements ICameraDirector {
   beginAirSwing(duration: number): void {
     this.swingActive = true;
     this.swingT = 0;
-    this.swingDur = Math.max(duration, 0.4);
+    this.swingDur = Math.max(duration, 0.24);
     const t = this.subject;
+
+    // Scale the arc to the jump. Everything the course actually launches you
+    // off is between 0.55 m and 2 m of air, and a 66-degree whip around a
+    // 0.6 m hop is not a camera move, it is a fault. See `airSwingScaleFrom`.
+    const peak = t ? Math.max(t.peakAirHeight, t.airHeight) : 0;
+    this.swingArc =
+      CAMERA_TUNING.airSwingArc *
+      lerp(
+        CAMERA_TUNING.airSwingScaleMin,
+        1,
+        smoothstep(CAMERA_TUNING.airSwingScaleFrom, CAMERA_TUNING.airSwingScaleTo, peak),
+      );
     // Orbit AGAINST the spin: the relative rotation is larger, which is what
     // makes the trick read. Orbiting with it would cancel the spin out and the
     // rider would look like they were hanging still in the air.
@@ -1025,8 +1397,13 @@ export class CameraDirector implements ICameraDirector {
     let target = this.fovBase;
 
     if (t) {
-      const s01 = clamp01(t.speed / CAMERA_TUNING.referenceSpeed);
-      target = this.fovBase + (this.fovTop - this.fovBase) * Math.pow(s01, CAMERA_TUNING.fovExponent);
+      target = this.speedFov(t.speed);
+      // THE SURGE. The speed curve is a state and states stop being noticed;
+      // this is its derivative, and a derivative is an event. Opens while the
+      // rider is gaining, closes while they are scrubbing, and is worth nothing
+      // at all at a steady 83 km/h — which is correct, because a steady 83 does
+      // not feel like anything either.
+      target += this.surgeFov();
       // Narrowing slightly in the air makes the height read as height. The
       // instinct is to widen for drama; widening actually flattens the drop.
       if (t.mode === BikeMode.Airborne) target -= clamp(t.airHeight * 0.22, 0, 3.2);
@@ -1167,11 +1544,38 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Shake ─────────────────────────────────────────────────────────────────
 
+  /**
+   * The impact envelope, evaluated at normalised time. Steep power decay for
+   * the instantaneous peak, cosine term for one visible rebound in the tail.
+   *
+   * Shared with the dominance test below, and that sharing is the whole point.
+   */
+  private shakeEnvelope(u: number): number {
+    if (u >= 1) return 0;
+    return Math.pow(1 - u, 2.4) * (1 + 0.38 * Math.cos(u * Math.PI * 3.0));
+  }
+
+  /** How hard the camera is being shaken RIGHT NOW, in request units. */
+  private shakeCurrent(): number {
+    if (this.shakeDur <= 0 || this.shakeT >= this.shakeDur) return 0;
+    return this.shakeAmp * this.shakeEnvelope(clamp01(this.shakeT / this.shakeDur));
+  }
+
   shake(amount: number, duration: number): void {
-    // Never downgrade a shake that is still stronger than the new request —
-    // a small follow-up hit must not cut a big one short.
-    const remaining = this.shakeDur > 0 ? clamp01(1 - this.shakeT / this.shakeDur) : 0;
-    if (amount <= this.shakeAmp * remaining) return;
+    // Never downgrade a shake that is still stronger than the new request — a
+    // small follow-up hit must not cut a big one short.
+    //
+    // Compared against the envelope's CURRENT VALUE, not against the fraction
+    // of the duration left to run. Those are wildly different numbers: a 0.94 s
+    // crash shake 70% of the way through has 30% of its clock remaining and
+    // 6% of its amplitude. Testing the clock made a decayed shake keep veto
+    // power over every new impulse for the whole of its tail, and that is
+    // exactly what was measured on the `crash` sequence — the body's ground
+    // impact at f0056 fired the impact flash, called straight through to here,
+    // and was silently thrown away by a shake that was already invisible.
+    // Cross-correlation of the static geometry over f0048-f0066 found no
+    // impulse at all on the punch frame.
+    if (amount <= this.shakeCurrent()) return;
     this.shakeAmp = amount;
     this.shakeDur = Math.max(duration, 0.05);
     this.shakeT = 0;
@@ -1183,8 +1587,9 @@ export class CameraDirector implements ICameraDirector {
     _shakeDir.copy(dir);
     if (_shakeDir.lengthSq() < 1e-8) _shakeDir.set(0, 1, 0);
     else _shakeDir.normalize();
-    const remaining = this.shakeDur > 0 ? clamp01(1 - this.shakeT / this.shakeDur) : 0;
-    if (amount <= this.shakeAmp * remaining) return;
+    // Same test as `shake`, run first so the direction is not adopted by a
+    // request that is about to be rejected.
+    if (amount <= this.shakeCurrent()) return;
     this.shakeDir.copy(_shakeDir);
     this.shake(amount, duration);
   }
@@ -1198,10 +1603,7 @@ export class CameraDirector implements ICameraDirector {
     const u = clamp01(this.shakeT / this.shakeDur);
 
     // The envelope is the whole difference between an impact and a rumble.
-    // A steep power decay gives the instantaneous peak; the cosine term puts
-    // one visible rebound in the tail, which is what says "something struck
-    // something" rather than "an engine is running".
-    const env = Math.pow(1 - u, 2.4) * (1 + 0.38 * Math.cos(u * Math.PI * 3.0));
+    const env = this.shakeEnvelope(u);
     const amp = this.shakeAmp * CAMERA_TUNING.shakeMetres;
 
     const primary = Math.sin(this.shakeT * CAMERA_TUNING.shakeFrequency) * env * amp;
@@ -1352,17 +1754,56 @@ export class CameraDirector implements ICameraDirector {
   }
 
   private updateOrbit(t: BikeState, dt: number): void {
-    this.orbitYaw += this.orbitSpin * dt;
+    const cf = this.crashFocus;
+
+    // The arc ACCELERATES through a wreck. A constant-rate orbit is the correct
+    // language for an establishing shot and an admission of indifference during
+    // the most cinematic two seconds in the game.
+    this.orbitYaw += this.orbitSpin * (1 + CAMERA_TUNING.crashOrbitSpin * cf) * dt;
+
     // The standoff floor. An orbit closer than this has the lens inside the
     // subject's own dust — see `framedMinDist`.
-    const dist = Math.max(this.orbitDist, CAMERA_TUNING.framedMinDist);
+    let dist = Math.max(this.orbitDist, CAMERA_TUNING.framedMinDist);
+
+    // LEGIBILITY CLOSE. Only for shots authored as a standoff rather than as a
+    // composition, only ever inward, floored twice. See `orbitCloseMaxDist`.
+    //
+    // Solved rather than damped: it is a pure function of the authored distance
+    // and the current FOV, both of which are already smooth, so there is no
+    // transient to smooth and nothing for a damper to do except make the
+    // harness's twelve settle frames ship a half-converged shot.
+    if (this.orbitDist <= CAMERA_TUNING.orbitCloseMaxDist) {
+      const tanHalf = Math.tan(this.camera.fov * DEG * 0.5);
+      const want =
+        CAMERA_TUNING.orbitSubjectSpan /
+        (2 * Math.max(tanHalf, 1e-3) * CAMERA_TUNING.orbitSubjectFrac);
+      if (want < dist) {
+        dist = Math.max(
+          want,
+          this.orbitDist * CAMERA_TUNING.orbitCloseFloor,
+          CAMERA_TUNING.framedMinDist,
+        );
+      }
+    }
+
+    // The crash push-in and the crash elevation. A rider on the ground is a
+    // horizontal subject; the authored pitch is chosen for one on a bike.
+    dist = Math.max(
+      dist * lerp(1, CAMERA_TUNING.crashOrbitPull, cf),
+      CAMERA_TUNING.framedMinDist,
+    );
+    const pitch = Math.min(
+      this.orbitPitch + CAMERA_TUNING.crashOrbitRise * cf,
+      CAMERA_TUNING.crashOrbitMaxPitch,
+    );
+
     this.boomDesired = dist;
-    const cy = Math.cos(this.orbitPitch);
+    const cy = Math.cos(pitch);
     this.lookPos.copy(t.position);
     this.lookPos.y += 1.1;
     this.camPos.set(
       this.lookPos.x + Math.sin(this.orbitYaw) * cy * dist,
-      this.lookPos.y + Math.sin(this.orbitPitch) * dist,
+      this.lookPos.y + Math.sin(pitch) * dist,
       this.lookPos.z + Math.cos(this.orbitYaw) * cy * dist,
     );
     this.roll = dampHL(this.roll, 0, 0.2, dt);
@@ -1432,6 +1873,22 @@ export class CameraDirector implements ICameraDirector {
     this.headingPrimed = false;
     this.aimYaw = 0;
     this.yawRate = 0;
+
+    // SPEED FROM THE VELOCITY, NOT FROM `state.speed`.
+    //
+    // `speed` is a DERIVED field the physics writes during its step, and every
+    // caller of this function re-seats the bike and then immediately resets the
+    // camera — so at this instant `velocity` is the caller's 19 m/s and `speed`
+    // is still whatever it was, which for a fresh spawn is zero. Everything
+    // seeded off it was therefore seeded for a STATIONARY rider: the arm at the
+    // resting standoff, the lens at 62°, the surge at a full 19 m/s of phantom
+    // acceleration. Measured before this fix, on `scree-speed` at a steady
+    // 19-23 m/s: the surge never dropped below 3.3 m/s for the whole two-second
+    // run and pinned +4.5° of spurious FOV on every frame of it, the lens ran
+    // 63.8→77.6 instead of 69.2→73.5, and the arm opened from 5.45 m — a metre
+    // and a half of unasked-for travel — while the subject settled.
+    const spd0 = Math.max(target.velocity.length(), target.speed);
+
     _flatVel.copy(target.velocity);
     _flatVel.y = 0;
     if (_flatVel.lengthSq() < 1e-4) {
@@ -1446,8 +1903,11 @@ export class CameraDirector implements ICameraDirector {
     // the resting distance meant every sequence began with the camera 3.4 m out
     // and spent its first 15 frames expanding — the rider filled 68% of frame
     // one of `scree-speed` for no reason other than the reset.
-    const s01 = clamp01(target.speed / CAMERA_TUNING.referenceSpeed);
-    const d0 = CAMERA_TUNING.chaseDistance + CAMERA_TUNING.chaseDistanceSpeedGain * s01;
+    const s01 = clamp01(spd0 / CAMERA_TUNING.referenceSpeed);
+    const f0 = this.mode === CameraMode.Chase ? this.speedFov(spd0) : this.fovBase;
+    this.dollyFovS.value = this.speedFov(spd0);
+    this.dollyFovS.velocity = 0;
+    const d0 = this.chaseStandoff(this.dollyFovS.value);
     const h0 = CAMERA_TUNING.chaseHeight + CAMERA_TUNING.chaseHeightSpeedGain * s01;
     _desired
       .copy(target.position)
@@ -1484,8 +1944,22 @@ export class CameraDirector implements ICameraDirector {
     this.crashT = -1;
     this.crashFocus = 0;
     this.kick = 0;
-    this.fovS.value = this.fovBase;
+    this.speedLag = spd0;
+    this.surge = 0;
+    this.buffetOffset.set(0, 0, 0);
+    this.buffetRoll = 0;
+    this.swingCooldown = 0;
+
+    // Seat the LENS at the speed it is being re-seated at, exactly as the arm
+    // is. Starting the FOV spring at `fovBase` on a bike already doing 23 m/s
+    // meant the first twelve frames of every capture were a 62°→73° zoom that
+    // nobody composed, and since the dolly is solved against the FOV it would
+    // now drag the standoff through the same transient. Measured before this:
+    // `scree-speed` f0000 shipped the rider at 366 px against 245 by f0112.
+    this.fovS.value = f0;
     this.fovS.velocity = 0;
+    this.camera.fov = f0;
+    this.camera.updateProjectionMatrix();
     this.clearNearFade();
 
     // THE SUBJECT HAS TELEPORTED. Everything the old shot left hanging in the
@@ -1678,6 +2152,9 @@ export class CameraDirector implements ICameraDirector {
     this.applyShake(dt);
 
     _camFinal.copy(this.camPos).add(this.shakeOffset);
+    // The buffet rides on the lens with the shake, after the arm is solved, so
+    // it can never be written back into the springs or mistaken for a collision.
+    if (this.mode === CameraMode.Chase) _camFinal.add(this.buffetOffset);
     if (tracking) _camFinal.y += this.collisionLift;
     // Hand-framed modes take their correction as elevation about the pivot
     // instead, so the authored distance and azimuth survive it.
@@ -1718,7 +2195,8 @@ export class CameraDirector implements ICameraDirector {
     // tilt and has no business feeding the framing loop.
     if (tracking) this.updateFraming(subject, dt);
 
-    const roll = this.roll + this.shakeRoll;
+    const roll =
+      this.roll + this.shakeRoll + (this.mode === CameraMode.Chase ? this.buffetRoll : 0);
     if (Math.abs(roll) > 1e-5) {
       this.camera.rotateZ(roll);
       this.camera.updateMatrixWorld();
@@ -2162,12 +2640,12 @@ export class CameraDirector implements ICameraDirector {
     // View space, straight off the camera's inverse world matrix. Doing the
     // maths here rather than calling Vector3.project keeps roll and the
     // projection matrix's near/far terms out of a purely vertical question.
-    _view.set(src.x, src.y + CAMERA_TUNING.riderTop, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    _view.set(src.x, src.y + CAMERA_TUNING.frameBoxTop, src.z).applyMatrix4(this.camera.matrixWorldInverse);
     if (_view.z > -0.25) return; // behind, or on, the lens — nothing to frame
     const depth = -_view.z;
     const fracTop = 0.5 - (_view.y / (depth * tanHalf)) * 0.5;
 
-    _view.set(src.x, src.y - 0.48, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    _view.set(src.x, src.y + CAMERA_TUNING.frameBoxBottom, src.z).applyMatrix4(this.camera.matrixWorldInverse);
     if (_view.z > -0.25) return;
     const fracBot = 0.5 - (_view.y / (-_view.z * tanHalf)) * 0.5;
 

@@ -1,13 +1,17 @@
 /**
- * Throwaway probe: capture a pose with every mesh whose name contains a
- * substring forced invisible, to attribute a stray mark to the object that
- * drew it.  node tools/capture/_thide.mjs <pose> <substr> <out.png>
+ * Force the terrain zone lookup to a fixed mip level and shoot a pose.
+ *
+ * The question this answers: is a material tongue on screen a fact about the
+ * zone FIELD, or about the majority mip chain the shader reads it through?
+ * Pinning the level answers it in one frame.
+ *
+ *   node tools/capture/_zlod.mjs <pose> <lodMax> <out.png>
  */
 import { chromium } from 'playwright';
 
-const pose = process.argv[2] ?? 'treeline-silhouette';
-const substr = process.argv[3] ?? '';
-const out = process.argv[4] ?? '/tmp/thide.png';
+const pose = process.argv[2] ?? 'valley-vista';
+const lod = Number(process.argv[3] ?? 0);
+const out = process.argv[4] ?? '/tmp/zlod.png';
 
 const b = await chromium.launch({
   args: ['--use-angle=default', '--enable-gpu', '--ignore-gpu-blocklist', '--force-color-profile=srgb'],
@@ -21,19 +25,15 @@ await p.evaluate(() => window.__DESCENT__.game.capture.takeControl());
 await p.evaluate((x) => window.__DESCENT__.game.capture.setPose(x), pose);
 await p.evaluate(() => { for (let i = 0; i < 12; i++) window.__DESCENT__.game.capture.step(1 / 60); });
 
-const hidden = await p.evaluate((s) => {
-  if (!s) return [];
-  const g = window.__DESCENT__.game;
-  const names = [];
-  g.engine.scene.traverse((o) => {
-    if ((o.isMesh || o.isLine || o.isPoints) && o.name.includes(s)) {
-      Object.defineProperty(o, 'visible', { get: () => false, set: () => {}, configurable: true });
-      names.push(o.name);
-    }
+const n = await p.evaluate((l) => {
+  let hit = 0;
+  window.__DESCENT__.engine.scene.traverse((o) => {
+    const m = o.material;
+    if (m && m.uniforms && m.uniforms.uZoneLodMax) { m.uniforms.uZoneLodMax.value = l; hit++; }
   });
-  return names;
-}, substr);
-console.log('hidden:', hidden.length, hidden.slice(0, 6).join(', '));
+  return hit;
+}, lod);
+console.log('materials patched:', n, ' lodMax =', lod);
 
 await p.evaluate(() => { for (let i = 0; i < 2; i++) window.__DESCENT__.game.capture.step(1 / 60); });
 await p.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));

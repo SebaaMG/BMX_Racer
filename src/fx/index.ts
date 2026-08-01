@@ -34,6 +34,7 @@ import {
 } from 'three';
 
 import {
+  BikeMode,
   SurfaceKind,
   type BikeState,
   type IEffects,
@@ -41,6 +42,26 @@ import {
   type SurfaceProperties,
   type WheelState,
 } from '../game/Contracts';
+
+/**
+ * BikeState plus the two monotonic event counters BikePhysics publishes.
+ *
+ * They live on BikePhysics.BikeStateEx rather than on Contracts.BikeState (that
+ * file is the shared spine and is not this subsystem's to edit — see the
+ * report), and this module cannot import from `../bike` without creating a
+ * dependency the architecture does not want. So the shape is restated here as
+ * an OPTIONAL widening: everything still works against a plain BikeState, and
+ * where the counters exist they are used in preference to the latched flags.
+ *
+ * WHY THEY MATTER HERE. `landedThisStep` / `crashedThisStep` are true for
+ * exactly one 120 Hz physics step. A rendered frame consumes two of those, so
+ * a flag raised and cleared inside one frame is invisible; and the mode-edge
+ * fallback below cannot see a crash that begins and resolves between two
+ * frames at all. A counter compared against a remembered value is correct for
+ * any number of steps per frame, survives two events in one frame, and needs
+ * nobody to clear it.
+ */
+type EventCounters = { landCount?: number; crashCount?: number };
 import { clamp01 } from '../core/MathX';
 import { Rng } from '../core/RNG';
 import { BIKE, SURFACES } from '../game/WorldConstants';
@@ -121,6 +142,20 @@ export class Effects implements IEffects {
   private prevBoosting = false;
   private landCooldown = 0;
   private crashCooldown = 0;
+  /** Last seen values of the BikeStateEx event counters. -1 = not primed. */
+  private seenLandCount = -1;
+  private seenCrashCount = -1;
+
+  // ── Crash ground strikes ──────────────────────────────────────────────────
+  // A crash is not an instant, it is a process: the bike goes down, tumbles,
+  // and hits the ground two or three more times on the way to a stop. The old
+  // code punctuated only the ENTRY, so in the review capture — where the entry
+  // happens during the harness's settle frames — the whole visible crash had
+  // no dust and no accent anywhere in it. These track the slide so each strike
+  // gets its own.
+  private prevSpeed = 0;
+  private prevContact = false;
+  private crashStrikeCooldown = 0;
 
   private impactSteppedThisFrame = false;
 
@@ -183,10 +218,31 @@ export class Effects implements IEffects {
     // A new subject invalidates whatever rig we resolved for the old one.
     this.smearWired = false;
     this.smearAttempts = 0;
+    this.primeCounters(state);
     if (state) {
       this.prevAirborne = state.mode === 'airborne';
       this.prevCrashing = state.mode === 'crashing';
+      this.prevSpeed = state.speed;
     }
+  }
+
+  /**
+   * Take the event counters' CURRENT values as the baseline.
+   *
+   * The timing here is the whole point and it is easy to get backwards. If the
+   * baseline is adopted lazily, on the first update() that sees the subject,
+   * then any event that happens between the reset and that first frame is
+   * swallowed — and that is exactly the order Game.applySituation runs in: it
+   * calls effects.reset(), then prerolls the physics, then forces the crash,
+   * and only then does a frame render. Adopting late means the one pose in the
+   * review set named `crash` is the one pose whose crash is never announced.
+   * Adopting HERE, at the reset, makes the baseline mean "everything before
+   * this moment is history" and everything after it an event.
+   */
+  private primeCounters(state: BikeState | null): void {
+    const ev = state as (BikeState & EventCounters) | null;
+    this.seenLandCount = typeof ev?.landCount === 'number' ? ev.landCount : -1;
+    this.seenCrashCount = typeof ev?.crashCount === 'number' ? ev.crashCount : -1;
   }
 
   /**
@@ -339,6 +395,13 @@ export class Effects implements IEffects {
       ? (camera as PerspectiveCamera)
       : this.cameraDirector.camera;
 
+    // BEFORE ANY EMISSION. Dust culls emissions against the camera position it
+    // was last told about, and on the frame the subject teleports that
+    // position is still hundreds of metres away — so every burst fired on a
+    // respawn or a capture cut was silently thrown away. See
+    // DustSystem.syncCamera.
+    this.dust.syncCamera(cam);
+
     const s = this.subject;
     if (s && this.autoEmit) {
       if (!this.smearWired) this.resolveSmearRig(s);
@@ -371,21 +434,52 @@ export class Effects implements IEffects {
   private detectEvents(s: BikeState, dt: number): void {
     if (this.landCooldown > 0) this.landCooldown -= dt;
     if (this.crashCooldown > 0) this.crashCooldown -= dt;
+    if (this.crashStrikeCooldown > 0) this.crashStrikeCooldown -= dt;
 
-    const airborneNow = s.mode === 'airborne';
-    const crashingNow = s.mode === 'crashing';
+    const airborneNow = s.mode === BikeMode.Airborne;
+    const crashingNow = s.mode === BikeMode.Crashing;
 
-    const landed = s.landedThisStep || (this.prevAirborne && !airborneNow && !crashingNow);
-    if (landed && this.landCooldown <= 0) {
+    // ── Counters first, flags as the fallback ─────────────────────────────────
+    const ev = s as BikeState & EventCounters;
+    let landed: boolean;
+    let crashed: boolean;
+    if (typeof ev.landCount === 'number' && typeof ev.crashCount === 'number') {
+      if (this.seenLandCount < 0) {
+        // Never primed (no reset, no setSubject). Adopt rather than replay: the
+        // counters are monotonic across a whole race and a fresh consumer must
+        // not fire an effect for every landing that already happened.
+        this.seenLandCount = ev.landCount;
+        this.seenCrashCount = ev.crashCount;
+      }
+      landed = ev.landCount > this.seenLandCount;
+      crashed = ev.crashCount > this.seenCrashCount;
+      this.seenLandCount = ev.landCount;
+      this.seenCrashCount = ev.crashCount;
+    } else {
+      landed = s.landedThisStep || (this.prevAirborne && !airborneNow && !crashingNow);
+      crashed = s.crashedThisStep || (!this.prevCrashing && crashingNow);
+    }
+
+    if (landed && !crashingNow && this.landCooldown <= 0) {
       this.landCooldown = 0.08;
       this.notifyLanding(s);
     }
 
-    const crashed = s.crashedThisStep || (!this.prevCrashing && crashingNow);
     if (crashed && this.crashCooldown <= 0) {
       this.crashCooldown = 0.40;
       this.notifyCrash(s);
     }
+
+    // ── The rest of the crash ─────────────────────────────────────────────────
+    // Everything above fires once, on the frame the bike goes down. What the
+    // audience actually watches is the second and a half AFTER that, and until
+    // now none of it was drawn: the review capture of `crash` measured zero
+    // live puffs across the entire window in which the speedo falls from 19 to
+    // 9 km/h, and its only flash belonged to a rival colliding with the downed
+    // player 900 ms later. A body sliding across a rock garden throws material
+    // continuously and bangs down two or three times on the way to a stop.
+    if (crashingNow) this.crashStrikes(s, dt);
+    this.prevSpeed = s.speed;
 
     // Boost ignition gets a flash but never a freeze — it happens far too
     // often to spend a hold on, and a hold would fight the acceleration.
@@ -394,6 +488,58 @@ export class Effects implements IEffects {
 
     this.prevAirborne = airborneNow;
     this.prevCrashing = crashingNow;
+  }
+
+  /**
+   * Dust and punctuation for the body of a crash.
+   *
+   * Two signals, both derived from state that already exists:
+   *
+   *  • A STRIKE is a wheel or the frame arriving back on the ground — either a
+   *    contact rising edge, or a single-frame loss of speed too large to be
+   *    friction. Measured on `crash`, the hard one is at f0027-f0028 where the
+   *    speedo drops 15.6 to 8.9 km/h in 16 ms; that is the frame the eye reads
+   *    as the hit, and it is squarely inside the f0005-f0030 window the critic
+   *    identified and the old code left empty.
+   *
+   *  • A SLIDE throws a continuous trail while the wreck is anywhere near the
+   *    ground, whether or not the physics calls a wheel grounded — during a
+   *    tumble it usually does not, and "no wheel is technically in contact" is
+   *    not a reason for a bike scraping along at 20 km/h to be dustless.
+   */
+  private crashStrikes(s: BikeState, dt: number): void {
+    const w = s.rear?.grounded ? s.rear : s.front;
+    const surf = w?.surface ?? DEFAULT_SURFACE;
+    const nrm = w?.contactNormal ?? _fallbackNrm;
+    const pos = this.contactOrFallback(w, s);
+
+    const contact = !!(s.rear?.grounded || s.front?.grounded);
+    const drop = this.prevSpeed - s.speed;
+    // 6 m/s² of friction over a 60 Hz frame is 0.1 m/s. Anything four times
+    // that in one frame is the ground arriving, not the ground rubbing.
+    const hardHit = drop > 0.42 && s.speed > 0.8;
+    const struck = (contact && !this.prevContact) || hardHit;
+    this.prevContact = contact;
+
+    if (struck && this.crashStrikeCooldown <= 0) {
+      this.crashStrikeCooldown = 0.12;
+      const force = clamp01(0.30 + drop * 0.9 + s.speed * 0.035);
+      // CRASH DUST IGNORES A STINGY SURFACE. `crash` is staged in the rock
+      // garden, dustAmount 0.18, which turned a 16-puff impact into three.
+      this.dust.burst(pos, nrm, s.velocity, 0.55 + force * 0.45, surf, 0.62);
+      this.debris.screeSpray(pos, nrm, s.velocity, force * 0.7, surf);
+      // Flash only — the freeze belongs to the crash's own entry, and stopping
+      // the world three times inside one tumble is a stutter, not punctuation.
+      // Two frames for a real bang, one for a scuff: the same 33 ms punch a
+      // motion review measured as correct, landing on the frame the body
+      // actually arrives rather than on the frame the solver changed mode.
+      if (force > 0.34) this.impact.flashOnly(0.30 + force * 0.55, undefined, force > 0.55 ? 2 : 1);
+    }
+
+    // The slide. Gated on height above the ground rather than on `grounded`.
+    if (s.airHeight < 1.4 && s.speed > 1.2) {
+      this.dust.trail(pos, nrm, s.velocity, 26 + s.speed * 7, dt, surf, 0.55);
+    }
   }
 
   private emitFromState(s: BikeState, dt: number): void {
@@ -440,7 +586,15 @@ export class Effects implements IEffects {
     // dust channel is cut right back there and the splash below does the work.
     // Left at full rate, water's 1.8 dustAmount made it the single dustiest
     // surface on the mountain, which is the opposite of true.
-    const rate = Math.min((roll + skid * 1.4) * 88 * weight * (0.35 + load01 * 0.9), 210 * weight)
+    //
+    // The base was 88, and on the surface the course is actually ridden on —
+    // the groomed ribbon, dustAmount 0.55 — that resolves to 68 puffs/s across
+    // both wheels. At the ribbon's ~1.2 s skid life that is 62 live puffs,
+    // which is what countAlive() measures on `scree-speed`, and 62 marks spread
+    // over the 27 m a 1.2 s puff falls behind at 23 m/s is three per metre of a
+    // trail that is supposed to read as continuous. 130 puts it at ~100, which
+    // is where the overlapping contours start being one shape.
+    const rate = Math.min((roll + skid * 1.4) * 130 * weight * (0.35 + load01 * 0.9), 240 * weight)
       * (isWater ? 0.20 : 1);
     if (rate > 0.5) this.dust.trail(pos, nrm, s.velocity, rate, dt, surf);
 
@@ -466,8 +620,10 @@ export class Effects implements IEffects {
     const nrm = w?.contactNormal ?? _fallbackNrm;
 
     // Landings always throw dust, even a soft one — the dust is the read that
-    // the wheels touched. Only the SIZE tracks the impact.
-    this.dust.burst(pos, nrm, s.velocity, Math.max(impact, 0.58), surf);
+    // the wheels touched. Only the SIZE tracks the impact. The 0.45 floor
+    // means a landing on rock still throws something: the surface decides how
+    // MUCH material is loose, not whether a 90 kg impact disturbs any.
+    this.dust.burst(pos, nrm, s.velocity, Math.max(impact, 0.58), surf, 0.45);
     if (impact > 0.12) this.debris.screeSpray(pos, nrm, s.velocity, impact * 0.85, surf);
     if (surf.kind === SurfaceKind.Water) {
       this.debris.splash(pos, nrm, s.velocity, 0.45 + impact * 0.55);
@@ -482,9 +638,14 @@ export class Effects implements IEffects {
     const pos = this.contactOrFallback(w, s);
     const nrm = w?.contactNormal ?? _fallbackNrm;
 
-    this.dust.burst(pos, nrm, s.velocity, 0.85 + sev * 0.15, surf);
+    this.dust.burst(pos, nrm, s.velocity, 0.85 + sev * 0.15, surf, 0.70);
     this.debris.crashDebris(pos, s.velocity, s.crashDirection, sev, surf);
     this.impact.trigger(0.45 + sev * 0.55, undefined, true);
+    // Arm the strike tracker so the first frame of the tumble does not read as
+    // a fresh contact and fire a second burst on top of this one.
+    this.prevContact = !!(s.rear?.grounded || s.front?.grounded);
+    this.prevSpeed = s.speed;
+    this.crashStrikeCooldown = 0.16;
   }
 
   private contactOrFallback(w: WheelState | undefined, s: BikeState): Vector3 {
@@ -534,16 +695,30 @@ export class Effects implements IEffects {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  /** Clear every live particle and post dial. Use on race restart. */
+  /**
+   * Clear every live particle and post dial. Use on race restart, and on every
+   * capture pose — `Game.applySituation` calls this before each of the sixteen.
+   *
+   * DUST IS NOW IN HERE. It was not, and the only thing covering it was
+   * CameraDirector.resetTo() calling clearAllDust() on the side. That works
+   * today and it is the wrong place for it to live: a caller that resets the
+   * effects without resetting the camera got a rider wearing the dust he kicked
+   * up before he was teleported.
+   */
   reset(): void {
+    this.dust.clear();
     this.debris.clear();
     this.speed.reset();
     this.impact.reset();
     this.landCooldown = 0;
     this.crashCooldown = 0;
+    this.crashStrikeCooldown = 0;
     this.prevAirborne = false;
     this.prevCrashing = false;
     this.prevBoosting = false;
+    this.prevContact = false;
+    this.prevSpeed = this.subject?.speed ?? 0;
+    this.primeCounters(this.subject);
   }
 
   dispose(): void {

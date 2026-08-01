@@ -52,6 +52,7 @@ import { RAMPS, type RampPreset } from '../npr/Palette';
 import { clamp01, lerp } from '../core/MathX';
 import {
   BONE_INDEX,
+  FOOT as F,
   REST,
   RIDER_DIMS as D,
   RiderSkeleton,
@@ -641,6 +642,12 @@ const HEAD_BASIS = (() => {
   return basisMatrix(up, new Vector3(0, 0, 1), new Matrix4());
 })();
 const HEAD_CENTRE = new Vector3().lerpVectors(P.head, P.headEnd, 0.40);
+
+/** Head-local → rig space, as one matrix, for geometry deformed before placing. */
+const _headPlace = new Matrix4()
+  .makeTranslation(HEAD_CENTRE.x, HEAD_CENTRE.y, HEAD_CENTRE.z)
+  .multiply(HEAD_BASIS);
+const _ZERO3 = new Vector3();
 
 // ── Skin ─────────────────────────────────────────────────────────────────────
 
@@ -1234,50 +1241,127 @@ function buildRubberParts(): BufferGeometry[] {
     );
   }
 
-  // Shoes. Built along the ankle→toe line with a flat sole slab, because a shoe
-  // that is a tapered tube reads as a sock.
+  // ── Shoes ────────────────────────────────────────────────────────────────
+  //
+  // Authored in the foot's own REST frame — origin at the ankle, +Z at the toe,
+  // sole flat and horizontal — rather than along the ankle→toe bone vector.
+  //
+  // That distinction is the whole fix. The old shoe was lofted along the bone
+  // direction, which at rest ran 22° into the ground, so the sole was a tilted
+  // rocker whose lowest point sat 102 mm below the ankle and 46 mm in front of
+  // it. The ankle was 72 mm above the pedal spindle. The sole therefore passed
+  // 30 mm THROUGH the pedal, in front of it, at an angle — a shoe pointed at
+  // the dirt with nothing under it, on every frame of every sequence, while the
+  // ankle JOINT measured a perfect 72 mm from its anchor.
+  //
+  // Now the sole is a flat plane at exactly `FOOT.soleDrop` below the ankle and
+  // `LIMB.ankleLift` puts the ankle exactly `FOOT.platform` above that plane's
+  // spindle, so the shoe stands ON the pedal by construction and there is no
+  // number left to get wrong.
   for (const side of [1, -1]) {
     const ankle = side > 0 ? P.ankleL : P.ankleR;
-    const toe = side > 0 ? P.toeL : P.toeR;
     const foot: BoneName = side > 0 ? 'footL' : 'footR';
     const toeB: BoneName = side > 0 ? 'toeL' : 'toeR';
+    const shinB: BoneName = side > 0 ? 'shinL' : 'shinR';
+    /** Point in the foot's rest frame. */
+    const f = (y: number, z: number): Vector3 => offset(ankle, 0, y, z);
 
-    const fdir = new Vector3().subVectors(toe, ankle).normalize();
-    const heel = new Vector3().copy(ankle).addScaledVector(fdir, -0.085).add(new Vector3(0, -0.030, 0));
-    const path = [
-      heel,
-      offset(ankle, 0, -0.030, 0),
-      mix(ankle, toe, 0.55).add(new Vector3(0, -0.032, 0)),
-      new Vector3().copy(toe).add(new Vector3(0, -0.014, 0.012)),
+    const W = D.shoeWidth; // half-width at the widest point
+    const SOLE_Y = -F.soleDrop; // underside of the sole
+    const UPPER_Y = SOLE_Y + 0.014; // where the sole slab meets the upper
+
+    // Upper: one loft from the heel counter to the toe box. The half-heights
+    // are chosen so the bottom of every ring lands on UPPER_Y, which is what
+    // gives the shoe a straight bottom edge in profile instead of a belly.
+    const upper: [number, number, number, number][] = [
+      // z,      centre y,            halfWidth,  halfHeight
+      [-F.heelBack + 0.008, UPPER_Y + 0.044, W * 0.80, 0.044],
+      [-0.030, UPPER_Y + 0.048, W * 0.90, 0.048],
+      [0.022, UPPER_Y + 0.040, W * 0.99, 0.040],
+      [F.ballAhead, UPPER_Y + 0.030, W * 1.00, 0.030],
+      [0.126, UPPER_Y + 0.024, W * 0.92, 0.024],
+      [F.toeAhead - 0.012, UPPER_Y + 0.017, W * 0.66, 0.017],
     ];
-    const rx = [D.shoeWidth * 0.86, D.shoeWidth, D.shoeWidth * 0.98, D.shoeWidth * 0.74];
-    const ry = [D.shoeHeight * 0.62, D.shoeHeight * 0.66, D.shoeHeight * 0.50, D.shoeHeight * 0.34];
-    parts.push(
-      skinPart(loftLimb(path, rx, ry, 12, 1, 1), [
-        { bone: foot, falloff: 0.130 },
-        { bone: toeB, falloff: 0.110 },
-        { bone: side > 0 ? 'shinL' : 'shinR', falloff: 0.055, bias: 0.5 },
-      ]),
-    );
-    // Sole slab — the flat that sits on the pedal and catches the key light.
-    const solePath = [
-      new Vector3().copy(heel).add(new Vector3(0, -0.016, 0)),
-      mix(ankle, toe, 0.5).add(new Vector3(0, -0.062, 0)),
-      new Vector3().copy(toe).add(new Vector3(0, -0.036, 0.006)),
-    ];
-    parts.push(
-      skinPart(loftLimb(solePath, [D.shoeWidth * 0.90, D.shoeWidth * 1.02, D.shoeWidth * 0.76], [0.016, 0.017, 0.013], 8), [
-        { bone: foot, falloff: 0.130 },
-        { bone: toeB, falloff: 0.110 },
-      ]),
-    );
-    // Ankle collar.
     parts.push(
       skinPart(
-        loftLimb([offset(ankle, 0, 0.006, -0.004), offset(ankle, 0, 0.052, -0.008)], [D.shinBottom * 1.32, D.shinBottom * 1.24], [D.shinBottom * 1.36, D.shinBottom * 1.26], 10),
+        loftLimb(
+          upper.map((r) => f(r[1], r[0])),
+          upper.map((r) => r[2]),
+          upper.map((r) => r[3]),
+          12,
+          1,
+          1,
+        ),
+        [
+          { bone: foot, falloff: 0.130 },
+          { bone: toeB, falloff: 0.110 },
+          { bone: shinB, falloff: 0.055, bias: 0.5 },
+        ],
+      ),
+    );
+
+    // Sole slab — the flat that sits on the pedal and catches the key light.
+    // Dead level from heel to ball, with a small toe kick so the front does not
+    // read as a plank; the flat section is what the pedal platform meets.
+    const soleY = SOLE_Y + 0.007;
+    const sole: [number, number, number][] = [
+      [-F.heelBack, soleY, W * 0.82],
+      [-0.024, soleY, W * 0.94],
+      [0.040, soleY, W * 1.02],
+      [F.ballAhead + 0.020, soleY, W * 0.99],
+      [F.toeAhead, soleY + 0.006, W * 0.68],
+    ];
+    parts.push(
+      skinPart(
+        loftLimb(
+          sole.map((r) => f(r[1], r[0])),
+          sole.map((r) => r[2]),
+          sole.map(() => 0.007),
+          10,
+          1,
+          1,
+        ),
+        [
+          { bone: foot, falloff: 0.130 },
+          { bone: toeB, falloff: 0.110 },
+        ],
+      ),
+    );
+
+    // Instep strap. Three millimetres proud of the upper, across the ball —
+    // this is the detail that says "flat pedal shoe" and it also gives the
+    // Sobel a crease exactly where the foot flexes.
+    parts.push(
+      skinPart(
+        loftLimb(
+          [
+            offset(ankle, side * -W * 0.86, UPPER_Y + 0.026, 0.048),
+            offset(ankle, 0, UPPER_Y + 0.050, 0.052),
+            offset(ankle, side * W * 0.86, UPPER_Y + 0.026, 0.048),
+          ],
+          [0.013, 0.014, 0.013],
+          [0.006, 0.006, 0.006],
+          6,
+          0,
+          0,
+          new Vector3(0, 0, 1),
+        ),
+        [{ bone: foot, falloff: 0.120 }],
+      ),
+    );
+
+    // Ankle collar, padded, sitting on top of the heel counter.
+    parts.push(
+      skinPart(
+        loftLimb(
+          [f(0.004, -0.014), f(0.050, -0.020)],
+          [D.shinBottom * 1.32, D.shinBottom * 1.24],
+          [D.shinBottom * 1.36, D.shinBottom * 1.26],
+          10,
+        ),
         [
           { bone: foot, falloff: 0.080 },
-          { bone: side > 0 ? 'shinL' : 'shinR', falloff: 0.080 },
+          { bone: shinB, falloff: 0.080 },
         ],
       ),
     );
@@ -1299,14 +1383,43 @@ function buildRubberParts(): BufferGeometry[] {
     );
   }
 
-  // Goggle strap around the back of the helmet.
-  const strapCentre = new Vector3(0, -0.028, 0).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-  const strap = arcPath(strapCentre, HEAD_BASIS, D.helmetRadius * 1.00, D.helmetRadius * 1.02, 0.70, Math.PI * 2 - 0.70, 18, (t) =>
-    Math.sin(t * Math.PI) * 0.006,
-  );
-  const strapR = strap.map(() => 0.020);
-  const strapD = strap.map(() => 0.009);
-  parts.push(rigidPart(loftLimb(strap, strapR, strapD, 6, 0, 0, new Vector3(0, 1, 0)), 'head'));
+  // ── Goggle strap ──────────────────────────────────────────────────────────
+  //
+  // TWO SHORT SIDE RUNS, NOT A BAND AROUND THE OCCIPUT.
+  //
+  // This was one 290° arc at helmet radius, 40 mm tall and 18 mm proud, so from
+  // behind the rider wore a horizontal black bar straight across the back of
+  // his skull. Under the inverted hull that bar inks as a long crescent, and a
+  // crescent under the ring the occipital scoop was also drawing is a MOUTH
+  // under an EYE: at anything past ~120 px the back of the helmet read as a
+  // face looking at the camera. A 6x crop of `switchback` f0070 was
+  // unmistakable — concentric ring, crescent, two side clips.
+  //
+  // A real strap disappears under the shell. So it runs from the outer edge of
+  // the goggle back to the ear cup on each side and stops: nothing crosses the
+  // occiput, and the back of the lid is one uninterrupted surface with one
+  // silhouette, which is the only thing that cannot be read as a face.
+  const strapCentre = new Vector3(0, -0.030, 0).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
+  for (const side of [1, -1]) {
+    const a0 = side * 1.02;
+    const a1 = side * 2.05;
+    const run = arcPath(
+      strapCentre,
+      HEAD_BASIS,
+      D.helmetRadius * 0.995,
+      D.helmetRadius * 1.01,
+      a0,
+      a1,
+      8,
+      (t) => -0.004 * t,
+    );
+    parts.push(
+      rigidPart(
+        loftLimb(run, run.map(() => 0.016), run.map(() => 0.0055), 6, 1, 1, new Vector3(0, 1, 0)),
+        'head',
+      ),
+    );
+  }
 
   return parts;
 }
@@ -1330,14 +1443,42 @@ function buildHelmetParts(): BufferGeometry[] {
     new Vector2(R * 1.00, R * 0.14),
     new Vector2(R * 0.99, R * -0.20),
     new Vector2(R * 0.93, R * -0.46),
-    new Vector2(R * 0.86, R * -0.56),
+    new Vector2(R * 0.86, R * -0.60),
   ];
-  const shellBasis = new Matrix4().copy(HEAD_BASIS).multiply(new Matrix4().makeScale(0.97, 1, 1.06));
-  parts.push(rigidPart(latheForm(shellProfile, 18, HEAD_CENTRE, shellBasis), 'head'));
 
-  // Occipital scoop at the back.
-  const backCentre = new Vector3(0, -0.030, -0.052).applyMatrix4(HEAD_BASIS).add(HEAD_CENTRE);
-  parts.push(rigidPart(sphereForm(backCentre, R * 0.86, R * 0.72, R * 0.80, 12, 10, Math.PI * 0.72, HEAD_BASIS), 'head'));
+  // ── The occiput is part of the shell, not a second solid ──────────────────
+  //
+  // There used to be a separate hemisphere sitting on the back of the head to
+  // make the occipital bulge. Every closed solid earns its own stroke from the
+  // inverted hull, and that one protruded 24 mm past the shell, so what it drew
+  // was a hard CONCENTRIC RING on the back of the helmet — which, with the
+  // shading band inside it, is an eye. Six-times crops of `switchback` f0070
+  // showed a rider apparently looking backwards at the camera for 667 ms.
+  //
+  // The bulge is now a deformation of the shell's own vertices: the rear of the
+  // lathe is pushed back and its skirt dropped over the occiput, so the lid is
+  // ONE solid with ONE silhouette and there is no interior edge to ink. The
+  // deformation is applied in the head's local frame before the basis, because
+  // "back" and "down" only mean anything there.
+  const shell = latheForm(shellProfile, 20, _ZERO3);
+  {
+    const pos = shell.getAttribute('position') as BufferAttribute;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const y = pos.getY(i);
+      const z = pos.getZ(i);
+      // 0 at the ear line, 1 straight back.
+      const back = clamp01(-z / R);
+      // 1 at the brow line, 0 at the crown — the skirt drops, the crown does not.
+      const low = clamp01(1 - y / (R * 0.70));
+      pos.setX(i, x * 0.965);
+      pos.setZ(i, z * 1.10 - back * 0.010);
+      pos.setY(i, y - back * back * low * 0.034);
+    }
+    shell.computeVertexNormals();
+    shell.applyMatrix4(_headPlace);
+  }
+  parts.push(rigidPart(shell, 'head'));
 
   // ── Ear cup + retention strap ─────────────────────────────────────────────
   //

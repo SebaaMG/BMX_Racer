@@ -202,13 +202,20 @@ export class ImpactFrames {
    * A flash with no freeze. Boost ignition, checkpoint gates, a clean landing
    * that doesn't deserve to stop the world.
    */
-  flashOnly(intensity: number, tint?: number): void {
+  /**
+   * `frames` is the staircase length in RENDERED FRAMES, defaulting to the
+   * one-frame flash. A caller that is punctuating a real hit — a body coming
+   * down inside a crash, as opposed to a boost igniting — asks for two, which
+   * is the length the convention specifies and the length a motion review
+   * measured as correct on the crash capture (2 frames / 33 ms). Never three.
+   */
+  flashOnly(intensity: number, tint?: number, frames: number = IMPACT_TUNING.flashOnlyFrames): void {
     const s = clamp01(intensity);
     if (s <= 0.01) return;
     // Never let a small flash stomp a big one that is still playing.
     const peak = s * 0.7 * IMPACT_TUNING.flashCeiling;
     if (this.flashFramesLeft > 0 && peak <= this.flashPeak * this.staircase()) return;
-    this.flashSpan = IMPACT_TUNING.flashOnlyFrames;
+    this.flashSpan = Math.max(1, Math.min(Math.round(frames), IMPACT_TUNING.flashFrames));
     this.flashFramesLeft = this.flashSpan;
     this.flashPeak = peak;
     this.inkPeak = s * 0.18 * IMPACT_TUNING.inkCeiling;

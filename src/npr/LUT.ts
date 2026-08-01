@@ -84,8 +84,57 @@ const TRIM = {
   saturation: 0.93,
   /** Saturation multiplier at the top of the range, reached over 0.55..0.95 luma. */
   highlightSat: 0.85,
-  /** No channel may exceed this after grading. Guards the ramp's top step. */
-  chromaCeiling: 0.985,
+  /**
+   * GAMUT ROLL — where the hottest channel starts to be compressed, and the
+   * asymptote it can never reach.
+   *
+   * ── THIS WAS THE SKY'S MISSING SATURATION, AND THE ARITHMETIC IS EXACT ─────
+   *
+   * It used to be a single number, `chromaCeiling: 0.985`, enforced by pulling
+   * the whole triplet toward its own LUMINANCE until the hottest channel fit.
+   * Preserving hue while chroma gives is the textbook move and it is completely
+   * wrong here, because of where the pull lands on a bright band.
+   *
+   * Take SKY.horizon, 0xf0cf9e, the authored dawn cream — hue 35, saturation
+   * 34%. Through bloom, the display shoulder and the encode it arrives at this
+   * table as (0.957, 0.831, 0.627). The grade then does what it is asked to:
+   *
+   *   gain + lift + gamma          -> (0.991, 0.837, 0.649)
+   *   contrast 1.12 about 0.46     -> (1.054, 0.882, 0.671)   red already over 1
+   *   gold split at luma 0.904     -> (1.122, 0.908, 0.651)
+   *   saturation 1.06              -> (1.104, 0.911, 0.679)
+   *
+   * The hottest channel is 1.104 and its own luminance is 0.935, so the old
+   * ceiling scaled the distance from luminance by (0.985 - 0.935)/0.169 =
+   * 0.296. SEVENTY PERCENT OF THE CHROMA WAS DELETED IN ONE STEP. The predicted
+   * output is (251, 237, 219) = hsv(35, 13%); the frame measures #fbf0e1 =
+   * hsv(35, 10%). The critic's "authored SKY.horizon of hue 35, saturation 34%
+   * reads at 11% saturation" is this line of code and nothing else — not the
+   * fog, not the clouds, not the dome.
+   *
+   * And it had to be worst exactly where it is most visible. The pull toward
+   * luminance costs chroma in proportion to how far the hottest channel
+   * overshoots, and the things that overshoot are the BRIGHT, SATURATED bands —
+   * a dawn sky, a lit dirt plateau, a red jersey in sun. The grade was
+   * bleaching precisely the colours it was authored to enrich.
+   *
+   * WHAT IT DOES NOW. The overshoot is taken out of EXPOSURE instead of chroma:
+   * the hottest channel is rolled through a soft asymptotic knee and the whole
+   * triplet is scaled by the same ratio. Uniform scaling preserves hue exactly
+   * AND preserves HSV saturation exactly — (max - min)/max is invariant under
+   * scaling — so a cream stays a cream and only its value gives, by 1-2%.
+   * SKY.horizon now lands at (249, 206, 153) = hsv(35, 39%) against an authored
+   * 34%, instead of hsv(35, 10%).
+   *
+   * The knee is asymptotic rather than clamped, which is what keeps the
+   * ORIGINAL bug fixed. The whole reason a ceiling exists is that a hard clip
+   * puts two authored plateaus on the same channel value and collapses the top
+   * step of the dirt ramp; an asymptote is strictly monotonic in the hottest
+   * channel, so two inputs that differ still differ on the way out. Lit dirt
+   * sits at 0.957, below the knee's real effect, and moves by 4/255.
+   */
+  gamutKnee: 0.90,
+  gamutCeiling: 0.995,
 };
 
 const LUMA_R = 0.2126;
@@ -174,20 +223,19 @@ export function gradeLutTexture(size = 32): Data3DTexture {
         cg = l2 + (cg - l2) * sat;
         cb = l2 + (cb - l2) * sat;
 
-        // Chroma ceiling. Instead of letting a channel clip — which flattens
-        // two authored plateaus onto one hue — pull the whole triplet back
-        // toward its own luminance until the hottest channel just fits. Hue is
-        // preserved exactly; only chroma gives.
+        // Gamut roll. The hottest channel goes through a soft asymptotic knee
+        // and the WHOLE TRIPLET is scaled by the same ratio, so hue and HSV
+        // saturation both survive untouched and the only thing that gives is
+        // value. See TRIM.gamutKnee for the measurement this replaced.
         const m = Math.max(cr, cg, cb);
-        if (m > TRIM.chromaCeiling) {
-          const lc = LUMA_R * cr + LUMA_G * cg + LUMA_B * cb;
-          const denom = m - lc;
-          if (denom > 1e-5) {
-            const k = Math.max(0, (TRIM.chromaCeiling - lc) / denom);
-            cr = lc + (cr - lc) * k;
-            cg = lc + (cg - lc) * k;
-            cb = lc + (cb - lc) * k;
-          }
+        if (m > TRIM.gamutKnee) {
+          const span = TRIM.gamutCeiling - TRIM.gamutKnee;
+          const over = (m - TRIM.gamutKnee) / span;
+          const rolled = TRIM.gamutKnee + span * (1 - Math.exp(-over));
+          const k = rolled / m;
+          cr *= k;
+          cg *= k;
+          cb *= k;
         }
 
         bytes[p++] = Math.round(Math.min(Math.max(cr, 0), 1) * 255);
@@ -265,7 +313,7 @@ export const GLSL_GRADE = /* glsl */ `
   /**
    * Elliptical vignette. Subtle by construction — it keeps the eye on the trail.
    *
-   * TWO THINGS HAD TO BE RIGHT HERE AND ONLY ONE OF THEM WAS.
+   * THREE THINGS HAVE TO BE RIGHT HERE. THE FIRST TWO WERE.
    *
    * 1. COLOUR SPACE. uVignetteTint carries GRADE.shadowTint, and a three Color
    *    holds LINEAR values — 0x5b4a86 is (0.107, 0.072, 0.235) linear against
@@ -281,20 +329,54 @@ export const GLSL_GRADE = /* glsl */ `
    *    do that — it is a pure hue rotation, and how dark the corner gets is a
    *    separate, explicit term. Cool toward violet, then darken a little; never
    *    the one operation doing both jobs and desaturating as a side effect.
+   *
+   * 3. IT MUST NOT BE A SMOOTH LUMINANCE RAMP. The old comment below already
+   *    said why — "a heavy vignette puts a smooth ramp straight across every
+   *    one of them" — and then the code did exactly that: uVignette *
+   *    smoothstep(0.55, 1.25, r), a continuous darkening running from a fifth
+   *    of the way out to past the corner, i.e. across two thirds of the frame.
+   *
+   *    MEASURED, not assumed. tools/capture/_skyab.mjs installs an override on
+   *    CompositePass.syncState (writing the uniform and rendering measures
+   *    nothing — syncState reloads every uniform from POST_STATE) and shoots
+   *    the same pose with uVignette forced to 0. On ravine-gap, the horizontal
+   *    trace the stills critic used — y = 1000, x 2400..3150 — carried 18.9
+   *    luminance units with a MAXIMUM SINGLE-PIXEL STEP OF 1.0. Zeroing the
+   *    vignette alone took 7.1 of those units out. It was the second-largest
+   *    step-free gradient in the frame after the speed field, and unlike the
+   *    speed field it was in EVERY frame the game has ever rendered.
+   *
+   *    It is now three hard rings, cut on the one-pixel fwidth rule the rest of
+   *    the picture uses, and they are placed OUT IN THE CORNERS: the innermost
+   *    arc meets the top edge at 15% of the width and hugs to 5% at mid-height,
+   *    so no arc ever crosses open sky in the middle of the frame. The
+   *    darkening coefficient comes down from 0.45 to 0.34 at the same time, so
+   *    a single step is about 3% — a drawn corner, not a band.
+   *
+   *    The COOLING is left continuous on purpose. It is a multiply by a tint
+   *    normalised to unit luminance, so it cannot move luma at all; there is no
+   *    ramp for anyone to measure in it, and quantising a pure hue rotation
+   *    would put a visible colour arc where there is currently nothing.
    */
   vec3 applyVignette(vec3 c, vec2 uv, float aspect) {
     vec2 d = (uv - 0.5) * vec2(aspect, 1.0);
     float r = length(d) * 1.42;
-    float v = uVignette * smoothstep(uVignetteSoftness, 1.25, r);
-    if (v <= 0.0002) return c;
+    if (uVignette <= 0.0002 || r < uVignetteSoftness) return c;
 
     vec3 tint = linearToSrgb(uVignetteTint);
     tint /= max(luma(tint), 1e-3);
+    float cool = uVignette * smoothstep(uVignetteSoftness, 1.25, r);
+    vec3 cooled = c * mix(vec3(1.0), tint, saturate1(cool * 1.15));
 
-    vec3 cooled = c * mix(vec3(1.0), tint, saturate1(v * 1.15));
-    // The darkening. Deliberately modest: a cel frame is flat plateaus, and a
-    // heavy vignette puts a smooth ramp straight across every one of them.
-    return cooled * (1.0 - v * 0.45);
+    // The darkening, in three flat steps. A 16:9 frame reaches r = 1.323 at the
+    // corner and 1.263 at the middle of a side edge, so 1.14 / 1.24 / 1.31
+    // lands two rings on the side edges and the third in the corners only.
+    float rw = max(fwidth(r) * 0.8, 0.0035);
+    float g1 = smoothstep(1.14 - rw, 1.14 + rw, r);
+    float g2 = smoothstep(1.24 - rw, 1.24 + rw, r);
+    float g3 = smoothstep(1.31 - rw, 1.31 + rw, r);
+    float dark = uVignette * (0.36 * g1 + 0.34 * g2 + 0.30 * g3);
+    return cooled * (1.0 - dark * 0.34);
   }
 
   /**
