@@ -230,6 +230,8 @@ export class Game {
    * the review harness contaminating the thing it exists to review.
    */
   private suppressPopupFrames = 0;
+  /** Physics steps until a scripted capture crash fires. 0 = none pending. */
+  private pendingCrashSteps = 0;
   private scriptedInput: BikeInput | null = null;
   private debugOverlay = false;
   private headless: boolean;
@@ -408,6 +410,9 @@ export class Game {
   // ───────────────────────────────────────────────────────────────────────────
 
   private fixedUpdate(dt: number): void {
+    if (this.pendingCrashSteps > 0 && --this.pendingCrashSteps === 0) {
+      (this.race.player.bike as Bike).physics.forceCrash(0.82);
+    }
     if (this.scriptedInput) this.race.player.scripted = this.scriptedInput;
     this.race.fixedUpdate(dt);
     // The visual layer needs to know whether the rider is driving the cranks;
@@ -543,8 +548,19 @@ export class Game {
       // never spawned inside the mountain — the bike settles the short distance
       // instead of exploding out of it. This is a GUARD, not the fix: the carve
       // needs to make the two agree, and that is tracked separately.
+      // Spawn relative to the surface the WHEELS COLLIDE WITH.
+      //
+      // The ribbon mesh sits 0.18 m proud of the heightfield by design, and the
+      // physics rides the heightfield. Spawning on the ribbon therefore left the
+      // bike 0.15 m in the air, so frame 0 of every sequence had neither wheel
+      // grounded and emitted no dust — a defect an FX reviewer correctly saw and
+      // could not have fixed, because it is not in the FX.
+      //
+      // The guard is for the ravine, where the terrain is genuinely 13 m below
+      // the ribbon because that IS the gap. Past a metre and a half of
+      // disagreement, trust the ribbon rather than spawn into the hole.
       const groundY = this.terrain.heightAt(_v.x, _v.z);
-      if (groundY > _v.y) _v.y = groundY;
+      if (Math.abs(groundY - _v.y) < 1.5 || groundY > _v.y) _v.y = groundY;
 
       // `sample.position` is the ribbon SURFACE, and the bike's origin is on
       // the AXLE LINE — one wheel radius above whatever it is standing on.
@@ -603,10 +619,15 @@ export class Game {
     this.suppressPopupFrames = 4;
     this.hud.resetRun();
 
-    // AFTER the camera reset, not before. `resetTo` consumes the pending crash
-    // edge, so forcing the crash first meant the crash-focus envelope never saw
-    // it and the one pose named `crash` was the one that never pushed in.
-    if (s.crash) (this.race.player.bike as Bike).physics.forceCrash(0.82);
+    // Deferred, so the impact lands INSIDE the captured window.
+    //
+    // It used to fire here, which is before the preroll and before the
+    // harness's settle frames — so `crashCount` was already 1 at f0000 and the
+    // flash, the freeze and the camera push-in had all burned off screen. The
+    // sequence whose entire purpose is to show an impact never contained one.
+    // Counted in 120 Hz steps: 8 for the harness settle plus ~20 to put the hit
+    // about ten captured frames in.
+    this.pendingCrashSteps = s.crash ? 28 : 0;
 
     if (s.input) this.setScripted(s.input);
     return true;

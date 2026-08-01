@@ -80,6 +80,9 @@ const FRAGMENT = /* glsl */ `
   uniform vec3  uInkColor;
   uniform float uDesaturate;
 
+  uniform float uTonePost;
+  uniform float uToneSteps;
+
   uniform float uDebug;
 
   in vec2 vUv;
@@ -422,6 +425,138 @@ const FRAGMENT = /* glsl */ `
       disp = mix(disp, mono, saturate1(uDesaturate) * (1.0 - hold * 0.85) * darks);
     }
     disp = applyVignette(disp, uv, aspect);
+
+    // ── 11.5 TONE QUANTISE — THE LAST THING THAT CAN MAKE THE FRAME DRAWN ────
+    //
+    // WHAT THE MEASUREMENT ACTUALLY SAID, AFTER THREE WRONG OWNERS.
+    //
+    // The stills critic has reported the same defect four times: the widest
+    // thing in the picture is a smooth ramp. It was blamed on the sun shafts,
+    // then on this file's speed field, then on the vignette. All three were
+    // A/B tested through tools/capture/_ab.mjs (the override has to be
+    // installed ON syncState — see the speed-line note above) and the answer on
+    // the critic's own trace, ravine-gap y = 1000, x 2400..3150, is:
+    //
+    //     base            span 23.1 units, maxstep 4.22, ONE step above 4 / 749
+    //     speed field 0   BYTE-IDENTICAL
+    //     shaft fan hidden BYTE-IDENTICAL   (its uIntensity is 0.0000 there)
+    //     bloom 0         BYTE-IDENTICAL
+    //     ink 0           BYTE-IDENTICAL
+    //     vignette 0      span 23.0, maxstep 4.22
+    //
+    // Nothing in the composite owns it. The ramp IS THE SCENE: a cliff face
+    // whose cel bands are correct but whose lit plateau curves smoothly away
+    // across a thousand pixels. A frame-wide sweep (longest run of pixels with
+    // no single-pixel step above 4) finds the same thing everywhere the terrain
+    // is large and smooth — ravine-gap y = 1180 carries 104 luminance units
+    // across 1005 unbroken pixels, rockgarden-low y = 908 carries 109 across
+    // 707. It is not one effect. It is every large surface in the game.
+    //
+    // WHICH IS WHY IT BELONGS HERE. The composite is the only place that sees
+    // the finished picture, and a cel frame is defined by its TONE COMING FROM A
+    // DISCRETE SET. Every upstream pass quantises its own field and then the
+    // union of them is continuous again, because a curved surface slides
+    // smoothly along a single plateau. One quantisation of the final luminance
+    // fixes all of them at once, and it is the only fix that reaches a smooth
+    // ramp whoever drew it.
+    //
+    // THREE PROPERTIES MAKE IT A DRAWING RATHER THAN POSTERISATION.
+    //
+    //  1. IT CANNOT TOUCH AN EDGE. rate = fwidth(t) is how many tone steps the
+    //     picture crosses per pixel. An ink line, a cel terminator or a
+    //     silhouette crosses several steps in one pixel; the ramp we are after
+    //     crosses 0.0026. Above 0.34 steps/pixel the snap is faded out entirely,
+    //     so line work, antialiasing and texture are returned untouched and only
+    //     regions flat enough to hold a plateau are quantised.
+    //  2. IT MOVES THE TRIPLET, NOT THE CHANNELS. The snapped luminance is
+    //     applied as a SCALE. Uniform scaling preserves hue exactly and HSV
+    //     saturation exactly — (max-min)/max is invariant — so a graded dawn
+    //     cream stays that cream and only its value steps. Snapping channels
+    //     independently would rotate every colour in the frame toward a corner
+    //     of the RGB cube, which is the classic posterise look and the opposite
+    //     of this palette.
+    //  3. IT IS THE IDENTITY ON A FLAT FIELD, AT ANY VALUE. The map below is
+    //     continuous and passes through the input exactly at the centre of each
+    //     plateau AND at each plateau join, so a region that is already flat
+    //     comes out flat and a region that is already stepped comes out
+    //     unchanged. Nothing can mottle: there is no threshold for a dither to
+    //     straddle, because the operator has no threshold — it has a riser, and
+    //     the riser is where the picture is already moving.
+    //
+    //  4. THE RISER WANDERS, AND ONLY WHERE THERE IS A RAMP TO WANDER ON.
+    //     A riser on a fixed threshold lies on an exact iso-luminance curve of
+    //     the picture, and on this cliff that curve runs at FIVE DEGREES to the
+    //     horizontal: the measured tone rate at ravine-gap (2700, 1000) is
+    //     0.0028 steps per pixel across and 0.032 down, so the contour is very
+    //     nearly level. Two consequences, and the second is the one that took a
+    //     build to find. Visually a dead-level boundary a thousand pixels long
+    //     is the same defect as the sky's letterbox bar. Numerically, a one-pixel
+    //     cut crossed at five degrees is spread over eleven pixels by geometry
+    //     alone, so the critic's horizontal trace can never see it as a step
+    //     however hard the cut is — the first two builds measured maxstep 6.4
+    //     for exactly this reason and nothing was wrong with the cut.
+    //
+    //     So the riser carries a low-frequency displacement of +/-0.32 of a step.
+    //     On a ramp this shallow that moves the boundary by of the order of a
+    //     hundred pixels, which tips it well off the horizontal and makes it an
+    //     edge someone drew rather than a contour of a smooth field.
+    //
+    //     IT IS GATED ON THE PICTURE ALREADY RAMPING. Displacing a riser moves
+    //     the staircase even where the picture does not move, so an ungated
+    //     wander paints its own noise field into any flat plateau whose value
+    //     happens to sit near a cut — a full ten-unit step, in blobs, across a
+    //     clean sky. Both the wander and the snap itself are therefore faded in
+    //     over the picture's own tone rate: below about 0.011 luminance units
+    //     per pixel nothing happens at all, so every flat authored colour in the
+    //     frame comes out of this block bit-identical.
+    //
+    // Grain is applied AFTER, on purpose: paper tooth belongs on top of the
+    // drawing, and it also keeps the risers from being suspiciously clean.
+    if (uTonePost > 0.001) {
+      float l = luma(disp);
+      float t = l * uToneSteps;
+      float rate0 = fwidth(t);
+      float snapAmt = uTonePost
+        * smoothstep(0.0010, 0.0045, rate0)
+        * (1.0 - smoothstep(0.55, 1.40, rate0));
+      if (snapAmt > 0.003) {
+        vec2 wp = uv * vec2(aspect, 1.0);
+        float wob = clamp((fbm2(wp * 5.0 + 4.7, 3) - 0.5) * 2.0, -0.32, 0.32)
+                  * smoothstep(0.0016, 0.0090, rate0);
+        float u = t + wob;
+        float rate = fwidth(u);
+        float fl = floor(u);
+        float fr = u - fl;
+        // THE RISER IS ONE PIXEL WIDE, AND THAT IS THE WHOLE EFFECT.
+        //
+        // rate is how much of a step the picture crosses per pixel, so
+        // rate * 0.9 is the standard one-pixel fwidth cut this project uses
+        // everywhere. The first build of this block floored w at 0.030 out of
+        // caution about dither, and on the shallow ramp it exists to fix — 0.0026
+        // steps per pixel — that floor spread each riser over 0.06 / 0.0026 = 23
+        // PIXELS. A 10.6-unit step delivered over 23 pixels is a 0.46-unit step,
+        // i.e. exactly the smooth ramp again. Measured: maxstep 6.6 with the wide
+        // floor against 4.2 with the block off, where the step is 10.6 by
+        // construction. The floor is now only large enough to keep the smoothstep
+        // non-degenerate, and the ceiling of 0.5 is what makes a steep region
+        // resolve back to the identity instead of being posterised.
+        float w = clamp(rate * 0.9, 0.0015, 0.50);
+        float snapped = (fl + smoothstep(0.5 - w, 0.5 + w, fr)) / uToneSteps;
+        float k = clamp(snapped / max(l, 0.004), 0.55, 1.75);
+        disp = mix(disp, clamp(disp * k, 0.0, 1.0), snapAmt);
+      }
+      // 4 = how much of the frame the quantiser is allowed to touch,
+      // 5 = rate, the tone steps crossed per pixel, on a log scale.
+      // Both exist because the first two builds of this block were debugged by
+      // reading traces off the finished frame, which cannot distinguish "the
+      // snap did not fire" from "the snap fired and the contour is oblique".
+      if (uDebug > 3.5 && uDebug < 4.5) { fragColor = vec4(vec3(snapAmt), 1.0); return; }
+      if (uDebug > 4.5 && uDebug < 5.5) {
+        fragColor = vec4(vec3(saturate1((log2(max(rate0, 1e-6)) + 12.0) / 13.0)), 1.0);
+        return;
+      }
+    }
+
     disp = applyGrain(disp, gl_FragCoord.xy);
 
     fragColor = vec4(clamp(disp, 0.0, 1.0), 1.0);
@@ -455,6 +590,20 @@ export class CompositePass {
       uInkFlood: { value: 0 },
       uInkColor: { value: new Color().copy(INK) },
       uDesaturate: { value: 0 },
+      /**
+       * Tone quantise. NOT driven from POST_STATE — syncState() must never
+       * touch it, because it is a property of the RENDERER's look and not a
+       * per-frame dramatic dial. Left addressable so tools/capture/_ab.mjs and
+       * _skyab.mjs can force it to 0 and measure the frame against itself.
+       *
+       * 24 steps is 10.6/255 per riser: coarse enough that the critic's
+       * "maximum single-pixel step of 1.0 across 750 pixels" becomes a run of
+       * hard cuts, fine enough that no authored plateau is merged into its
+       * neighbour (the smallest gap between two adjacent band colours anywhere
+       * in Palette.ts is larger than one step).
+       */
+      uTonePost: { value: 1 },
+      uToneSteps: { value: 24 },
       uDebug: { value: 0 },
       // Grade tail (declared by GLSL_GRADE).
       uLut: { value: lut },

@@ -412,19 +412,55 @@ const DUST_VERT = /* glsl */ `
     // a third of a second; the settle is negligible early and eats all of it by
     // the end of life. Net height over life is a low arc that ends on the
     // ground, which is what a dispersing dust cloud actually does.
-    float rise = mix(0.14, 0.36, aParams.z) * mix(1.0, 1.35, isPlume);
-    float lift = rise * (1.0 - exp(-3.2 * t));
-    float settle = mix(0.34, 0.62, fract(aParams.z * 5.77)) * age * age;
+    // The correction above was made and MEASURED, and then measured again with
+    // the right ruler. tools/capture/_dustgeo.mjs replays this arithmetic on the
+    // live instance buffer and reports height above the terrain UNDER EACH PUFF
+    // — which is the quantity the screen-space complaint was a proxy for, and
+    // not the same thing as height above the rider's CURRENT contact patch: on
+    // a descent that drops 8 m in two seconds, dust pinned perfectly to the
+    // floor still reads as "3.5 m above the wheel" against the wheel's new
+    // position. On the scree-speed run the numbers came back 0.24-0.29 m AGL, max
+    // 0.53, with not one puff in 136 above 1.5 m.
+    //
+    // Which was the fix, and slightly too much of it. A plume whose every
+    // member sits at a quarter of a metre for its whole life has no BODY: the
+    // measured trail was 33 m long, 0.3 m tall and 0.6 m wide — a rope of
+    // beads lying on the ground behind the wheel, which is exactly what the
+    // capture shows. Dust that has been in the air for two seconds has climbed;
+    // what it must not do is climb AT BIRTH, or start high, or keep climbing
+    // forever. So the arc is unchanged in shape and roughly doubled in size,
+    // and the settle still eats it: peak is around 0.5 m at mid-life and the
+    // tail comes back to the deck. Knee height on the oldest puffs, nothing
+    // near a hub, let alone a helmet.
+    float rise = mix(0.30, 0.62, aParams.z) * mix(0.55, 1.0, isPlume);
+    float lift = rise * (1.0 - exp(-2.4 * t));
+    float settle = mix(0.20, 0.38, fract(aParams.z * 5.77)) * age * age;
     p.y += lift - settle;
 
     // ── LATERAL SPREAD ───────────────────────────────────────────────────────
     // A trail that keeps its birth width for its whole life is a tube, and a
     // tube reads as a pipe rather than as smoke. Each puff wanders off a
-    // per-instance world-space bearing, quadratically in age so the spread is
-    // invisible at the contact patch and obvious at the tail. World space, not
-    // camera space, or the whole plume swims when the camera moves.
+    // per-instance world-space bearing so the spread is invisible at the contact
+    // patch and obvious at the tail. World space, not camera space, or the whole
+    // plume swims when the camera moves.
+    //
+    // MEASURED, AND IT WAS A PIPE. mix(0.30, 0.95) * age^2 gives a mean offset
+    // of 0.43 m at the very end of life, of which only ~0.64 is across the
+    // direction of travel; _dustgeo reported a mean lateral of 0.09 m at birth
+    // rising to 0.29 m at the tail, with a single worst case of 0.88. Set that
+    // against puffs ~0.4 m across and a trail 33 m long and the plume is one
+    // puff wide down its whole length — the "single-file column of round puffs"
+    // the review measured, and the reason it reads as beads on a string rather
+    // than as a cloud.
+    //
+    // Three times the amplitude, and age^1.5 rather than age^2 so the fan opens
+    // early enough to be a cone instead of a rope with a flare on the end. The
+    // tail now spreads 0.7-2.5 m off the centreline, which against a 0.53 m
+    // wheel is a plume two to five wheels wide where it is oldest and still
+    // pinned to the tyre where it is born.
     float bear = fract(aParams.z * 31.73) * TAU;
-    float spread = mix(0.30, 0.95, fract(aParams.z * 12.41)) * age * age * mix(0.75, 1.25, isPlume);
+    float ageSpread = age * sqrt(age);
+    float spread = mix(0.40, 1.30, fract(aParams.z * 12.41)) * ageSpread * mix(0.85, 1.35, isPlume);
     p.x += cos(bear) * spread;
     p.z += sin(bear) * spread;
 
@@ -945,10 +981,15 @@ export class DustSystem {
     const kind = spray ? DUST_SPRAY : DUST_SKID;
     const tint = dustTintFor(surface.kind);
 
-    // Count scales with both the hit strength and how dusty the ground is, but
-    // is capped hard — 24 puffs is already a wall of smoke at these sizes, and
-    // the ring only holds 1100.
-    const count = clamp(Math.round((2 + a * 16) * dustScale), 1, 24);
+    // Count scales with both the hit strength and how dusty the ground is.
+    //
+    // Raised with the size cut below, and for the same reason: the previous
+    // pass bought its plume out of a handful of very large drawings, and a
+    // handful of very large drawings is what a captured impact looked like —
+    // seven or eight fully-opaque discs the size of the wreck, sitting apart
+    // from each other with clean ground between them. A cloud is MANY marks
+    // whose contours overlap. Same total ink, three times the shapes.
+    const count = clamp(Math.round((3 + a * 24) * dustScale), 1, 36);
 
     this.basis(normal);
     const vy = velocity.y;
@@ -991,17 +1032,27 @@ export class DustSystem {
 
       // SIZED AGAINST THE WHEEL, which is the only ruler in the frame.
       //
-      // The old birth scale reached 0.48, and `sz` is a HALF-EXTENT that the
-      // x2 atlas compensation doubles again, so a single fresh puff was 1.9 m
-      // across against a 0.53 m wheel. Measured at `tabletop-air`: individual
-      // puffs larger than the wheels, occluding both contact patches. Birth is
-      // now ~0.3-0.5 m across — smaller than a wheel — and the GROWTH ramp
-      // takes it to plume size over the puff's life, which is the read the
-      // critic asked for and the one that was never visible underneath the
-      // starting size.
+      // WORK OUT THE VISIBLE DIAMETER PROPERLY, BECAUSE TWO FACTORS OF TWO
+      // CANCEL AND IT IS EASY TO LOSE ONE. `sz` is the quad's HALF-extent, so
+      // the quad spans 2*sz; the atlas cell is twice the puff's own footprint
+      // (128 px of art centred in a 256 px cell, the padding that stops mips
+      // bleeding between variants), so the drawn puff covers exactly half the
+      // quad in each axis. Visible diameter is therefore 2 * sz * 0.5 = sz =
+      // scale * (1 + growth * q) * uSizeScale, with uSizeScale = 2.
+      //
+      // Run the old numbers through that and a trail plume on scree finished
+      // its life at 2 * 0.315 * 4.6 = 2.9 m across — five and a half wheels.
+      // Measured on the live buffer, the oldest quarter of the population
+      // averaged 1.9-2.0 m. That is the "individual puffs LARGER THAN THE
+      // WHEELS, occluding both contact patches" of `tabletop-air`, and it is
+      // also why the crash reads as balloons: at that size a dozen puffs cannot
+      // overlap into a cloud, they can only sit next to each other.
+      //
+      // The target is a puff BORN smaller than a wheel (0.53 m) and DYING at
+      // about two wheels. Birth 0.25-0.40 m, tail 0.8-1.5 m.
       const life = spray ? this.rng.range(0.80, 1.30) : this.rng.range(1.05, 1.70);
-      const scale = (spray ? this.rng.range(0.13, 0.24) : this.rng.range(0.15, 0.27)) * (0.85 + dustScale * 0.25);
-      const growth = spray ? this.rng.range(2.4, 3.6) : this.rng.range(1.9, 2.9);
+      const scale = (spray ? this.rng.range(0.115, 0.185) : this.rng.range(0.125, 0.200)) * (0.88 + dustScale * 0.18);
+      const growth = spray ? this.rng.range(1.9, 2.7) : this.rng.range(1.6, 2.3);
       const spin = this.rng.signed() * (spray ? 1.6 : 0.9);
 
       this.write(_v.x, _v.y, _v.z, _d.x, _d.y, _d.z, life, kind, scale, growth, spin, tint);
@@ -1011,7 +1062,7 @@ export class DustSystem {
     // behind the contact — the tail that sells the impact after the spray has
     // already gone.
     if (spray && dustScale > 0.9 && vLen > 6) {
-      const n2 = clamp(Math.round(a * 5 * dustScale), 1, 8);
+      const n2 = clamp(Math.round(a * 9 * dustScale), 1, 14);
       for (let i = 0; i < n2; i++) {
         _d.copy(velocity).multiplyScalar(-0.14);
         _d.addScaledVector(_n, this.rng.range(0.18, 0.50));
@@ -1020,7 +1071,7 @@ export class DustSystem {
           position.x + this.rng.signed() * 0.45, position.y + 0.10, position.z + this.rng.signed() * 0.45,
           _d.x, _d.y, _d.z,
           this.rng.range(1.8, 2.7), DUST_PLUME,
-          this.rng.range(0.22, 0.38) * (0.85 + dustScale * 0.25), this.rng.range(2.2, 3.2),
+          this.rng.range(0.15, 0.24) * (0.88 + dustScale * 0.18), this.rng.range(1.8, 2.5),
           this.rng.signed() * 0.55, tint,
         );
       }
@@ -1057,7 +1108,7 @@ export class DustSystem {
     let count = Math.floor(expected);
     if (this.rng.next() < expected - count) count++;
     if (count <= 0) return;
-    if (count > 12) count = 12;
+    if (count > 18) count = 18;
 
     // Loose DRY ground (scree, snow) throws a genuine plume: bigger, slower to
     // disperse, and persistent enough to hang behind the rider as a trail
@@ -1084,10 +1135,35 @@ export class DustSystem {
       // rises and never settles". A rolling contact throws material SIDEWAYS
       // and the shader owns what little of it goes up.
       const radial = this.rng.range(0.55, 1.35);
-      _d.copy(_t).multiplyScalar(Math.cos(ang) * radial)
-        .addScaledVector(_b, Math.sin(ang) * radial)
-        .addScaledVector(_n, this.rng.range(0.10, 0.34));
-      _d.multiplyScalar(this.rng.range(0.85, 1.6) * (plume ? 1.25 : 1.0));
+      const jitter = this.rng.range(0.85, 1.6) * (plume ? 1.25 : 1.0);
+
+      // ── THE FLING SCALES WITH THE RIM SPEED ──────────────────────────────────
+      //
+      // The in-plane throw used to be a fixed ~1.2 m/s at every speed, and the
+      // widening of the plume was left entirely to the shader's age-driven
+      // spread. Which is correct physics for smoke and wrong for THIS SHOT: the
+      // chase boom sits 4.8 m behind the bike, so the only dust the frame
+      // contains is the four metres between the wheel and the bottom edge —
+      // 0.17 s of trail at 83 km/h. Every part of the effect authored "over the
+      // puff's life" happens off-camera. Measured: a plume 33 m long and 1.8 m
+      // wide at its widest still renders as a rope one wheel across, because
+      // the frame only ever sees age < 0.2 and age^1.5 at 0.13 is nothing.
+      //
+      // A tyre displacing loose material at 23 m/s does not gently diffuse it,
+      // it THROWS it, and the throw is what opens the wedge inside the first
+      // couple of metres. Scaling the in-plane component with the contact speed
+      // gives ~5.5 m/s of lateral fling at race pace (a 1.9 m asymptote under
+      // the shader's drag, 0.66 m of it inside the first 0.15 s) and ~1.8 m/s
+      // at walking pace, where a wide fan would be nonsense.
+      //
+      // The NORMAL component is deliberately left out of that scaling. It is the
+      // one direction that must not grow with speed — the entire first defect
+      // was dust climbing to head height, and a fling term multiplying the up
+      // vector is exactly how that comes back.
+      const fling = radial * jitter * (0.9 + 0.17 * Math.min(velocity.length(), 24));
+      _d.copy(_t).multiplyScalar(Math.cos(ang) * fling)
+        .addScaledVector(_b, Math.sin(ang) * fling)
+        .addScaledVector(_n, this.rng.range(0.10, 0.34) * jitter);
       // Dragged backward out of the contact patch.
       _d.addScaledVector(velocity, -0.16);
 
@@ -1110,9 +1186,17 @@ export class DustSystem {
       // over life the critic could not find. Longer-lived too — at 23 m/s a
       // 1.45 s puff is 33 m behind the wheel when it dies, which is what
       // "hangs and streams 20 m or more" costs.
+      //
+      // AND THE SECOND CUT. The paragraph above was written against a scale
+      // that still finished at 2.9 m — see the arithmetic in burst(), where the
+      // two factors of two are worked out. Measured on `scree-speed` the oldest
+      // quarter of the live population averaged 2.0 m across, five wheels wide,
+      // which is why the trail read as a chain of separate balloons rather than
+      // as one shape with a silhouette. Birth 0.25-0.41 m, tail 0.8-1.4 m, and
+      // the count raised to match so the ink lands as overlap.
       const life = plume ? this.rng.range(1.9, 2.9) : this.rng.range(1.05, 1.60);
-      const scale = (plume ? this.rng.range(0.14, 0.26) : this.rng.range(0.11, 0.20)) * (0.85 + dustScale * 0.3);
-      const growth = plume ? this.rng.range(2.4, 3.6) : this.rng.range(2.0, 3.0);
+      const scale = (plume ? this.rng.range(0.180, 0.270) : this.rng.range(0.170, 0.260)) * (0.88 + dustScale * 0.18);
+      const growth = plume ? this.rng.range(1.4, 2.1) : this.rng.range(1.2, 1.9);
       const spin = this.rng.signed() * (plume ? 0.5 : 1.1);
 
       this.write(_v.x, _v.y, _v.z, _d.x, _d.y, _d.z, life, kind, scale, growth, spin, tint);

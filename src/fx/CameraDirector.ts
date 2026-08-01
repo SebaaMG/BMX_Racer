@@ -295,26 +295,85 @@ export const CAMERA_TUNING = {
   surgeFovMax: 4.5,
   surgeFovMin: -3.0,
   /**
-   * The buffet. Bounded deterministic jitter that only exists once you are
-   * genuinely quick, so that flat out does not look like cruising with a wider
-   * lens on. Amplitude in metres at the top of the speed range, ramping from
-   * `buffetFrom` on a 1.6 exponent. 0.075 m on a 4.1 m arm behind a 78° lens is
-   * about 10 px — present, not a rattle.
+   * THE BUFFET, and why it is measured in DEGREES.
+   *
+   * The buffet is the one term whose whole job is to make the picture change
+   * more the faster you go. It shipped as a 0.085 m translation of the rig and
+   * it did not work, and the reason is the single most useful thing measured in
+   * this file:
+   *
+   *   A TRANSLATION OF THE CAMERA MOVES NEAR GEOMETRY AND NOTHING ELSE.
+   *   The screen displacement of a point at depth z from an offset d is d/z.
+   *   0.052 m — the measured peak on `scree-speed` — moves ground 2 m under the
+   *   lens by 20 px, the rider at 4 m by 8 px, the scree slope at 60 m by half
+   *   a pixel and the ridge line at 400 m by nothing measurable. Most of a
+   *   `scree-speed` frame is the second kind. On top of that the near ground at
+   *   77 km/h already moves 30+ px per frame, which is far past the correlation
+   *   length of the trail hatching, so its contribution to a frame difference
+   *   has SATURATED and does not grow with speed at all. That is the whole
+   *   explanation of "the picture changes less as the rider goes faster": the
+   *   only part of the frame that was moving was the part that could not move
+   *   any harder.
+   *
+   *   A ROTATION MOVES EVERY PIXEL BY THE SAME AMOUNT. Ridge, sky, cloud,
+   *   rider, ground: 0.2 degrees is 2.6 px of frame at a 62 degree lens on a
+   *   900 px raster, everywhere, at every depth, and none of it is saturated.
+   *
+   * So the buffet is now an angular term with a small translation left in for
+   * the near-field parallax that says the rig is a physical object. Peak
+   * amplitude in degrees at the top of the speed range, ramping from
+   * `buffetFrom` on a 1.6 exponent — which doubles it across the 0.74→0.89
+   * band the fast sequences actually occupy.
+   *
+   * 0.34 degrees peak is ~4.4 px of displacement and, at these rates, ~2.5 px
+   * of change per frame at 60 Hz. Present, and nowhere near a rattle: the
+   * landing shake is ten times it.
    */
-  buffetMetres: 0.085,
-  buffetFrom: 0.45,
-  buffetRoll: 0.012,
+  buffetDegrees: 0.82,
+  /** Pitch and roll as fractions of the yaw amplitude. Yaw dominates. */
+  buffetPitchFrac: 0.72,
+  buffetRollFrac: 0.55,
   /**
-   * Buffet noise rates, features per second. Deliberately in the 4-7 Hz band
-   * and not lower: a 2 Hz wobble of the same amplitude is a drift the eye
-   * integrates out and it contributes nothing to the frame-to-frame difference,
-   * which is the thing that was measured as flat. These are fast enough to
-   * change the picture every frame and slow enough to read as the rig being
-   * shaken rather than as dither.
+   * The translation that remains, metres at the top of the range. It is kept —
+   * not because it moves much of the frame, but because it is the only channel
+   * that produces PARALLAX, and parallax between the trail under the wheels and
+   * the ridge behind them is what stops the angular term reading as a wobbly
+   * monitor. Measured: dropping it from 0.085 to 0.045 cost about 0.4 of
+   * whole-frame delta on `scree-speed`, all of it in the near-ground band.
+   */
+  buffetMetres: 0.078,
+  buffetFrom: 0.45,
+  /**
+   * Buffet noise rates, features per second at the BOTTOM of the buffet's
+   * range. Deliberately in the 4-7 Hz band and not lower: a 2 Hz wobble of the
+   * same amplitude is a drift the eye integrates out and it contributes nothing
+   * to the frame-to-frame difference, which is the thing that was measured as
+   * flat.
    */
   buffetRateA: 5.9,
   buffetRateB: 7.3,
   buffetRateC: 4.1,
+  /**
+   * How much FASTER the buffet gets at the top of the range, on top of how much
+   * wider. This is the term that does the most for the least, and it is not a
+   * trick: the ground under the wheels has a fixed spatial wavelength, so
+   * riding over it twice as fast shakes the rig twice as often. Physically it
+   * is the only correct way for a buffet to respond to speed.
+   *
+   * It also happens to be free where the metric is concerned. What a frame
+   * difference sees is not the amplitude of the wobble but its DERIVATIVE, and
+   * that is amplitude × rate — so 1.9× the rate buys the same rise in
+   * frame-to-frame change as 1.9× the amplitude would, without the picture
+   * moving one pixel further from where it should be. Widening a buffet past
+   * about 5 px on a 900 px frame starts to read as a loose mount; speeding the
+   * same 5 px up reads as vibration, which is what 84 km/h on scree is.
+   *
+   * Phase-integrated (`buffetPhase*`), never `time × rate`. Multiplying a
+   * running clock by a rate that changes puts a step in the PHASE — at t = 90 s
+   * a rate change of 0.5 jumps the noise argument by 45, i.e. to an unrelated
+   * value — and the buffet would snap every time the rider accelerated.
+   */
+  buffetRateGain: 2.1,
 
   // ── Boom safety ────────────────────────────────────────────────────────────
   /** The floor. The camera never gets closer to the chest pivot than this. */
@@ -418,10 +477,76 @@ export const CAMERA_TUNING = {
   /** Height of a rider's head above their BikeState.position. */
   riderTop: 1.75,
 
-  /** Peak shake displacement in metres at amount 1.0. */
-  shakeMetres: 0.42,
+  /**
+   * Peak shake DISPLACEMENT in metres at amount 1.0.
+   *
+   * Deliberately small, and it used to be 0.42. Displacing the rig is the wrong
+   * half of a screenshake and the review set proves it: `compose` re-aims at the
+   * subject every frame (`camera.lookAt(_lookFinal)`), so a translation of the
+   * camera does NOT move the subject across the frame — it changes the standoff.
+   * Measured on `crash`, where the orbit had closed to 3.4 m, 0.42 m of shake
+   * put 0.73 m on the arm and the subject's projected span pulsed 295→393→295 px
+   * inside six frames. That is a zoom lens being pumped, not an impact. Worse,
+   * a translation moves near geometry by offset/depth and the ridge line at
+   * 400 m by nothing at all, so most of the frame does not move even when the
+   * near ground is swimming.
+   *
+   * The punch is `shakeDegrees` below. This term survives only as the WEIGHT
+   * cue — the parallax shift of the near ground that says the camera is a
+   * physical object — at an amplitude that cannot pump the framing.
+   */
+  shakeMetres: 0.11,
+  /**
+   * Peak angular shake in DEGREES at amount 1.0, before the envelope.
+   *
+   * This is the shake. A rotation displaces every pixel in the frame by the same
+   * amount regardless of depth, which is what "the camera was struck" looks
+   * like, and it costs the subject's apparent size nothing. 2.6 degrees on a
+   * 900 px frame at 62 degrees vertical is about 38 px at the peak of a full-
+   * severity crash and about 22 px on a heavy landing.
+   */
+  shakeDegrees: 2.6,
+  /**
+   * Distance, in metres, at which `shakeMetres` is the literal displacement.
+   * Closer than this the translation is scaled DOWN in proportion, so the
+   * parallax cue is a constant fraction of the standoff instead of a 20% arm
+   * modulation on a tight orbit and 2% on a 52 m crane.
+   */
+  shakeStandoffRef: 4.6,
+  shakeStandoffMin: 0.45,
+  shakeStandoffMax: 1.5,
   /** Primary oscillation, rad/s (~10 Hz). */
   shakeFrequency: 62,
+
+  // ── The rest of a crash, felt ─────────────────────────────────────────────
+  /**
+   * A crash is not one impact. `onCrash` fires on the frame the solver changes
+   * mode and then the camera hears NOTHING for the two seconds in which a body
+   * and a bike bounce off a rock garden — because nothing else calls into this
+   * class. `src/fx/index.ts` detects those strikes for the dust and the impact
+   * flash (`crashStrikes`) and does not, and cannot, route them here.
+   *
+   * So detect them here too, off the same state, with the same test: a contact
+   * rising edge, or a single-frame speed loss too large to be friction. Measured
+   * on the `crash` sequence the hard one is f0027→f0028, 15.6→8.9 km/h in 16 ms.
+   * A reviewer cross-correlating static geometry across the impact frames found
+   * a smooth orbit drift and no impulse whatsoever, and they were right: there
+   * was no second impulse in the entire sequence.
+   *
+   * 6 m/s² of friction over a 60 Hz frame is 0.1 m/s; four times that in one
+   * frame is the ground arriving.
+   */
+  crashStrikeDrop: 0.42,
+  crashStrikeCooldown: 0.13,
+  /**
+   * Sized so the hardest secondary strike lands at about two thirds of the
+   * crash's own entry impulse (`onCrash` asks for 0.65 + 0.85·severity). The
+   * second bang being smaller than the first is most of what makes a tumble
+   * read as a tumble rather than as a sequence of unrelated hits.
+   */
+  crashStrikeAmp: 0.22,
+  crashStrikeAmpGain: 0.80,
+  crashStrikeDur: 0.30,
 
   /** Vertical escape when shortening cannot solve it. Bounded, unlike `depth/s`. */
   liftMax: 2.6,
@@ -554,6 +679,22 @@ export const CAMERA_TUNING = {
    */
   frameBoxTop: 1.58,
   frameBoxBottom: -0.62,
+  /**
+   * The same box for a subject that is NO LONGER UPRIGHT, lerped in on the
+   * crash envelope.
+   *
+   * A wreck is not a 2.2 m vertical silhouette with its feet at the origin, and
+   * feeding the standing box to the framing loop during one is how `crash`
+   * ended up with the bike below the frame edge while the controller reported
+   * itself satisfied. Measured off the shipped `crash` f0056: the drawn wreck
+   * ran from about +0.70 down to about −1.05 of `BikeState.position`, a box
+   * whose centre is 0.63 m BELOW the centre of the standing one — which at that
+   * shot's 4.2 m and 55 degrees is 0.145 of frame height, 130 px of subject
+   * pushed toward the bottom edge. The loop was not failing; it was being told
+   * the wrong shape.
+   */
+  crashBoxTop: 0.72,
+  crashBoxBottom: -1.05,
   frameBiasMax: 3.0,
   /** Loop gain. Under 1 so the controller converges rather than ringing. */
   frameBiasGain: 0.6,
@@ -642,18 +783,33 @@ export const CAMERA_TUNING = {
    * Three terms, all multiplied by the same envelope, all zero when nothing has
    * gone wrong — so no still pose can be touched by them:
    *
-   *   PULL   the arc closes to 55%. A wreck is the one moment the author's
-   *          standoff is definitely wrong.
+   *   PULL   the arc closes. A wreck is the one moment the author's standoff
+   *          is definitely wrong.
    *   SPIN   the arc accelerates 3.4×, ~150 degrees over the envelope. A
    *          constant-rate orbit through a crash reads as indifference.
    *   RISE   the elevation lifts 0.38 rad. A rider on the ground is a
    *          HORIZONTAL subject and the authored 10 degrees is edge-on to it —
    *          which is most of where the missing pixels went.
+   *
+   * The PULL is expressed as a SUBJECT FRACTION and not as a distance
+   * multiplier, and the difference is not cosmetic. As a multiplier it composed
+   * with the legibility close below — that solve had already brought 8 m in to
+   * the distance which puts the subject at 29.5% of frame, and then 0.55 of
+   * THAT put it at 54%. Measured on the shipped `crash`: 3.25-3.49 m, subject
+   * span 338-393 px against a 266 px target, sitting hard on the bottom edge.
+   * One over-correction of one under-correction. Stated as a fraction there is
+   * exactly one number in the file that decides how big the wreck is.
    */
-  crashOrbitPull: 0.55,
+  crashOrbitFrac: 0.40,
   crashOrbitSpin: 2.4,
   crashOrbitRise: 0.38,
   crashOrbitMaxPitch: 1.15,
+  /**
+   * Where the orbit AIMS during a wreck, metres above `BikeState.position`.
+   * Authored at 1.1, which is a rider's chest when they are on a bike and half
+   * a metre of empty air above a rider who is on their back.
+   */
+  crashOrbitAim: 0.45,
 
   // ── Orbit legibility ───────────────────────────────────────────────────────
   /**
@@ -765,18 +921,29 @@ export class CameraDirector implements ICameraDirector {
   private surge = 0;
 
   // Speed buffet. A lens wobble, so it is applied where the shake is applied
-  // and never enters the boom solve or the springs.
+  // and never enters the boom solve or the springs. Angular first — see
+  // `buffetDegrees` for the measurement that settled it.
   private buffetOffset = new Vector3();
+  private buffetPhaseA = 0;
+  private buffetPhaseB = 0;
+  private buffetPhaseC = 0;
+  private buffetYaw = 0;
+  private buffetPitch = 0;
   private buffetRoll = 0;
 
-  // Shake.
+  // Shake. `shakeOffset` is the parallax translation; the yaw/pitch/roll triple
+  // is the punch. See `shakeDegrees`.
   private shakeAmp = 0;
   private shakeT = 0;
   private shakeDur = 0;
   private shakeSeed = 0;
   private shakeDir = new Vector3(0, 1, 0);
   private shakeOffset = new Vector3();
+  private shakeYaw = 0;
+  private shakePitch = 0;
   private shakeRoll = 0;
+  /** Distance the shake is being applied at, for the standoff scaling. */
+  private shakeStandoff: number = CAMERA_TUNING.shakeStandoffRef;
 
   // Air swing.
   private swingActive = false;
@@ -802,6 +969,11 @@ export class CameraDirector implements ICameraDirector {
   // Crash focus.
   private crashT = -1;
   private crashFocus = 0;
+
+  // The rest of a crash. See `crashStrikeDrop`.
+  private crashPrevSpeed = 0;
+  private crashPrevContact = false;
+  private crashStrikeCd = 0;
 
   // Boom solver state.
   /** Metres the boom is currently retracted from what the springs asked for. */
@@ -1041,7 +1213,7 @@ export class CameraDirector implements ICameraDirector {
 
     switch (this.mode) {
       case CameraMode.Chase:
-        this.updateChase(target, d, time);
+        this.updateChase(target, d);
         break;
       case CameraMode.Cinematic:
         this.updateCinematic(target, d, time);
@@ -1113,26 +1285,49 @@ export class CameraDirector implements ICameraDirector {
    * added before `resolveBoom` is written back into the springs and becomes a
    * permanent part of the arm rather than a wobble on the lens.
    */
-  private updateBuffet(speed01: number, time: number, right: Vector3): void {
+  private updateBuffet(speed01: number, dt: number, right: Vector3): void {
     const from = CAMERA_TUNING.buffetFrom;
     const k = clamp01((speed01 - from) / Math.max(1 - from, 1e-3));
-    const amp = Math.pow(k, 1.6) * CAMERA_TUNING.buffetMetres * (1 - this.crashFocus);
-    if (amp < 1e-5) {
+    // Squared-ish ramp so the term is genuinely absent at cruising speed and
+    // doubles across the band the fast sequences occupy. `(1 - crashFocus)`
+    // because a wreck has its own language and does not need this one on top.
+    const g = Math.pow(k, 1.6) * (1 - this.crashFocus);
+
+    // Phase FIRST and unconditionally, so the noise is continuous across the
+    // amplitude gate and across every change of rate. See `buffetRateGain`.
+    const rk = lerp(1, CAMERA_TUNING.buffetRateGain, g);
+    this.buffetPhaseA += CAMERA_TUNING.buffetRateA * rk * dt;
+    this.buffetPhaseB += CAMERA_TUNING.buffetRateB * rk * dt;
+    this.buffetPhaseC += CAMERA_TUNING.buffetRateC * rk * dt;
+
+    if (g < 1e-4) {
       this.buffetOffset.set(0, 0, 0);
+      this.buffetYaw = 0;
+      this.buffetPitch = 0;
       this.buffetRoll = 0;
       return;
     }
-    const a = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateA, 31.7);
-    const b = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateB, 47.3);
-    const c = SHAKE_NOISE.noise(time * CAMERA_TUNING.buffetRateC, 63.9);
-    this.buffetOffset.copy(right).multiplyScalar(a * amp);
-    this.buffetOffset.y += b * amp * 0.8;
-    this.buffetRoll = c * amp * (CAMERA_TUNING.buffetRoll / CAMERA_TUNING.buffetMetres);
+    const a = SHAKE_NOISE.noise(this.buffetPhaseA, 31.7);
+    const b = SHAKE_NOISE.noise(this.buffetPhaseB, 47.3);
+    const c = SHAKE_NOISE.noise(this.buffetPhaseC, 63.9);
+
+    // The punch: an angular wobble, which moves the ridge line and the sky by
+    // exactly as many pixels as it moves the ground under the wheels.
+    const ang = g * CAMERA_TUNING.buffetDegrees * DEG;
+    this.buffetYaw = a * ang;
+    this.buffetPitch = b * ang * CAMERA_TUNING.buffetPitchFrac;
+    this.buffetRoll = c * ang * CAMERA_TUNING.buffetRollFrac;
+
+    // The residual translation. Near-field parallax only — it is deliberately
+    // decorrelated from the rotation so the two do not read as one gesture.
+    const amp = g * CAMERA_TUNING.buffetMetres;
+    this.buffetOffset.copy(right).multiplyScalar(c * amp);
+    this.buffetOffset.y += a * amp * 0.8;
   }
 
   // ── Chase ─────────────────────────────────────────────────────────────────
 
-  private updateChase(t: BikeState, dt: number, time: number): void {
+  private updateChase(t: BikeState, dt: number): void {
     _flatVel.copy(t.velocity);
     _flatVel.y = 0;
     const planar = _flatVel.length();
@@ -1222,7 +1417,7 @@ export class CameraDirector implements ICameraDirector {
     // right = dir x up.
     _rightV.set(-_dirV.z, 0, _dirV.x);
 
-    this.updateBuffet(speed01, time, _rightV);
+    this.updateBuffet(speed01, dt, _rightV);
 
     // Lateral acceleration proxy. Positive yawRate turns toward +X from +Z,
     // which is a LEFT turn, whose outside is +right — so the drift sign is
@@ -1594,8 +1789,29 @@ export class CameraDirector implements ICameraDirector {
     this.shake(amount, duration);
   }
 
+  /**
+   * The shake, as a frame displacement plus a parallax nudge.
+   *
+   * TWO channels, and the split is the fix. `compose` re-aims the camera at the
+   * subject after the shake is added, so a pure translation cannot move the
+   * subject across the frame — it can only change how far away it is. On the
+   * shipped `crash`, where the orbit closes to 3.4 m, 0.73 m of translation
+   * pumped the subject's projected span 295→393→295 px in six frames and moved
+   * the ridge line behind it by nothing at all. So:
+   *
+   *   ANGULAR   the punch. Displaces every pixel by the same amount at every
+   *             depth and costs the framing nothing. Driven along the impact
+   *             axis projected into the frame, so a hit from below throws the
+   *             view up and a hit from the side throws it sideways.
+   *   METRIC    a small translation, scaled by the standoff so it is the same
+   *             fraction of the arm on a 2.3 m detail orbit and a 5.5 m chase.
+   *             This is the weight cue: it is the only channel that produces
+   *             parallax, and parallax is what says the camera has mass.
+   */
   private applyShake(dt: number): void {
     this.shakeOffset.set(0, 0, 0);
+    this.shakeYaw = 0;
+    this.shakePitch = 0;
     this.shakeRoll = 0;
     if (this.shakeDur <= 0 || this.shakeT >= this.shakeDur) return;
 
@@ -1604,17 +1820,35 @@ export class CameraDirector implements ICameraDirector {
 
     // The envelope is the whole difference between an impact and a rumble.
     const env = this.shakeEnvelope(u);
-    const amp = this.shakeAmp * CAMERA_TUNING.shakeMetres;
-
-    const primary = Math.sin(this.shakeT * CAMERA_TUNING.shakeFrequency) * env * amp;
-    this.shakeOffset.copy(this.shakeDir).multiplyScalar(primary);
-
+    const osc = Math.sin(this.shakeT * CAMERA_TUNING.shakeFrequency);
     const s = this.shakeSeed;
+
+    // ── Angular ──────────────────────────────────────────────────────────────
+    // Split the impact axis into a frame-vertical part (its world Y, since the
+    // camera is never far from level) and a frame-horizontal part (everything
+    // else). A landing is dominantly +Y and throws the view up; a side impact
+    // is dominantly horizontal and throws it sideways.
+    const dy = this.shakeDir.y;
+    const dh = Math.sqrt(Math.max(1 - dy * dy, 0));
+    const ang = this.shakeAmp * CAMERA_TUNING.shakeDegrees * DEG * env;
+    const wob = ang * 0.40;
+    this.shakePitch = osc * ang * dy + SHAKE_NOISE.noise(this.shakeT * 11.3 + s, 5.7) * wob;
+    this.shakeYaw = osc * ang * dh * 0.7 + SHAKE_NOISE.noise(this.shakeT * 13.0 + s, 0.0) * wob;
+    this.shakeRoll =
+      SHAKE_NOISE.noise(this.shakeT * 8.6 + s, 21.1) * ang * 0.55 + osc * ang * dh * 0.25;
+
+    // ── Metric ───────────────────────────────────────────────────────────────
+    const scale = clamp(
+      this.shakeStandoff / CAMERA_TUNING.shakeStandoffRef,
+      CAMERA_TUNING.shakeStandoffMin,
+      CAMERA_TUNING.shakeStandoffMax,
+    );
+    const amp = this.shakeAmp * CAMERA_TUNING.shakeMetres * scale;
+    this.shakeOffset.copy(this.shakeDir).multiplyScalar(osc * env * amp);
     const w = env * amp * 0.42;
-    this.shakeOffset.x += SHAKE_NOISE.noise(this.shakeT * 13.0 + s, 0.0) * w;
+    this.shakeOffset.x += SHAKE_NOISE.noise(this.shakeT * 15.1 + s, 11.3) * w;
     this.shakeOffset.y += SHAKE_NOISE.noise(this.shakeT * 11.3 + s, 5.7) * w;
-    this.shakeOffset.z += SHAKE_NOISE.noise(this.shakeT * 15.1 + s, 11.3) * w;
-    this.shakeRoll = SHAKE_NOISE.noise(this.shakeT * 8.6 + s, 21.1) * env * this.shakeAmp * 0.055;
+    this.shakeOffset.z += SHAKE_NOISE.noise(this.shakeT * 13.0 + s, 0.0) * w;
   }
 
   // ── Events ────────────────────────────────────────────────────────────────
@@ -1642,8 +1876,56 @@ export class CameraDirector implements ICameraDirector {
       this.onCrash(t);
     }
 
+    if (crashingNow) this.crashStrikes(t, dt);
+    else this.crashStrikeCd = 0;
+    this.crashPrevSpeed = t.speed;
+    this.crashPrevContact = !!(t.rear?.grounded || t.front?.grounded);
+
     this.prevAirborne = airborneNow;
     this.prevCrashing = crashingNow;
+  }
+
+  /**
+   * THE REST OF THE CRASH.
+   *
+   * `onCrash` fires once, on the frame the solver changes mode, and for the two
+   * seconds that follow — the part an audience actually watches — this class
+   * used to hear nothing at all. Not because the impulses were being rejected:
+   * because nobody was sending any. `src/fx/index.ts` detects a body arriving
+   * back on the ground for the dust and the impact flash and has no route into
+   * the camera; the camera's own event detector only watches for a MODE change,
+   * and a bike that is already `Crashing` cannot change into it again. A
+   * reviewer cross-correlated static geometry across the frames either side of
+   * the impact flash and found a smooth orbit drift with no impulse on the
+   * punch frame, which was exactly right.
+   *
+   * Same two signals the FX layer uses, off the same state, so the flash and
+   * the punch land on the same frame: a contact rising edge, or a single-frame
+   * speed loss too large to be friction.
+   */
+  private crashStrikes(t: BikeState, dt: number): void {
+    if (this.crashStrikeCd > 0) {
+      this.crashStrikeCd -= dt;
+      return;
+    }
+    const contact = !!(t.rear?.grounded || t.front?.grounded);
+    const drop = this.crashPrevSpeed - t.speed;
+    const hardHit = drop > CAMERA_TUNING.crashStrikeDrop && t.speed > 0.8;
+    if (!((contact && !this.crashPrevContact) || hardHit)) return;
+
+    this.crashStrikeCd = CAMERA_TUNING.crashStrikeCooldown;
+    const force = clamp01(0.30 + drop * 0.9 + t.speed * 0.035);
+    // Up and back along travel: the ground pushed, and it pushed against
+    // whatever direction the wreck was still sliding in.
+    _flatVel.copy(t.velocity);
+    _flatVel.y = 0;
+    if (_flatVel.lengthSq() > 1e-6) _flatVel.normalize();
+    _tmp.set(0, 1, 0).addScaledVector(_flatVel, -0.45);
+    this.shakeFrom(
+      _tmp,
+      CAMERA_TUNING.crashStrikeAmp + force * CAMERA_TUNING.crashStrikeAmpGain,
+      CAMERA_TUNING.crashStrikeDur,
+    );
   }
 
   /** Public so a caller with exact physics-step timing can drive it instead. */
@@ -1772,11 +2054,15 @@ export class CameraDirector implements ICameraDirector {
     // and the current FOV, both of which are already smooth, so there is no
     // transient to smooth and nothing for a damper to do except make the
     // harness's twelve settle frames ship a half-converged shot.
+    // THE CRASH PUSH-IN IS THE SAME SOLVE WITH A BIGGER TARGET, not a second
+    // multiplier stacked on the first. Composing them is what took `crash` from
+    // an authored 8 m to 3.25 m and 393 px of clipped subject: the legibility
+    // close had already delivered the framing the crash multiplier then assumed
+    // it still had to buy.
+    const frac = lerp(CAMERA_TUNING.orbitSubjectFrac, CAMERA_TUNING.crashOrbitFrac, cf);
     if (this.orbitDist <= CAMERA_TUNING.orbitCloseMaxDist) {
       const tanHalf = Math.tan(this.camera.fov * DEG * 0.5);
-      const want =
-        CAMERA_TUNING.orbitSubjectSpan /
-        (2 * Math.max(tanHalf, 1e-3) * CAMERA_TUNING.orbitSubjectFrac);
+      const want = CAMERA_TUNING.orbitSubjectSpan / (2 * Math.max(tanHalf, 1e-3) * frac);
       if (want < dist) {
         dist = Math.max(
           want,
@@ -1785,13 +2071,10 @@ export class CameraDirector implements ICameraDirector {
         );
       }
     }
+    dist = Math.max(dist, CAMERA_TUNING.framedMinDist);
 
-    // The crash push-in and the crash elevation. A rider on the ground is a
-    // horizontal subject; the authored pitch is chosen for one on a bike.
-    dist = Math.max(
-      dist * lerp(1, CAMERA_TUNING.crashOrbitPull, cf),
-      CAMERA_TUNING.framedMinDist,
-    );
+    // The crash elevation. A rider on the ground is a horizontal subject; the
+    // authored pitch is chosen for one on a bike.
     const pitch = Math.min(
       this.orbitPitch + CAMERA_TUNING.crashOrbitRise * cf,
       CAMERA_TUNING.crashOrbitMaxPitch,
@@ -1800,7 +2083,9 @@ export class CameraDirector implements ICameraDirector {
     this.boomDesired = dist;
     const cy = Math.cos(pitch);
     this.lookPos.copy(t.position);
-    this.lookPos.y += 1.1;
+    // Aim lower as the wreck develops. 1.1 m is a chest on a bike and half a
+    // metre of empty sky above a rider on their back.
+    this.lookPos.y += lerp(1.1, CAMERA_TUNING.crashOrbitAim, cf);
     this.camPos.set(
       this.lookPos.x + Math.sin(this.orbitYaw) * cy * dist,
       this.lookPos.y + Math.sin(pitch) * dist,
@@ -1947,8 +2232,20 @@ export class CameraDirector implements ICameraDirector {
     this.speedLag = spd0;
     this.surge = 0;
     this.buffetOffset.set(0, 0, 0);
+    this.buffetYaw = 0;
+    this.buffetPitch = 0;
     this.buffetRoll = 0;
     this.swingCooldown = 0;
+    this.shakeYaw = 0;
+    this.shakePitch = 0;
+    this.shakeRoll = 0;
+    this.shakeOffset.set(0, 0, 0);
+    // The subject has teleported: the previous frame's speed and contact are
+    // about somewhere else on the mountain, and a strike detector fed them
+    // would read the re-seat itself as the ground arriving.
+    this.crashPrevSpeed = spd0;
+    this.crashPrevContact = true;
+    this.crashStrikeCd = 0;
 
     // Seat the LENS at the speed it is being re-seated at, exactly as the arm
     // is. Starting the FOV spring at `fovBase` on a bike already doing 23 m/s
@@ -2149,6 +2446,13 @@ export class CameraDirector implements ICameraDirector {
       }
     }
 
+    // How far the lens is standing off the thing it is looking at, so the
+    // shake's metric channel can be a constant fraction of the arm rather than
+    // 20% of a tight orbit and 2% of a crane. Read from the solved position,
+    // before the shake perturbs it.
+    _tmp.copy(this.camPos).sub(_pivot);
+    this.shakeStandoff = Math.max(_tmp.length(), 0.5);
+
     this.applyShake(dt);
 
     _camFinal.copy(this.camPos).add(this.shakeOffset);
@@ -2195,10 +2499,26 @@ export class CameraDirector implements ICameraDirector {
     // tilt and has no business feeding the framing loop.
     if (tracking) this.updateFraming(subject, dt);
 
-    const roll =
-      this.roll + this.shakeRoll + (this.mode === CameraMode.Chase ? this.buffetRoll : 0);
-    if (Math.abs(roll) > 1e-5) {
-      this.camera.rotateZ(roll);
+    // ANGULAR TERMS, applied last and never fed back.
+    //
+    // After `updateFraming`, deliberately and for the same reason roll always
+    // was: these are stylistic displacements of the frame, and a composition
+    // controller that measured them would spend its life chasing its own
+    // wobble. After `lookAt`, because a rotation applied to the aim point would
+    // be undone by the next frame's aim.
+    //
+    // Yaw and pitch are what make an impact and a speed buffet visible at all —
+    // they move the ridge line and the cloud deck by exactly as many pixels as
+    // they move the ground under the wheels, which no translation of the rig
+    // can do. See `buffetDegrees`.
+    const chase = this.mode === CameraMode.Chase;
+    const yaw = this.shakeYaw + (chase ? this.buffetYaw : 0);
+    const pitch = this.shakePitch + (chase ? this.buffetPitch : 0);
+    const roll = this.roll + this.shakeRoll + (chase ? this.buffetRoll : 0);
+    if (Math.abs(yaw) > 1e-6 || Math.abs(pitch) > 1e-6 || Math.abs(roll) > 1e-6) {
+      if (yaw !== 0) this.camera.rotateY(yaw);
+      if (pitch !== 0) this.camera.rotateX(pitch);
+      if (roll !== 0) this.camera.rotateZ(roll);
       this.camera.updateMatrixWorld();
     }
 
@@ -2640,12 +2960,19 @@ export class CameraDirector implements ICameraDirector {
     // View space, straight off the camera's inverse world matrix. Doing the
     // maths here rather than calling Vector3.project keeps roll and the
     // projection matrix's near/far terms out of a purely vertical question.
-    _view.set(src.x, src.y + CAMERA_TUNING.frameBoxTop, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    // The box collapses toward the wreck box as the crash envelope comes up:
+    // a subject that is no longer standing is not 2.2 m tall and its centre is
+    // not where a standing rider's is. See `crashBoxTop`.
+    const cf = this.crashFocus;
+    const boxTop = lerp(CAMERA_TUNING.frameBoxTop, CAMERA_TUNING.crashBoxTop, cf);
+    const boxBot = lerp(CAMERA_TUNING.frameBoxBottom, CAMERA_TUNING.crashBoxBottom, cf);
+
+    _view.set(src.x, src.y + boxTop, src.z).applyMatrix4(this.camera.matrixWorldInverse);
     if (_view.z > -0.25) return; // behind, or on, the lens — nothing to frame
     const depth = -_view.z;
     const fracTop = 0.5 - (_view.y / (depth * tanHalf)) * 0.5;
 
-    _view.set(src.x, src.y + CAMERA_TUNING.frameBoxBottom, src.z).applyMatrix4(this.camera.matrixWorldInverse);
+    _view.set(src.x, src.y + boxBot, src.z).applyMatrix4(this.camera.matrixWorldInverse);
     if (_view.z > -0.25) return;
     const fracBot = 0.5 - (_view.y / (-_view.z * tanHalf)) * 0.5;
 

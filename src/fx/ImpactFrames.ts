@@ -195,6 +195,7 @@ export class ImpactFrames {
     // held drawing its poster-like contrast instead of just making it bright.
     this.inkPeak = (0.30 + 0.55 * s * (isCrash ? 1.0 : 0.7)) * IMPACT_TUNING.inkCeiling;
     this.setTint(tint, isCrash);
+    this.publish();
     return true;
   }
 
@@ -220,6 +221,44 @@ export class ImpactFrames {
     this.flashPeak = peak;
     this.inkPeak = s * 0.18 * IMPACT_TUNING.inkCeiling;
     this.setTint(tint, false);
+    this.publish();
+  }
+
+  /**
+   * Write the dials for THIS frame and consume one frame of the staircase.
+   *
+   * ── THE ACCENT USED TO LAND ONE FRAME AFTER THE HIT, ALWAYS. ───────────────
+   *
+   * Everything here published only from update(), and update() runs at the TOP
+   * of the frame (Game.render calls effects.beginFrame first, because the scaled
+   * dt it returns has to exist before anything else can use it). Every caller,
+   * on the other hand, is downstream: Effects.detectEvents → crashStrikes →
+   * flashOnly happens in the MIDDLE of the frame, long after update() has been
+   * and gone. So a flash requested on frame N was not written to POST_STATE
+   * until update() ran again on frame N+1, and the composite drew frame N with
+   * the dials still at zero.
+   *
+   * That is a whole 16.7 ms, and for a two-frame accent it is half the effect,
+   * placed on the wrong side of the event. Measured on the `crash` capture: the
+   * body arrives at f0028 (the speedo falls 15.6 → 8.9 km/h in one frame) and
+   * the composite's uImpactFlash first goes non-zero at f0029. The punch landed
+   * on the frame AFTER the frame the eye reads as the hit — which is precisely
+   * the "fires on the wrong frame" the motion review measured, at the small
+   * scale that survived after the gross 267-433 ms error was fixed.
+   *
+   * Publishing here, at the moment of the request, puts the first and loudest
+   * step of the staircase on the frame the hit happens. update() then carries
+   * the remaining steps exactly as before, because this consumes its frame the
+   * same way update() does — the two are deliberately the same three lines.
+   */
+  private publish(): void {
+    if (this.flashFramesLeft <= 0) return;
+    const s = this.staircase();
+    POST_STATE.impactFlash = this.flashPeak * s;
+    POST_STATE.impactTint.copy(this.flashTint);
+    POST_STATE.inkFlood = this.inkPeak * this.staircase(1);
+    POST_STATE.desaturate = Math.min(this.flashPeak * s * 0.45, IMPACT_TUNING.desatCeiling);
+    this.flashFramesLeft--;
   }
 
   private setTint(tint: number | undefined, isCrash: boolean): void {
@@ -281,19 +320,15 @@ export class ImpactFrames {
       this.timeScale = 1;
     }
 
+    // Publishing is one shared routine (see publish()): the ink flood decays one
+    // step faster than the flash so the frame goes white-hot first and graphic
+    // second, the desaturation rides the flash, and the frame counter is
+    // consumed AFTER the write — a one-frame flash that zeroed itself in the
+    // same call that raised it would never survive to be composited at all.
+    // update() carries the steps AFTER the first; the first is written by the
+    // trigger itself, on the frame of the hit.
     if (this.flashFramesLeft > 0) {
-      const s = this.staircase();
-      POST_STATE.impactFlash = this.flashPeak * s;
-      POST_STATE.impactTint.copy(this.flashTint);
-      // Ink flood decays one step faster than the flash so the frame goes
-      // white-hot first and graphic second, which is the order the eye reads.
-      POST_STATE.inkFlood = this.inkPeak * this.staircase(1);
-      // The blown-out frame loses colour before it loses brightness.
-      POST_STATE.desaturate = Math.min(this.flashPeak * s * 0.45, IMPACT_TUNING.desatCeiling);
-      // Decrement AFTER publishing, and clear on the following update rather
-      // than this one — a one-frame flash that zeroed itself in the same call
-      // that raised it would never survive to be composited at all.
-      this.flashFramesLeft--;
+      this.publish();
     } else if (this.flashFramesLeft === 0) {
       this.flashFramesLeft = -1;
       // Hand the dials straight back rather than leaving them latched — the

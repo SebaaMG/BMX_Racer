@@ -107,9 +107,11 @@ interface ClipLevel {
   index: number;
   spacing: number;
   halfSpan: number;
-  /** [variant][quadrant] — variant 0 is the only one for the solid block. */
+  /** [variant][block] — variant 0 is the only one for the solid block. */
   variants: BufferGeometry[][];
   meshes: Mesh[];
+  /** Blocks per axis: 2 for the solid centre, 4 for every ring. */
+  split: number;
   originX: number;
   originZ: number;
   variant: number;
@@ -184,32 +186,66 @@ export class TerrainClipmap {
     const curvAttr = new BufferAttribute(new Float32Array(vcount).fill(0.15), 1);
 
     // ── Index variants ────────────────────────────────────────────────────
+    //
+    // A ring is cut into a 4x4 grid rather than into quadrants. The whole point
+    // of the hand-rolled cull is to reject geometry the frustum cannot see, and
+    // a quadrant of a camera-CENTRED ring always has a corner at the camera —
+    // so the frustum always intersects it, and the test could never reject
+    // anything. Measured before this change: 2 of 28 quadrants culled, and the
+    // two were the level-0 halves directly behind the camera. Sixteen blocks
+    // put the ring's mass into pieces that are wholly off to one side, which is
+    // the only shape of piece a frustum test can throw away.
+    //
+    // The middle four land on the hole and come out empty, except when the hole
+    // is shifted a texel to track the finer level's snap, which leaves a
+    // one-cell strip. Empty geometry is kept rather than special-cased: the
+    // block set has to be the same size in every variant, and a zero-index
+    // draw is skipped by the visibility test in `update`.
+    const split = isBlock ? 2 : 4;
+    const blocks = split * split;
+    const step = N / split;
     const variantCount = isBlock ? 1 : 4;
     const variants: BufferGeometry[][] = [];
     for (let v = 0; v < variantCount; v++) {
       const shiftX = isBlock ? 0 : v & 1;
       const shiftZ = isBlock ? 0 : (v >> 1) & 1;
-      const quadrants: BufferGeometry[] = [];
-      for (let q = 0; q < 4; q++) {
+      const list: BufferGeometry[] = [];
+      for (let b = 0; b < blocks; b++) {
+        const bx = b % split;
+        const bz = (b / split) | 0;
         const geo = new BufferGeometry();
         geo.setAttribute('position', posAttr);
         geo.setAttribute('normal', nrmAttr);
         geo.setAttribute('uv', uvAttr);
         geo.setAttribute('aSmoothNormal', smoothAttr);
         geo.setAttribute('aCurvature', curvAttr);
-        geo.setIndex(new BufferAttribute(buildIndices(N, isBlock ? 0 : N / 4, shiftX, shiftZ, q), 1));
+        geo.setIndex(
+          new BufferAttribute(
+            buildIndices(
+              N,
+              isBlock ? 0 : N / 4,
+              shiftX,
+              shiftZ,
+              bx * step,
+              (bx + 1) * step,
+              bz * step,
+              (bz + 1) * step,
+            ),
+            1,
+          ),
+        );
         finalizeGeometry(geo, { tolerance: 1e-3 });
-        geo.name = `clip${L}:v${v}:q${q}`;
-        quadrants.push(geo);
+        geo.name = `clip${L}:v${v}:b${b}`;
+        list.push(geo);
       }
-      variants.push(quadrants);
+      variants.push(list);
     }
 
     // ── Meshes ────────────────────────────────────────────────────────────
     const meshes: Mesh[] = [];
-    for (let q = 0; q < 4; q++) {
-      const mesh = new Mesh(variants[0][q], this.opts.materials.main);
-      mesh.name = `terrain:L${L}:q${q}`;
+    for (let b = 0; b < blocks; b++) {
+      const mesh = new Mesh(variants[0][b], this.opts.materials.main);
+      mesh.name = `terrain:L${L}:b${b}`;
       // Culled by hand against a real AABB; see the file header.
       mesh.frustumCulled = false;
       mesh.receiveShadow = true;
@@ -232,6 +268,7 @@ export class TerrainClipmap {
       halfSpan,
       variants,
       meshes,
+      split,
       originX: NaN,
       originZ: NaN,
       variant: -1,
@@ -274,22 +311,31 @@ export class TerrainClipmap {
       }
       if (variant !== lv.variant) {
         lv.variant = variant;
-        for (let q = 0; q < 4; q++) lv.meshes[q].geometry = lv.variants[variant][q];
+        for (let b = 0; b < lv.meshes.length; b++) lv.meshes[b].geometry = lv.variants[variant][b];
       }
 
       // ── Place and cull ──────────────────────────────────────────────────
-      const half = lv.halfSpan;
-      for (let q = 0; q < 4; q++) {
-        const mesh = lv.meshes[q];
+      const split = lv.split;
+      const blockSpan = (lv.halfSpan * 2) / split;
+      for (let b = 0; b < lv.meshes.length; b++) {
+        const mesh = lv.meshes[b];
         mesh.position.set(lv.originX, 0, lv.originZ);
         mesh.updateMatrix();
 
-        const qx = q & 1;
-        const qz = (q >> 1) & 1;
-        const x0 = lv.originX + (qx === 0 ? -half : 0);
-        const x1 = x0 + half;
-        const z0 = lv.originZ + (qz === 0 ? -half : 0);
-        const z1 = z0 + half;
+        const idx = mesh.geometry.getIndex();
+        if (!idx || idx.count === 0) {
+          // A middle block sitting entirely on the ring's hole. Nothing to
+          // draw, and nothing to count as culled either — it is not geometry.
+          mesh.visible = false;
+          continue;
+        }
+
+        const bx = b % split;
+        const bz = (b / split) | 0;
+        const x0 = lv.originX - lv.halfSpan + bx * blockSpan;
+        const x1 = x0 + blockSpan;
+        const z0 = lv.originZ - lv.halfSpan + bz * blockSpan;
+        const z1 = z0 + blockSpan;
 
         this.pyramid.range(x0, z0, x1, z1, _minMax);
         // A little vertical slack: the vertex shader's bilinear can overshoot
@@ -308,8 +354,7 @@ export class TerrainClipmap {
 
         if (visible) {
           this.stats.drawn++;
-          const idx = mesh.geometry.getIndex();
-          this.stats.triangles += idx ? idx.count / 3 : 0;
+          this.stats.triangles += idx.count / 3;
         } else {
           this.stats.culled++;
         }
@@ -342,7 +387,7 @@ export class TerrainClipmap {
 // Index generation
 // ─────────────────────────────────────────────────────────────────────────────
 /**
- * One quadrant of one hole-variant of one level.
+ * One BLOCK of one hole-variant of one level.
  *
  * `holeHalf` is measured in quads from the centre; 0 means a solid block.
  * `shiftX`/`shiftZ` move the hole by 0 or 1 quad, which is exactly the range of
@@ -360,17 +405,13 @@ function buildIndices(
   holeHalf: number,
   shiftX: number,
   shiftZ: number,
-  quadrant: number,
+  iStart: number,
+  iEnd: number,
+  jStart: number,
+  jEnd: number,
 ): Uint16Array {
   const side = N + 1;
   const half = N / 2;
-  const qx = quadrant & 1;
-  const qz = (quadrant >> 1) & 1;
-
-  const iStart = qx === 0 ? 0 : half;
-  const iEnd = qx === 0 ? half : N;
-  const jStart = qz === 0 ? 0 : half;
-  const jEnd = qz === 0 ? half : N;
 
   const out: number[] = [];
   for (let j = jStart; j < jEnd; j++) {

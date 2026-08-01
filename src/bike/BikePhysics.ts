@@ -110,6 +110,32 @@ export const BODY_TUNE = {
   tipCancel: 0.94,
   /** How fast the bars move to the demanded angle, radians per second. */
   steerRate: 5.4,
+  /**
+   * How firmly the rider holds the bars, N·m per radian.
+   *
+   * The front tyre's lateral force acts `trail` behind the steering axis, so it
+   * torques the wheel toward its own direction of travel — that is the castor
+   * that makes a bike track straight, and the only thing resisting it is the
+   * rider's arms. So the bars sit where the demand and the self-aligning torque
+   * balance, not where the demand alone says.
+   *
+   * The number matters most in the place the bars were previously inert: a
+   * nose-first landing. Measured on `tabletop-air`, the front wheel touched
+   * down alone with 3° of slip and 5.6 kN on it, and because all of that grip
+   * was 0.54 m AHEAD of the centre of mass the yaw ran away — 0.13 rad/s to
+   * 4.8 rad/s over 22 steps, 160° of spin, and 53 → 17 km/h scrubbed off
+   * sideways with no steer input at all. A real front wheel cannot hold 3° of
+   * slip under 5.6 kN: 210 N·m of aligning torque is far past what anyone's
+   * arms hold and the wheel simply castors straight. At this stiffness it does,
+   * and the equilibrium slip angle under that load is a fifth of what it was.
+   *
+   * In a steady corner the same term costs almost nothing, because camber
+   * thrust — which is where a leaned bike's cornering force comes from — makes
+   * essentially no aligning torque. See Wheel.alignTorque.
+   */
+  barStiffness: 1250,
+  /** Hard limit on how far the castor may push the bars off the demand, rad. */
+  barGive: 0.30,
   /** Speed at which lean fully replaces steer as the cornering mechanism. */
   leanAuthoritySpeed: 9.5,
 
@@ -431,6 +457,8 @@ export class BikePhysics {
 
   // ── Control state ─────────────────────────────────────────────────────────
   private steerDemand = 0;
+  /** How far the castor has pushed the bars off the demand, radians. */
+  private barGive = 0;
   private targetLean = 0;
   private crouchPrev = 0;
   /** Seconds since the crouch was released with charge in it; <0 = not armed. */
@@ -848,7 +876,26 @@ export class BikePhysics {
     );
     const direct = input.steer * BIKE.maxSteer;
     this.steerDemand = clamp(lerp(direct, kinematic, leanAuthority), -BIKE.maxSteer, BIKE.maxSteer);
-    s.steerAngle = moveTowards(s.steerAngle, this.steerDemand, BODY_TUNE.steerRate * dt);
+
+    // ── Castor ──────────────────────────────────────────────────────────────
+    // The bars are not a position servo. The front tyre's lateral force acts
+    // behind the steering axis and pushes the wheel toward its own direction of
+    // travel; the rider's arms are a spring against that. So the wheel ends up
+    // where the two balance. See BODY_TUNE.barStiffness for the measurement
+    // this exists for — a nose-first landing where the front wheel held 3° of
+    // slip under 5.6 kN and spun the bike 160°, which no real front wheel does
+    // because it would have castored straight in a fraction of the time.
+    //
+    // `alignTorque` is last step's, which at 120 Hz is 8 ms of lag. That is
+    // deliberate: reading it inside the same step would need the tyre solved
+    // before the steer it depends on.
+    this.barGive = clamp(
+      -this.front.alignTorque / BODY_TUNE.barStiffness,
+      -BODY_TUNE.barGive,
+      BODY_TUNE.barGive,
+    );
+    const target = clamp(this.steerDemand + this.barGive, -BIKE.maxSteer, BIKE.maxSteer);
+    s.steerAngle = moveTowards(s.steerAngle, target, BODY_TUNE.steerRate * dt);
   }
 
   private updatePreload(input: BikeInput, dt: number): void {
@@ -1075,6 +1122,24 @@ export class BikePhysics {
     // force's. See cancelTipMoment: cancelling one without the other leaves the
     // bike leaning OUT of every corner.
     this.tipRoll += _t.dot(_fwd);
+
+    // ── Trail ────────────────────────────────────────────────────────────────
+    // The lateral force does not act AT the contact patch, it acts `trail`
+    // behind it, and the moment that offset produces about the patch is a pure
+    // couple along the contact normal: (-trail·forward) × (fy·left) = -trail·fy·n.
+    //
+    // This is what makes a bicycle a bicycle rather than a shopping trolley,
+    // and it is the term that was missing when the tabletop landing spun the
+    // bike 160° with the bars dead straight. On the FRONT wheel it opposes that
+    // wheel's own yaw moment, shortening its effective lever from 0.54 m to
+    // about 0.44 m — real directional stability, paid for out of turn-in. On
+    // the REAR its sign is the same as the rear contact's own moment, so it
+    // adds to the stability there instead of taking from it.
+    //
+    // The same number, read back by `updateSteering`, is what castors the bars.
+    if (w.alignTorque !== 0) {
+      this.torque.addScaledVector(w.contactNormal, w.alignTorque);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -1168,12 +1233,49 @@ export class BikePhysics {
     s.manualAmount = dampHL(s.manualAmount, frontUp ? clamp01(0.35 + back * 0.65) : 0, 0.09, dt);
     s.manualling = frontUp && s.manualAmount > 0.35;
 
-    // ── Yaw damping ─────────────────────────────────────────────────────────
-    _v.copy(_up).multiplyScalar(-s.angularVelocity.dot(_up) * BODY_TUNE.yawDamp * BODY_TUNE.inertiaYaw);
-    this.torque.add(_v);
+    // ── Yaw damping, referenced to the corner the bike is already leaning ───
+    //
+    // The coefficient is unchanged. What changed is what it is measured
+    // AGAINST, and that was the bug: a damper referenced to zero damps the
+    // corner itself. A bike leaned at θ and travelling at v is going round a
+    // circle of radius v²/(g·tan θ), so its chassis MUST be yawing at
+    // g·tan θ / v — that is the same balance equation `updateSteering` picks
+    // the lean angle from, read the other way round. Yawing at that rate is not
+    // a disturbance and damping it is a tax on every corner.
+    //
+    // Measured on the flat skidpad at 14 m/s: the damper was pulling 31.6 N·m
+    // against a 1.10 rad/s corner, which the tyres had to pay for out of a
+    // front/rear force imbalance, and the sideslip that developed to produce
+    // that imbalance was NEGATIVE at both wheels — the chassis sitting nose-out
+    // of its own path, with the slip-angle force subtracting from the camber
+    // thrust instead of adding to it.
+    //
+    // Referenced this way the damper still does its real job — it kills the
+    // residual spin a two-wheeled body accumulates, it catches a wheel that
+    // steps out, it holds the bike straight with the stick centred (lean 0
+    // gives a reference of 0, exactly the old behaviour) — at exactly the
+    // authority it had before, so nothing about a deliberate slide changes.
+    // Faded out below walking pace, where `tan(lean)/v` is not a corner radius
+    // any more, and off entirely while the rider is picking the bike up.
+    // The reference is the lean the RIDER IS ASKING FOR, not the lean the bike
+    // happens to be at. Those agree in a corner — the balance loop's whole job
+    // is to make them agree — and they must not agree anywhere else. Referenced
+    // to the momentary lean, every rock that rolls the bike 15° also commands a
+    // turn, and the yaw the bike then acquires rolls it further: measured on
+    // `rockgarden-low` with the stick CENTRED, that loop took a clean 13 → 14.8
+    // m/s run and put the bike on its roof (|lean| 2.92 rad) and down to
+    // 1.2 m/s. A disturbance must never become a steering input.
+    const yawRate = s.angularVelocity.dot(n);
+    const vTurn = Math.max(Math.abs(s.forwardSpeed), 2.4);
+    const turning =
+      s.mode === BikeMode.Recovering ? 0 : clamp01((Math.abs(s.forwardSpeed) - 1.6) / 3.5);
+    const yawWanted =
+      (-turning * BIKE.gravity * Math.tan(clamp(this.targetLean, -1.2, 1.2))) / vTurn;
+    const yawT = (yawWanted - yawRate) * BODY_TUNE.yawDamp * BODY_TUNE.inertiaYaw;
+    this.torque.addScaledVector(n, yawT);
     if (BIKE_DIAG.enabled) {
-      BIKE_DIAG.yawRate = s.angularVelocity.dot(_up);
-      BIKE_DIAG.yawDampT = -BIKE_DIAG.yawRate * BODY_TUNE.yawDamp * BODY_TUNE.inertiaYaw;
+      BIKE_DIAG.yawRate = yawRate;
+      BIKE_DIAG.yawDampT = yawT;
     }
 
     // Low-side. Past the lean limit with load on the wheels, the bike is down.
@@ -1315,10 +1417,22 @@ export class BikePhysics {
    * on the floor whatever the tumble does.
    */
   private clampCrashSpeed(dt: number): void {
-    if (this.state.mode !== BikeMode.Crashing) return;
     const s = this.state;
+    // The ceiling covers the whole time the rider is DOWN, which is Crashing
+    // AND Recovering. Ending it at the mode change left a residual: the tumble
+    // decayed correctly to 0.5 km/h, then Recovering ran the full grounded
+    // control laws on a 9° slope with only a fading drag against them and the
+    // speedo climbed back to 3 km/h — 1 → 7 km/h in the review footage — while
+    // the rider was still on the floor. Gravity was doing exactly what gravity
+    // does; the problem is that a bike lying on its side is not a bike rolling.
+    //
+    // Recovering ratchets more gently than the tumble does, so the last thing
+    // that happens before control returns is the bike being allowed to roll
+    // again rather than being released from a standstill.
+    const crashing = s.mode === BikeMode.Crashing;
+    if (!crashing && s.mode !== BikeMode.Recovering) return;
     const sp = s.velocity.length();
-    this.crashSpeedCap = Math.min(this.crashSpeedCap, sp) * Math.pow(0.55, dt);
+    this.crashSpeedCap = Math.min(this.crashSpeedCap, sp) * Math.pow(crashing ? 0.55 : 0.92, dt);
     if (sp > this.crashSpeedCap && sp > 1e-4) {
       s.velocity.multiplyScalar(this.crashSpeedCap / sp);
       if (BIKE_DIAG.enabled) BIKE_DIAG.dvCrash += s.velocity.length() - sp;
@@ -1589,6 +1703,7 @@ export class BikePhysics {
     s.crashSeverity = 0;
     this.setMode(BikeMode.Grounded);
     this.steerDemand = 0;
+    this.barGive = 0;
     this.targetLean = 0;
     this.crouchPrev = 0;
     this.pumpFired = -1e3;

@@ -34,8 +34,9 @@ import {
 import type { HudModel, IHud } from '../game/Contracts';
 import { RacePhase } from '../game/Contracts';
 import { HUD_PALETTE } from '../npr/Palette';
+import { RACER_COUNT } from '../game/WorldConstants';
 import { clamp01, dampHL } from '../core/MathX';
-import { HudCanvasRoot, HudLayer, type LayerPlacement } from './HudCanvas';
+import { DESIGN_H, HudCanvasRoot, HudLayer, type LayerPlacement } from './HudCanvas';
 import { buildTypeface } from './Typeface';
 import {
   BoostWidget,
@@ -48,6 +49,7 @@ import {
   StandingsWidget,
   WarningWidget,
   Widget,
+  standingsHeight,
 } from './Widgets';
 import { CountdownWidget, MenuScreen, type MenuKind, type ReplayFrameRect } from './Menus';
 
@@ -130,6 +132,13 @@ export class Hud implements IHud {
     // Widgets.ts) inside 158 would have left the silhouette 41 units of relief
     // out of 72 — a flat line pretending to be a mountain. 184 gives it 71.
     //
+    // It is now 61.8, because the rivals were taken off the skyline and given a
+    // rail of their own — they were colliding with the PLAYER's marker, which
+    // no lift can fix while both ride the same curve. See the PROFILE_RIVAL_*
+    // block in Widgets.ts. The height stays 184: the rail is the third band in
+    // a stack of four (header, rail, relief, two label rows) and every one of
+    // them is now the ink extent of its own contents.
+    //
     // The cost is 26 design units, 2.4% of the frame's height. The panel's
     // bottom edge lands at design y 200 against a highest-in-set horizon of
     // 300, so it is still furniture in the corner and still nowhere near the
@@ -140,8 +149,9 @@ export class Hud implements IHud {
     this.clock = this.mount(new ClockWidget(
       new HudLayer('clock', place('top', 0, 22, 470, 200)),
     ));
+    // The board's height is its rows, not a round number: see standingsHeight().
     this.standings = this.mount(new StandingsWidget(
-      new HudLayer('board', place('top-right', 26, 24, 430, 280)),
+      new HudLayer('board', place('top-right', 26, 24, 430, standingsHeight(RACER_COUNT))),
     ));
     this.corner = this.mount(new CornerWidget(
       new HudLayer('corner', place('top', 0, 232, 300, 190)),
@@ -156,8 +166,18 @@ export class Hud implements IHud {
     this.speed = this.mount(new SpeedWidget(
       new HudLayer('speed', place('bottom-right', 20, 16, 580, 360)),
     ));
+    // 552 rather than 680. This is the one panel that was measurably wider than
+    // its content needs: the meter is ten chunks and a label, and at 680 the
+    // chunks were 57 × 42 landscape rectangles in a slab that spanned 35% of
+    // the frame's width, dead centre, directly under the subject and over the
+    // dust plume — the emptiest 3.2% of frame the HUD owns, since it reads as a
+    // black rail until you have actually earned some boost. At 552 the chunks
+    // are square, which is a better chunk, and the bottom band stops being a
+    // continuous strip of furniture: 178 units of clear air to the position
+    // block on one side and 84 to the speedometer on the other. Everything in
+    // the widget derives from the layer width, so this is a one-number change.
     this.boost = this.mount(new BoostWidget(
-      new HudLayer('boost', place('bottom', 0, 26, 680, 120)),
+      new HudLayer('boost', place('bottom', 0, 26, 552, 120)),
     ));
     // 620 x 600, grown UPWARD from the 620 x 520 it was. The column now stacks
     // four things whose heights are derived from their own type rather than
@@ -185,6 +205,26 @@ export class Hud implements IHud {
     this.menu = this.mount(new MenuScreen(
       new HudLayer('menu', place('center', 0, 0, 1360, 860), { maxScale: 1.4 }),
     ));
+
+    // ── THE POPUP COLUMN IS LAID OUT AGAINST THE STANDINGS BOARD ─────────────
+    //
+    // Both are right-anchored and they overlap in x by 418 of the board's 430
+    // units, so the only thing keeping a six-deep popup pile off the last two
+    // rows of the board was arithmetic done once, by hand, in a comment. It was
+    // wrong, and it stayed wrong through a pitch change that made it less wrong.
+    //
+    // Here it is derived. `layerFloor` is where the board's backing store ends
+    // in design space and `layerTop` is where the popup layer's begins; the
+    // difference, plus clear air, is the ceiling the column may not cross. Note
+    // this is the worst case over aspect ratios rather than a design-space
+    // guess: the board is TOP-anchored and the column is CENTRE-anchored, so on
+    // anything taller than 16:9 the column moves down and away, and on anything
+    // wider `ui` is height-limited and the design-space figure is exact.
+    const board = this.standings.layer.placement;
+    const col = this.popups.layer.placement;
+    const boardFloor = board.dy + board.h;
+    const colTop = DESIGN_H * 0.5 - col.h * 0.5 + col.dy;
+    this.popups.setCeiling(boardFloor - colTop + 10);
 
     this.resize(width, height);
   }

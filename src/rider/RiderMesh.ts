@@ -49,7 +49,7 @@ import {
 import { CelMaterial, attachOutline, registerNprMesh, type CelOptions } from '../npr/CelMaterial';
 import { finalizeGeometry } from '../npr/OutlineGeometry';
 import { RAMPS, type RampPreset } from '../npr/Palette';
-import { clamp01, lerp } from '../core/MathX';
+import { clamp01, lerp, smoothstep } from '../core/MathX';
 import {
   BONE_INDEX,
   FOOT as F,
@@ -1460,20 +1460,77 @@ function buildHelmetParts(): BufferGeometry[] {
   // ONE solid with ONE silhouette and there is no interior edge to ink. The
   // deformation is applied in the head's local frame before the basis, because
   // "back" and "down" only mean anything there.
-  const shell = latheForm(shellProfile, 20, _ZERO3);
+  // ── ...and the occiput carries HARDWARE, because a dome cannot ────────────
+  //
+  // Removing the second solid killed the concentric ring, and the back of the
+  // helmet still read as a face — because what was left was a smooth dome, and
+  // a smooth dome is the one surface on which every shading iso-contour closes
+  // into a CIRCLE. The helmet material draws a contour around its highlight
+  // (`specInk`) and `bandedSpecular` steps at the same place; on a sphere both
+  // trace a circle of constant N·H, so the lid wore a hard-edged bright oval
+  // with a stroke round it. Isolated on `rider-closeup` from az 180: the oval
+  // survives `lineOpacity = 0`, survives hiding every inverted hull, and
+  // disappears the moment the helmet mesh itself is hidden. It is not ink. It
+  // is the shading of a blank sphere, and no exponent makes a circle not a
+  // circle.
+  //
+  // So the occiput gets what a real lid has: a raised centre spine with an
+  // exhaust channel either side of it. Three things follow. The iso-contours
+  // are cut, so nothing closes into an oval. The centre spine puts a vertical
+  // mark down the midline, and a midline mark is the most anti-facial shape
+  // there is — a face is bilateral about exactly that axis. And the back of the
+  // helmet finally looks like equipment rather than a painted scalp.
+  //
+  // All of it is a DEFORMATION OF THE SHELL'S OWN VERTICES. Modelling vents as
+  // separate solids would earn each one its own inverted-hull stroke, and two
+  // symmetric outlined blobs on the back of a head is a worse face than the one
+  // being fixed. 44 segments rather than 20 because the spine is 7.5 degrees
+  // wide and 18-degree segments cannot resolve it.
+  const shell = latheForm(shellProfile, 44, _ZERO3);
   {
     const pos = shell.getAttribute('position') as BufferAttribute;
+    /** Centre of the shell mass — the direction to push a surface feature. */
+    const cy = R * 0.15;
     for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i);
-      const y = pos.getY(i);
-      const z = pos.getZ(i);
-      // 0 at the ear line, 1 straight back.
-      const back = clamp01(-z / R);
-      // 1 at the brow line, 0 at the crown — the skirt drops, the crown does not.
-      const low = clamp01(1 - y / (R * 0.70));
-      pos.setX(i, x * 0.965);
-      pos.setZ(i, z * 1.10 - back * 0.010);
-      pos.setY(i, y - back * back * low * 0.034);
+      const x0 = pos.getX(i);
+      const y0 = pos.getY(i);
+      const z0 = pos.getZ(i);
+
+      // Occipital bulge: the rear of the lathe pushed back and its skirt
+      // dropped over the occiput. `smoothstep` on both masks rather than the
+      // raw `clamp01` they used to be — a clamp is C0, and its slope step at
+      // y = 0.70R was itself a crease running round the back of the lid.
+      const back = smoothstep(0, 1, clamp01(-z0 / R));
+      const low = smoothstep(0, 1, clamp01(1 - y0 / (R * 0.70)));
+      let x = x0 * 0.965;
+      let z = z0 * 1.10 - back * 0.010;
+      let y = y0 - back * back * low * 0.034;
+
+      // Spine and channels. `u` is the lateral position across the shell in
+      // radii; the ridge sits on the midline and the two channels flank it.
+      const u = x / R;
+      const ridge = Math.exp(-((u / 0.135) ** 2));
+      const groove = Math.exp(-(((Math.abs(u) - 0.30) / 0.135) ** 2));
+      // Only on the back, and not into the crown pole or down onto the skirt,
+      // where the feature would break the silhouette instead of marking the
+      // surface.
+      const h = y / R;
+      const vmask = smoothstep(-0.54, -0.20, h) * (1 - smoothstep(0.44, 0.86, h));
+      const amount = (ridge * 0.0095 - groove * 0.0078) * back * back * vmask;
+      if (amount !== 0) {
+        _vA.set(x, y - cy, z);
+        const len = _vA.length();
+        if (len > 1e-6) {
+          _vA.multiplyScalar(amount / len);
+          x += _vA.x;
+          y += _vA.y;
+          z += _vA.z;
+        }
+      }
+
+      pos.setX(i, x);
+      pos.setY(i, y);
+      pos.setZ(i, z);
     }
     shell.computeVertexNormals();
     shell.applyMatrix4(_headPlace);
@@ -1737,7 +1794,16 @@ function celOptionsFor(part: RiderPart, identityColor: Color): CelOptions {
     // exponent alone does not do. A scanline across the crown proved the shell
     // was already resolving to flat plateaus and still reading as gloss,
     // because nothing put a line round the glint. See CelOptions.specInk.
-    o.specInk = 0.90;
+    //
+    // 0.45, not 0.90. A contour drawn round a highlight is a mark when the
+    // highlight is a glint and an OUTLINE when the highlight is a third of the
+    // shell — and on the back of the head an outlined bright oval is an eye.
+    // The occiput now has a spine and two channels cutting the iso-contours so
+    // the shape cannot close (see buildHelmetParts), and at half the weight the
+    // remaining line reads as the edge of a glint instead of as a drawn
+    // feature. Both halves are needed: the geometry stops it being a circle,
+    // this stops it being emphatic.
+    o.specInk = 0.45;
     // ...and less matcap, because with a real highlight present the matcap is
     // no longer carrying the gloss and its own soft content is just haze. The
     // matcap is sampled by the VIEW-space normal, so its features are pinned to

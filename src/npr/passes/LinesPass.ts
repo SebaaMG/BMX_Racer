@@ -72,7 +72,8 @@
 import { Color, GLSL3, IUniform, LinearFilter, PerspectiveCamera, RGBAFormat, UnsignedByteType, Vector2, WebGLRenderer, WebGLRenderTarget } from 'three';
 import { GLSL_COMMON, GLSL_FRAG_OUT } from '../ShaderChunks';
 import { NPR } from '../NprGlobals';
-import { INK, LINES } from '../Palette';
+import { materialIdFor } from '../CelMaterial';
+import { INK, LINES, RAMPS } from '../Palette';
 import { FullscreenPass } from './Fullscreen';
 
 /**
@@ -111,6 +112,111 @@ const DEPTH_QUANT_ULPS = LINES.depthQuantUlps;
  * fading the hue toward the background is the photographic one.
  */
 const CONTOUR_FOG_CAP = LINES.contourFogCap;
+
+/**
+ * PAINT IDS — the material ids that describe a surface whose shading is
+ * deliberately COARSER than its mesh.
+ *
+ * The terrain prepass writes its shading normal out of the normal MAP, at the
+ * same blurred `formSample` level the main pass paints with, precisely so that
+ * "the Sobel does not ink creases the shading does not have". Its DEPTH,
+ * however, comes from the rasteriser, at the heightfield's full resolution.
+ * The two channels therefore describe two different surfaces: a smooth painted
+ * hillside, and a mesh with every gully lip and fold in it.
+ *
+ * Every stray stroke in this pass's defect list came out of that gap:
+ *
+ *  • `treeline-silhouette` — fifteen straight needles, several in parallel
+ *    pairs, 200-600 px long, over ground the paint draws as one continuous
+ *    slope. Probed at (606..609, 800): the depth channel steps 20.8 m → 17.2 m
+ *    in ONE pixel while the normal turns 0.129 (7 degrees) and the colour does
+ *    not change at all. Those are terrain SELF-OCCLUSION contours — the near
+ *    lip of a fold hiding the ground behind it, which is why they come in
+ *    pairs (the occluding edge and the re-emergence edge) and converge to a
+ *    vanishing point. They are geometrically real and pictorially absent.
+ *    (They are NOT LOD seams: the camera sat inside clipmap ring L0, whose
+ *    nearest boundary was 48 m away, and these were at 10-21 m.)
+ *
+ *  • `ridge-exposure` — the closed quadrilaterals and pentagons on the flat
+ *    trail are the id channel drawing the `terrain:dirt` / `terrain:trail`
+ *    zone boundary, i.e. the corridor apron painted onto the terrain, one
+ *    coarse zone-mip texel at a time.
+ *
+ *  • `valley-vista` — the 400-900 px aliased staircase is the same detector on
+ *    the `terrain:rock` / `terrain:scree` boundary, stepping at the zone map's
+ *    mip texel size, which `sampleZone` deliberately holds at about two screen
+ *    pixels.
+ *
+ * The rule that follows is one rule, not three: ON A PAINTED SURFACE THE INK
+ * FOLLOWS THE PAINT. A zone boundary is a colour step and never a stroke, and
+ * a depth step is only inked to the extent that the paint's own normal turns
+ * there too. Everything else in the frame — rock, rider, bike, ribbon,
+ * furniture — shades from the same normals it is built from, so none of this
+ * applies to it and none of it is gated.
+ *
+ * The list is built from the same convention `TerrainMaterial` uses when it
+ * fills `uZoneIds` (`terrain:${ZONE_RAMPS[kind].name}`), through the same
+ * memoised `materialIdFor`, so both sides land on the same integers whichever
+ * module is evaluated first. It is NOT imported from `src/terrain` on purpose:
+ * that would put the whole terrain module graph inside the post stack. If the
+ * naming convention over there ever changes, `setPaintIds` is the seam — call
+ * it with the authoritative array and this default goes away.
+ */
+const PAINT_RAMPS = [
+  RAMPS.rock, RAMPS.dirt, RAMPS.grass, RAMPS.scree, RAMPS.snow, RAMPS.water, RAMPS.trail,
+];
+const MAX_PAINT_IDS = 8;
+
+/**
+ * PEN PRESSURE — the darkness of an interior stroke, from the SIZE of the fold
+ * it is drawn on.
+ *
+ * The pass shipped with a pen-pressure model that could not press. Every
+ * detector ends in a `smoothstep`, so on any edge that genuinely clears its
+ * threshold the response is exactly 1.0 — and the model applied its weight as
+ * `pow(interior, 1.0 / weight)`, which at interior == 1.0 is the identity for
+ * every weight there is. The only surviving term was a `mix(0.82, 1.0, weight)`
+ * spanning 18%, so a scatter rock's alpha was measured at 0.85, 0.89, 0.90,
+ * 0.91 across four facet edges whose dihedral angles ran from 27 to 55 degrees.
+ * That is what makes a boulder read as a wireframe: not that the edges are
+ * wrong — every one of them is a real fold — but that a 27-degree bevel and a
+ * 55-degree corner are inked at the same pressure as each other and nearly the
+ * same pressure as the silhouette. `LINES.curvatureWeight` and `curvatureFloor`
+ * were not "thinning nothing" because the weld was missing; the weld runs, and
+ * `aCurvature` on that rock measured 0.43-0.79. They were thinning nothing
+ * because the term they feed is raised to a power of a quantity pinned at one.
+ *
+ * So the width model keeps `pow` — it shapes the antialiased shoulder, which is
+ * genuinely where width lives — and the DARKNESS is taken over by a second,
+ * much higher knee on the same evidence the detector used. At the detection
+ * threshold the pen is at `x`; by the time the fold is a hard corner it is at
+ * `y`. The old constant 0.86 * 1.0 sits at the top of that range, so nothing
+ * that used to be a full-strength line loses anything.
+ *
+ * Both belong in `LINES` in Palette.ts beside `curvatureWeight`; that file is
+ * owned elsewhere this pass, so they live here and are reported.
+ */
+const PRESSURE_RANGE = new Vector2(0.45, 1.05);
+/**
+ * Where the pressure ramp starts and ends, as multiples of the crease
+ * threshold. 0.95 puts the lightest pen just under the detector's own knee;
+ * 2.66 puts the heaviest at a normal step of 0.85, which is a corner of about
+ * 50 degrees. Measured on `summit-rider`'s foreground boulder: facet steps of
+ * 0.46 / 0.69 / 0.75 / 0.93 now ink at 0.49 / 0.68 / 0.72 / 0.90 instead of
+ * 0.85 / 0.90 / 0.88 / 0.89.
+ */
+const PRESSURE_FOLD = new Vector2(0.95, 2.66);
+/**
+ * How much the paint has to turn before a depth step on a PAINTED surface is
+ * allowed to be inked, again as multiples of the crease threshold. Below the
+ * low end the stroke is fully suppressed; above the high end it is untouched.
+ * 0.34-1.00 is 0.109-0.32 of normal step in the near field, i.e. from about 6
+ * to about 19 degrees across one pixel. The treeline needles sit at 0.129 and
+ * are attenuated to 8% of their old alpha; a berm lip the paint actually shows
+ * measures 0.6-0.9 and is untouched.
+ */
+const CORROBORATION = new Vector2(0.34, 1.0);
+
 export const LINE_DEBUG = {
   off: 0,
   field: 1,
@@ -125,6 +231,8 @@ export const LINE_DEBUG = {
   probeNormal: 8,
   /** Diagnostic packing: r dRel*200, g the raw max-axis response*200, b eDepth. */
   probeDepth: 9,
+  /** Diagnostic packing: r pen pressure, g paint pair, b corroboration, a alpha. */
+  probePaint: 10,
 } as const;
 
 const FRAGMENT = /* glsl */ `
@@ -164,6 +272,15 @@ const FRAGMENT = /* glsl */ `
   uniform float uCharacterBoost;
   uniform vec3  uInkColor;
   uniform float uDebug;
+  /** Material ids whose shading is coarser than their mesh. See PAINT_RAMPS. */
+  uniform float uPaintIds[${MAX_PAINT_IDS}];
+  uniform int   uPaintIdCount;
+  /** Lightest and heaviest pen, as multipliers on uStrength. */
+  uniform vec2  uPressure;
+  /** Pressure ramp bounds, in multiples of the lateral crease threshold. */
+  uniform vec2  uPressureFold;
+  /** Corroboration ramp bounds, same units. Painted surfaces only. */
+  uniform vec2  uCorroborate;
 
   uniform vec3  uFogColors[4];
   uniform float uFogStrengths[4];
@@ -178,6 +295,23 @@ const FRAGMENT = /* glsl */ `
     vec2(-1.0,  0.0), vec2(0.0,  0.0), vec2(1.0,  0.0),
     vec2(-1.0,  1.0), vec2(0.0,  1.0), vec2(1.0,  1.0)
   );
+
+  /**
+   * Is this material id a PAINTED surface — one whose shading normal is a
+   * deliberately blurred version of its own geometry?
+   *
+   * An exact compare against a short list, not a range: the ids are small
+   * integers held exactly by a half float, but nothing guarantees the terrain
+   * zones stay contiguous once another material registers between them.
+   */
+  float isPaintId(float id) {
+    float hit = 0.0;
+    for (int k = 0; k < ${MAX_PAINT_IDS}; k++) {
+      if (k >= uPaintIdCount) break;
+      hit = max(hit, 1.0 - step(0.25, abs(id - uPaintIds[k])));
+    }
+    return hit;
+  }
 
   /** Window-space depth to view-space metres. */
   float viewDepth(float d) {
@@ -307,6 +441,24 @@ const FRAGMENT = /* glsl */ `
     float ky = uNormalEdge.y * (ty / uNormalEdge.x);
     float eNormal = max(smoothstep(tx, tx + kx, mx), smoothstep(ty, ty + ky, my));
 
+    // ── The same threshold, asked of the PAINT instead of the surface ───────
+    //
+    // tx and ty fold the along-ray part of the span into the threshold, which
+    // is exactly right for the crease test: a span that runs away from the
+    // camera really does cover more surface, and more surface is allowed to
+    // turn more normal. It is exactly wrong for the two questions below, which
+    // are about the PICTURE rather than the mesh — because at a depth STEP the
+    // along-ray term IS the step. Measured across the treeline needles, sx was
+    // 3.58 m, which drives tx to 16.3; against a maximum possible normal step
+    // of 2 the question "does the paint turn here" would be answered no for
+    // every step in the frame, including the ones that are drawn.
+    //
+    // So this threshold uses the LATERAL footprint alone, which is the paint's
+    // own resolution: how much a smooth surface could turn across the width of
+    // one pixel, and nothing about how far that pixel reaches into the screen.
+    float tLateral = max(uNormalEdge.x, lat / uCreaseRadius);
+    float paintTurn = max(mx, my);
+
     // ── Depth discontinuity ─────────────────────────────────────────────────
     float wC = w[4];
     float lapH = abs(w[3] + w[5] - 2.0 * wC);
@@ -346,6 +498,10 @@ const FRAGMENT = /* glsl */ `
 
     // ── Material id ─────────────────────────────────────────────────────────
     float eId = 0.0;
+    // 1 only where this pixel AND all four of its cardinal neighbours sit on a
+    // painted surface. Uncovered neighbours do not break the pair: the sky
+    // boundary is the contour's business and it has its own term.
+    float paintPair = isPaintId(aC.x);
     {
       int cardinal[4] = int[4](1, 3, 5, 7);
       for (int k = 0; k < 4; k++) {
@@ -356,16 +512,62 @@ const FRAGMENT = /* glsl */ `
         // the hull owns silhouettes.
         float adjacent = 1.0 - step(0.25, abs(dep[i] - dC) / dC);
         eId = max(eId, a.w * adjacent * step(uIdThreshold, abs(a.x - aC.x)));
+        paintPair = min(paintPair, mix(1.0, isPaintId(a.x), a.w));
       }
     }
+
+    // ── On a painted surface the ink follows the paint ──────────────────────
+    //
+    // Two suppressions, one rule. See the PAINT_RAMPS note above for what
+    // "painted" means and for the measurements behind both numbers.
+    //
+    // The id detector goes to zero outright. Between two terrain zones there is
+    // no object boundary to draw — there is a change of MATERIAL on one
+    // continuous surface, and a change of material is a change of colour. The
+    // zone map is also fetched at a mip level chosen to put one texel across
+    // about two screen pixels, so what the detector was tracing was never even
+    // the boundary's true shape: it was that boundary's staircase, at 4-8 px a
+    // step, which is why valley-vista carried 900 px of aliased contour over
+    // clean snow. Nothing else in the frame is affected: the ribbon lives at a
+    // different id from the corridor painted under it, so the trail edge — the
+    // one id line in that shot worth having — is untouched.
+    //
+    // The depth detector is not switched off, it is made answerable to the
+    // picture. It keeps whatever share of itself the paint's own fold supports.
+    eId *= 1.0 - paintPair;
+    float corroborated =
+      smoothstep(uCorroborate.x * tLateral, uCorroborate.y * tLateral, paintTurn);
+    eDepth = mix(eDepth, eDepth * corroborated, paintPair);
 
     // ── Variable weight ─────────────────────────────────────────────────────
     // Same curvature response as the hull's vertex program, so an interior
     // stroke that runs into a silhouette stroke matches its weight where they
-    // meet rather than stepping.
+    // meet rather than stepping. This shapes the stroke's WIDTH — the power
+    // below narrows or widens the antialiased shoulder — and nothing else.
     float curv = smoothstep(uCurvature.y, 1.0, aC.y);
     float weight = mix(1.0 - uCurvature.x * 0.55, 1.0 + uCurvature.x * 0.85, curv);
     weight = clamp(weight, 0.35, 1.95);
+
+    // ── Pen pressure ────────────────────────────────────────────────────────
+    //
+    // How hard the pen is pressed, from HOW BIG the fold is rather than from
+    // whether the detector fired on it. Every detector above ends in a
+    // smoothstep and therefore saturates: past its knee a 27-degree bevel and
+    // a 55-degree corner both report exactly 1.0, and every downstream shaping
+    // term that consumed that number was consuming a constant. This is the
+    // second knee, much higher up, on the same evidence.
+    //
+    // Each channel brings its own reading of the fold and only speaks where it
+    // actually fired:
+    //   NORMAL  how far the paint turns, against the lateral crease threshold
+    //   DEPTH   how big the step is, as a multiple of the detection threshold
+    //   ID      a fixed, firm pressure. A material change is not a fold at
+    //           all, so it has no depth to read; it is a definite edge drawn
+    //           at a definite weight, a little under a hard corner.
+    float pressN = smoothstep(uPressureFold.x * tLateral, uPressureFold.y * tLateral, paintTurn);
+    float pressD = smoothstep(1.0, 3.2, dRel / max(uDepthEdge.x, EPS));
+    float press = max(max(pressN * eNormal, pressD * eDepth), 0.80 * eId * uIdWeight);
+    float pressure = mix(uPressure.x, uPressure.y, press);
 
     // ── Two fades, not one ──────────────────────────────────────────────────
     // INTERIOR lines have to die with distance: past a few hundred metres a
@@ -399,7 +601,12 @@ const FRAGMENT = /* glsl */ `
     // uStrength 0.86, the weight term 0.95, and a power of 1/0.72 on a value
     // already under 1 — so a fully-detected edge lands at 0.79 alpha, not 1.
     //
-    // On a crease that is right. On a SILHOUETTE it is not, and the difference
+    // On a crease that is right — except that the chain was not doing it. The
+    // pen-pressure half now lives in the pressure term above, for the reason
+    // given there; what stays here is the WIDTH half, which is what pow was
+    // actually good for.
+    //
+    // On a SILHOUETTE none of it applies, and the difference
     // is measurable. Probed across the summit-wide skyline: the contour term
     // fired at 255 on every one of 29 columns and the hull mask read 0 on all
     // of them — the detector never dropped a single segment and nothing
@@ -412,8 +619,7 @@ const FRAGMENT = /* glsl */ `
     // detected with, and only distance — contourFade, floored at 0.46 — is
     // permitted to lighten it. The interior field keeps the pen-pressure model
     // untouched, and the two are combined by taking whichever is stronger.
-    float interiorA =
-      pow(saturate1(interior), 1.0 / weight) * uStrength * mix(0.82, 1.0, weight);
+    float interiorA = pow(saturate1(interior), 1.0 / weight) * uStrength * pressure;
     float alpha = max(interiorA, contourE);
 
     // How much of this pixel's ink is silhouette rather than interior. Drives
@@ -463,6 +669,11 @@ const FRAGMENT = /* glsl */ `
         fragColor = vec4(contour, hull, 1.0, saturate1(alpha));
         return;
       }
+      if (uDebug > 9.5) {
+        fragColor = vec4(saturate1(press), paintPair, saturate1(corroborated),
+                         saturate1(alpha));
+        return;
+      }
       if (uDebug > 8.5) {
         fragColor = vec4(saturate1(dRel * 200.0), saturate1(lapMax * dC * 200.0),
                          saturate1(eDepth), 1.0);
@@ -509,6 +720,13 @@ export class LinesPass {
     this.scale = options.scale ?? 1;
     this.pixelHeight = height;
 
+    // Padded to the array's declared length — GLSL sizes the uniform block from
+    // the declaration, and a short JS array leaves the tail undefined.
+    const paintIds = new Array<number>(MAX_PAINT_IDS).fill(-1);
+    PAINT_RAMPS.slice(0, MAX_PAINT_IDS).forEach((ramp, i) => {
+      paintIds[i] = materialIdFor(`terrain:${ramp.name}`);
+    });
+
     this.target = new WebGLRenderTarget(
       Math.max(1, Math.round(width * this.scale)),
       Math.max(1, Math.round(height * this.scale)),
@@ -553,6 +771,11 @@ export class LinesPass {
       uCharacterBoost: { value: 1.22 },
       uInkColor: { value: new Color().copy(INK) },
       uDebug: { value: 0 },
+      uPaintIds: { value: paintIds },
+      uPaintIdCount: { value: Math.min(PAINT_RAMPS.length, MAX_PAINT_IDS) },
+      uPressure: { value: PRESSURE_RANGE.clone() },
+      uPressureFold: { value: PRESSURE_FOLD.clone() },
+      uCorroborate: { value: CORROBORATION.clone() },
       uFogColors: NPR.uFogColors,
       uFogStrengths: NPR.uFogStrengths,
       uFogNear: NPR.uFogNear,
@@ -576,6 +799,21 @@ export class LinesPass {
 
   setDebug(mode: number): void {
     this.uniforms.uDebug.value = mode;
+  }
+
+  /**
+   * Override which material ids count as PAINTED — surfaces whose shading
+   * normal is deliberately coarser than their own mesh, and on which the ink
+   * therefore follows the paint rather than the geometry. See PAINT_RAMPS.
+   *
+   * The default is derived from the terrain zone naming convention. This is the
+   * seam for anything that wants to state it authoritatively instead.
+   */
+  setPaintIds(ids: readonly number[]): void {
+    const padded = new Array<number>(MAX_PAINT_IDS).fill(-1);
+    for (let i = 0; i < Math.min(ids.length, MAX_PAINT_IDS); i++) padded[i] = ids[i];
+    this.uniforms.uPaintIds.value = padded;
+    this.uniforms.uPaintIdCount.value = Math.min(ids.length, MAX_PAINT_IDS);
   }
 
   get strength(): number {

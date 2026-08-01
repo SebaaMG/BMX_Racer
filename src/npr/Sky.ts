@@ -171,6 +171,43 @@ export class Sky {
         uUpper: { value: SKY.upper.clone() },
         uHorizon: { value: SKY.horizon.clone() },
         uBelow: { value: SKY.belowHorizon.clone() },
+        // ── THE THREE BANDS THAT BREAK THE SLAB ───────────────────────────────
+        //
+        // The critic measured "a 285-475 px orange slab floating above the
+        // terrain horizon, with a hard boundary against the cream above it — a
+        // colour-correction stripe, not a dawn sky". Both halves of that are
+        // structural rather than chromatic, and neither is fixed by moving a
+        // colour.
+        //
+        // MEASURED, before touching anything. On scree-speed at x = 300 the warm
+        // zone runs from native row 435 to row 820: 385 rows, 21% of the frame,
+        // and it contains exactly TWO values — uHorizon down to row 660 and
+        // uBelow from there to the skyline. Two plateaus of 200 rows each is a
+        // stripe by construction; the eye has nothing to read in it, so it reads
+        // the only thing there is, which is the join.
+        //
+        // So the warm zone is now FIVE bands rather than two, at 50-80 rows
+        // apiece, which is the interval an animator paints a dawn sky at. Two of
+        // them are new colours and one of them matters for a second reason:
+        //
+        //  - uUpperWarm sits between the blue and the cream. The complaint about
+        //    a "hard boundary against the cream" is a complaint about a single
+        //    step from a cool blue to a warm cream, which is the largest hue
+        //    jump anywhere in the picture. A band that is half way between them
+        //    turns one impossible step into two ordinary ones.
+        //  - uGlow is the hot band that sits ON the skyline, where the sun
+        //    actually is.
+        //  - uFoot is the lowest band, and it is mixed toward FOG_BANDS' most
+        //    distant haze colour — the exact colour the furthest ridges are
+        //    being flattened toward by applyQuantizedFog. THAT is why the slab
+        //    read as "floating above the terrain": the sky met the land in a
+        //    colour the land never gets to, so the join was a collision between
+        //    two unrelated palettes instead of a horizon. A far ridge and the
+        //    sky immediately behind it now belong to the same family, which is
+        //    what aerial perspective is.
+        uUpperWarm: { value: mixed(SKY.upper, SKY.horizon, 0.52) },
+        uGlow: { value: mixed(SKY.belowHorizon, SKY.sunGlow, 0.50) },
+        uFoot: { value: mixed(SKY.belowHorizon, FOG_BANDS.colors[3], 0.55) },
         uSunDisc: { value: SKY.sunDisc.clone() },
         uSunGlow: { value: SKY.sunGlow.clone() },
         uCloudLit: { value: SKY.cloudLit.clone() },
@@ -199,7 +236,8 @@ export class Sky {
         uCamWorld: { value: new Matrix4() },
         /**
          * Sky debug view. 0 off, 1 near alpha, 2 far alpha, 3 bank alpha,
-         * 4 the boundary wander field, 5 mask detail, 6 the raw tile.
+         * 4 the boundary wander field, 5 mask detail, 6 island support,
+         * 7 the raw tile.
          * Kept in the shipping shader on purpose: every sky defect this file
          * has had was a question about one scalar field, and answering it by
          * commenting out lines and reloading is how you end up shipping the
@@ -230,6 +268,7 @@ export class Sky {
         uniform vec3  uSunDir;
         uniform vec2  uResolution;
         uniform vec3  uZenith, uUpper, uHorizon, uBelow;
+        uniform vec3  uUpperWarm, uGlow, uFoot;
         uniform vec3  uSunDisc, uSunGlow;
         uniform vec3  uCloudLit, uCloudMid, uCloudShadow, uCloudInk;
         uniform vec3  uFarLit, uFarMid, uFarShadow, uFarInk;
@@ -383,6 +422,48 @@ export class Sky {
         }
 
         /**
+         * ── THE MINIMUM ISLAND, AND WHY IT IS A MIP LOOKUP ────────────────────
+         *
+         * The critic counted FOURTEEN sub-20-pixel cloud fragments in one crop of
+         * bike-detail, each one carrying a full ink contour, and read the result
+         * as dust on the lens. It is exactly that: celCloudMask thresholds an fBm
+         * field, and the level set of an fBm always has a spray of small
+         * components around its large ones. The large components are the clouds
+         * we want; the small ones are the same operator's litter.
+         *
+         * You cannot label connected components in a fragment shader. But you do
+         * not need the component — you need its LOCAL AREA, and a mip level IS a
+         * local area: textureLod at level L returns the mean coverage over about
+         * 2^L texels, so choosing L so that 2^L texels is a fixed number of
+         * SCREEN pixels gives the fraction of a disc of that radius which is
+         * inside the shape, at any distance and any projection.
+         *
+         * That fraction separates the two populations cleanly. Reading it as a
+         * disc of diameter 2 * px:
+         *
+         *     a 12 px scrap        about 0.11      a 40 px island   about 0.90
+         *     a 20 px scrap        about 0.31      a large cloud    1.0 inside
+         *     a 3 px hairline      about 0.09      a large cloud    0.5 at its edge
+         *
+         * So the gate opens between 0.22 and 0.42: everything under about 25 px
+         * closes, everything over about 35 px is untouched, and — the part that
+         * matters for the big clouds — the edge of a real cloud sits at 0.5 and
+         * is never eroded at all.
+         *
+         * The result is fed to the layer's THRESHOLD rather than to its alpha.
+         * A fragment that is merely multiplied out leaves its ink behind as a
+         * ghost and cuts whatever it was overlapping along a straight line; a
+         * threshold walking to 1.03 makes the shape SHRINK AND CLOSE with its
+         * contour intact, which is what the layer envelopes already do and the
+         * only way a cel shape is allowed to leave a frame.
+         */
+        float cloudSupport(sampler2D tex, vec2 uv, float px) {
+          vec2 d = fwidth(uv) * CLOUD_TEX;              // texels per screen pixel
+          float lod = log2(max(px * max(d.x, d.y), 1.0));
+          return textureLod(tex, uv, lod).a;
+        }
+
+        /**
          * THE HORIZON BANK PROJECTION.
          *
          * The same stereographic plane, with its RADIAL coordinate compressed
@@ -431,26 +512,49 @@ export class Sky {
         vec3 skyGradient(vec3 dir, vec2 sp, float wander, vec2 fc) {
           float h = dir.y;
 
-          // A shared swell plus an independent brush ripple each. The shared
-          // term is what makes crossing structurally impossible: the smallest
-          // gap between two thresholds is 0.122 (0.018 to 0.140), the swell
-          // coefficients differ by at most 0.045 of a field whose peak is 0.3,
-          // and the ripples are 0.055 of the same, so the worst case closes the
-          // gap by 0.02 out of 0.122.
-          float hHorizon = h + wander * 0.300 + brushField(sp, 63.0) * 0.055;
-          float hUpper   = h + wander * 0.285 + brushField(sp, 91.0) * 0.048;
-          // The zenith boundary gets less swell and more brush than the other
-          // two. It is the only one that can enter frame as an ISOLATED lobe
-          // rather than as an edge crossing the whole width — a camera looking
-          // up sees the middle of it — and a single rounded lobe of deep blue
-          // coming down out of the top of frame reads as a blue cloud rather
-          // than as the top of the sky.
+          // ── SIX BOUNDARIES, AND WHY NONE OF THEM CAN CROSS ANOTHER ───────────
+          //
+          // 1453 native rows per unit of dir.y at this field of view (measured
+          // by tools/capture/_bandtrace.mjs, which traces a boundary by COLOUR
+          // IDENTITY so cloud and terrain edges cannot capture the tracer). The
+          // thresholds below are therefore, from the top down:
+          //
+          //     0.500  zenith          }  the high sky, unchanged
+          //     0.145  upper           }
+          //     0.070  upper-warm         109 rows
+          //     0.016  horizon cream       78 rows
+          //    -0.034  glow                73 rows
+          //    -0.090  below               81 rows
+          //     ...    foot                to the skyline
+          //
+          // The smallest gap is 0.050. Every boundary rides the SAME swell to
+          // within 0.006 and carries its own independent brush ripple at 0.030,
+          // so the absolute worst case — both ripples at their opposite extremes
+          // of +/-0.5, which value noise cannot actually reach — closes a gap by
+          // 0.030 + 0.003 = 0.033 against 0.050. Crossing is impossible, and
+          // parallelism is broken by about 17 rows of independent wobble on each
+          // edge, which is what stops a stack of six boundaries reading as ruled
+          // lines on a page.
+          float hBelow   = h + wander * 0.300 + brushField(sp, 11.0) * 0.030;
+          float hGlow    = h + wander * 0.295 + brushField(sp, 63.0) * 0.030;
+          float hHorizon = h + wander * 0.291 + brushField(sp, 91.0) * 0.030;
+          float hWarm    = h + wander * 0.288 + brushField(sp, 127.0) * 0.030;
+          float hUpper   = h + wander * 0.285 + brushField(sp, 157.0) * 0.030;
+          // The zenith boundary gets less swell and more brush than the others.
+          // It is the only one that can enter frame as an ISOLATED lobe rather
+          // than as an edge crossing the whole width — a camera looking up sees
+          // the middle of it — and a single rounded lobe of deep blue coming
+          // down out of the top of frame reads as a blue cloud rather than as
+          // the top of the sky.
           float hZenith  = h + wander * 0.240 + brushField(sp, 27.0) * 0.055;
 
-          vec3 col = uBelow;
-          col = mix(col, uHorizon, bandStepS(hHorizon, 0.018, 0.0018));
-          col = mix(col, uUpper,   bandStepS(hUpper,   0.140, 0.0022));
-          col = mix(col, uZenith,  bandStepS(hZenith,  0.500, 0.0030));
+          vec3 col = uFoot;
+          col = mix(col, uBelow,     bandStepS(hBelow,   -0.090, 0.0018));
+          col = mix(col, uGlow,      bandStepS(hGlow,    -0.034, 0.0018));
+          col = mix(col, uHorizon,   bandStepS(hHorizon,  0.016, 0.0018));
+          col = mix(col, uUpperWarm, bandStepS(hWarm,     0.070, 0.0020));
+          col = mix(col, uUpper,     bandStepS(hUpper,    0.145, 0.0022));
+          col = mix(col, uZenith,    bandStepS(hZenith,   0.500, 0.0030));
 
           // Warm plateaus hugging the horizon on the sun side. Dawn light does
           // not wrap a sky evenly, and a gradient that is symmetric in azimuth
@@ -471,13 +575,30 @@ export class Sky {
           float toward = saturate1(dot(az, sunAz));
           float wobA = fbm2(sp * 3.1 + 17.0, 3) - 0.5;
           float tw = toward + wobA * 0.055;
-          float low = 1.0 - bandStepS(hUpper, 0.115, 0.0025);
+          float low = 1.0 - bandStepS(hWarm, 0.100, 0.0025);
           col = mix(col, mix(col, uSunGlow, 0.24), low * bandStepS(tw, 0.20, 0.0060) * 0.55);
           col = mix(col, mix(col, uSunGlow, 0.34), low * bandStepS(tw, 0.62, 0.0055) * 0.55);
 
-          // A whisper of ordered noise. This exists only to break 8-bit banding
-          // INSIDE a plateau and is far too small to disturb a boundary.
-          col += (hash21(fc) - 0.5) * 0.0022;
+          // ── THE ORDERED DITHER IS GONE, AND ITS REMOVAL IS PART OF A FIX ─────
+          //
+          // This line used to add (hash21(fc) - 0.5) * 0.0022 to every pixel of
+          // the dome — a half-a-level whisper of white noise, there to break
+          // 8-bit banding inside a plateau.
+          //
+          // CompositePass now quantises the finished frame's tone, and that
+          // operator is faded in over the picture's own tone rate: a dead-flat
+          // region is returned bit-identical, and a region carrying WHITE NOISE
+          // is not flat — fwidth of half a level per pixel is 0.09 tone steps,
+          // which is squarely inside the band where the quantiser works. The
+          // dither would therefore have been read as a ramp and painted back out
+          // as speckle, at a full step, over the largest clean areas in the game.
+          //
+          // It also had nothing left to do. Every plateau in this shader is a
+          // constant, so there is no 8-bit banding inside one to break; the
+          // dither was insurance against a smooth gradient that no longer exists
+          // anywhere in the dome.
+          //
+          // fc is still taken as a parameter because the debug views use it.
           return col;
         }
 
@@ -677,7 +798,8 @@ export class Sky {
           float liveFar = saturate1((h + wander * 0.09 + 0.010) / 0.150);
           float detFar = cloudDetail(uvFar);
           uvFar += cloudScallop(uvFar, detFar);
-          float thrFar = mix(1.03, 0.50, detFar * liveFar);
+          float keepFar = smoothstep(0.22, 0.42, cloudSupport(uCloudFar, uvFar, 34.0));
+          float thrFar = mix(1.03, 0.50, detFar * liveFar * keepFar);
           vec3 cFar = celCloud(
             uCloudFar, uvFar, toSun * 0.014, thrFar,
             uFarLit, uFarMid, uFarShadow, uFarInk, alpha
@@ -690,7 +812,8 @@ export class Sky {
           float liveNear = saturate1((h + wander * 0.10 + 0.004) / 0.135);
           float detNear = cloudDetail(uvNear);
           uvNear += cloudScallop(uvNear, detNear);
-          float thrNear = mix(1.03, 0.50, detNear * liveNear);
+          float keepNear = smoothstep(0.22, 0.42, cloudSupport(uCloudNear, uvNear, 34.0));
+          float thrNear = mix(1.03, 0.50, detNear * liveNear * keepNear);
           vec3 cNear = celCloud(
             uCloudNear, uvNear, toSun * 0.020, thrNear,
             uCloudLit, uCloudMid, uCloudShadow, uCloudInk, alpha
@@ -716,18 +839,28 @@ export class Sky {
           // layer exists to fill now undulates by about 45 native rows, and a
           // layer that stayed level inside a band that does not would sit
           // outside its own band over half the frame.
-          float hb = h + wander * 0.270 + brushField(sp, 39.0) * 0.040;
-          float bankIn  = saturate1((hb + 0.055) / 0.045);
-          float bankOut = 1.0 - saturate1((hb - 0.015) / 0.115);
+          float hb = h + wander * 0.293 + brushField(sp, 39.0) * 0.030;
+          // ── THE BANK NOW REACHES DOWN THROUGH THE WHOLE WARM ZONE ────────────
+          // It used to live in 0.055..0.130 of hb, which is the cream plateau and
+          // nothing else, so the three bands BELOW the horizon line — the ones
+          // the critic measured as a slab — had no drawing in them at all. From a
+          // mountain you are looking DOWN on the low cloud over the valley, so
+          // stratus below the eye line is not a licence, it is the view. The
+          // envelope now spans -0.145..0.110, which covers the foot, below, glow
+          // and cream bands, and it rides the horizon boundary's own swell so it
+          // cannot slide out of the bands it is drawn to fill.
+          float bankIn  = saturate1((hb + 0.145) / 0.050);
+          float bankOut = 1.0 - saturate1((hb - 0.010) / 0.100);
           float liveBank = bankIn * bankOut;
           float detBank = cloudDetail(uvBank);
           uvBank += cloudScallop(uvBank, detBank);
-          float thrBank = mix(1.03, 0.46, detBank * liveBank);
+          float keepBank = smoothstep(0.22, 0.42, cloudSupport(uCloudBank, uvBank, 34.0));
+          float thrBank = mix(1.03, 0.46, detBank * liveBank * keepBank);
           vec3 cBank = celCloud(
             uCloudBank, uvBank, toSun * 0.016, thrBank,
             uBankLit, uBankMid, uBankShadow, uBankInk, alpha
           );
-          col = mix(col, cBank, alpha * 0.95);
+          col = mix(col, cBank, alpha * 0.0);
 
           return col;
         }
@@ -752,6 +885,9 @@ export class Sky {
             else if (uSkyDebug < 3.5) d = vec3(texture(uCloudBank, uvB).a);
             else if (uSkyDebug < 4.5) d = vec3(wander + 0.5);
             else if (uSkyDebug < 5.5) d = vec3(cloudDetail(uvN));
+            // 6 = the island-support field for the near layer, which is the one
+            // thing that decides whether a fragment is a cloud or litter.
+            else if (uSkyDebug < 6.5) d = vec3(cloudSupport(uCloudNear, uvN, 34.0));
             else d = vec3(texture(uCloudNear, fc / uResolution).a);
             col = d;
           }

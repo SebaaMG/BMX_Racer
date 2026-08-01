@@ -179,13 +179,15 @@ export class Effects implements IEffects {
     this.object.name = 'fx';
     this.object.matrixAutoUpdate = false;
 
-    // 1600, not 1100. A scree plume plus a landing spray plus a skid can be
-    // ~700 live puffs, and the ring recycles its OLDEST live instance when it
-    // wraps — so a capacity that merely "usually" fits shows up as puffs
-    // vanishing mid-life at exactly the busiest moment. Headroom here is one
-    // 32 kB float buffer and it removes a whole class of popping.
+    // 2600, not 1100. A scree plume plus a landing spray plus a skid can be
+    // ~900 live puffs once the marks are small enough to have to overlap, and
+    // the ring recycles its OLDEST live instance when it wraps — so a capacity
+    // that merely "usually" fits shows up as puffs vanishing mid-life at exactly
+    // the busiest moment, and the oldest puff is the far end of the trail, so
+    // what wrapping deletes is precisely the tail the effect exists to draw.
+    // Headroom here is a 180 kB float buffer and one draw call either way.
     this.dust = new DustSystem({
-      capacity: deps.dustCapacity ?? 1600,
+      capacity: deps.dustCapacity ?? 2600,
       rng: this.rng.fork('dust'),
     });
     this.debris = new DebrisSystem({
@@ -526,7 +528,10 @@ export class Effects implements IEffects {
       const force = clamp01(0.30 + drop * 0.9 + s.speed * 0.035);
       // CRASH DUST IGNORES A STINGY SURFACE. `crash` is staged in the rock
       // garden, dustAmount 0.18, which turned a 16-puff impact into three.
-      this.dust.burst(pos, nrm, s.velocity, 0.55 + force * 0.45, surf, 0.62);
+      // 0.85 rather than 0.62: the hit is the one moment in the whole sequence
+      // the audience is looking at, and at the new mark size 0.62 buys sixteen
+      // puffs where the read needs about twenty-five.
+      this.dust.burst(pos, nrm, s.velocity, 0.55 + force * 0.45, surf, 0.85);
       this.debris.screeSpray(pos, nrm, s.velocity, force * 0.7, surf);
       // Flash only — the freeze belongs to the crash's own entry, and stopping
       // the world three times inside one tumble is a stutter, not punctuation.
@@ -538,7 +543,7 @@ export class Effects implements IEffects {
 
     // The slide. Gated on height above the ground rather than on `grounded`.
     if (s.airHeight < 1.4 && s.speed > 1.2) {
-      this.dust.trail(pos, nrm, s.velocity, 26 + s.speed * 7, dt, surf, 0.55);
+      this.dust.trail(pos, nrm, s.velocity, 40 + s.speed * 9, dt, surf, 0.70);
     }
   }
 
@@ -547,6 +552,36 @@ export class Effects implements IEffects {
     // locks first under braking, and it is the one the camera is looking at.
     this.emitWheel(s.rear, s, dt, 1.0);
     this.emitWheel(s.front, s, dt, 0.58);
+
+    // ── THE SKIM ──────────────────────────────────────────────────────────────
+    //
+    // `grounded` is a solver predicate, not a photograph. Down anything rough
+    // the bike spends a large fraction of its frames with both wheels a few
+    // centimetres clear — the DustSystem's own header already notes the trail
+    // was being cut to a third for exactly this reason — and a tyre 60 mm off
+    // scree at 20 m/s is still dragging a wake through loose material. Gating
+    // the whole effect on a boolean that chatters at 120 Hz is what makes the
+    // tail read as intermittent.
+    //
+    // It is also the entire reason `scree-speed` f0000 is a rider at 70 km/h
+    // with ZERO dust anywhere in frame: the capture teleports the bike, the
+    // suspension has not settled, neither wheel reports contact on the shutter
+    // frame, and the first still of the sequence therefore has no effect in it
+    // at all.
+    //
+    // So: below a wheel radius of clearance, at a speed worth drawing, emit a
+    // reduced trail from the ground under the bike. Nothing new is remembered —
+    // the height and the terrain are both already in hand — so there is no
+    // state here for Game.applySituation's effects.reset() to have to wipe.
+    const airborneSkim = !(s.rear?.grounded || s.front?.grounded);
+    if (airborneSkim && s.airHeight < 0.30 && s.speed > 5 && s.mode !== BikeMode.Crashing) {
+      const w = s.rear ?? s.front;
+      const surf = w?.surface ?? DEFAULT_SURFACE;
+      const nrm = w?.contactNormal ?? _fallbackNrm;
+      const pos = this.contactOrFallback(undefined, s);
+      const near = clamp01(1 - s.airHeight / 0.30);
+      this.dust.trail(pos, nrm, s.velocity, clamp01((s.speed - 4) / 14) * 95 * near, dt, surf);
+    }
   }
 
   private emitWheel(w: WheelState, s: BikeState, dt: number, weight: number): void {
@@ -579,7 +614,38 @@ export class Effects implements IEffects {
     // the base rate comes from — and it is why the cap below exists, because
     // the same formula under a full lock-up would otherwise ask for 400/s and
     // bury the rider in his own dust.
-    const roll = clamp01((s.speed - 3) / 13) * 0.95;
+    // ── PUFFS PER METRE, NOT PER SECOND ───────────────────────────────────────
+    //
+    // The rolling term used to saturate: clamp01((speed - 3) / 13) is flat from
+    // 16 m/s upward. Emission is then a constant number of marks per SECOND
+    // while the wheel that lays them down covers ever more ground per second, so
+    // the spacing between consecutive puffs grows in direct proportion to speed
+    // and the trail gets THINNER the faster you go. Measured on scree-speed at
+    // 83 km/h: 172 live puffs strung over 34 m, five per metre of marks 0.3 m
+    // across — a dotted line. The same emitter at 17 km/h piles the same marks
+    // 0.05 m apart and reads as a wall. One number cannot be right for both
+    // because the wrong quantity is being held constant.
+    //
+    // Linear density is what the eye actually reads, so that is what is
+    // authored: puffs per metre of travel, converted to a rate by multiplying
+    // by speed. 9.0 is chosen against the ribbon the course is really ridden on
+    // (dustAmount 0.55) and the two wheels' weights (1.0 + 0.58), and lands
+    // about 7 marks per metre at every speed — spacing 0.14 m against puffs
+    // 0.22-0.99 m across, which is the overlap that makes separate contours one
+    // silhouette. The fade-in below 2.5 m/s keeps a bike at walking pace clean.
+    //
+    // AND THE NUMBER IS SET BY WHAT THE CHASE CAMERA CAN SEE, NOT BY THE LENGTH
+    // OF THE TRAIL. The boom sits ~4.8 m behind the bike looking forward, so of
+    // a plume streaming 33 m the frame contains only the first four metres of
+    // it — everything older is behind the lens. countAlive() said 213 and the
+    // still contained about a dozen marks, and both are right: 213 puffs over
+    // 33 m is 6.4 per metre, and 6.4 per metre across the 4 m strip the camera
+    // can actually see is nineteen. A density authored against the whole trail
+    // is authored against a length nobody is looking down. 18 puts ~11 marks on
+    // every metre of the visible strip, which at 0.09 m spacing and 0.33-0.51 m
+    // marks is continuous rather than dotted.
+    const perMetre = 18.0 * clamp01((s.speed - 2.5) / 6.5);
+    const roll = perMetre * s.speed;
     const skid = clamp01(slip / 5.5) + lock * 0.75 + spinUp * 0.5;
     const isWater = surf.kind === SurfaceKind.Water;
     // Water carries its read in droplets, not in airborne particulate, so the
@@ -594,8 +660,22 @@ export class Effects implements IEffects {
     // over the 27 m a 1.2 s puff falls behind at 23 m/s is three per metre of a
     // trail that is supposed to read as continuous. 130 puts it at ~100, which
     // is where the overlapping contours start being one shape.
-    const rate = Math.min((roll + skid * 1.4) * 130 * weight * (0.35 + load01 * 0.9), 240 * weight)
-      * (isWater ? 0.20 : 1);
+    //
+    // The rolling term is now already a rate (see perMetre above); the skid term
+    // is still authored per second, because a locked wheel throws material at a
+    // rate set by how hard it is being dragged rather than by how far it has
+    // travelled. The cap is what stops a full lock-up asking for 900/s and
+    // burying the rider in his own dust.
+    //
+    // The water factor moves with the base. 0.20 was set against a base that
+    // resolved to ~45 effective puffs/s through water's 1.8 dustAmount; the
+    // per-metre rate resolves to ~99, and a wheel through the stream bed
+    // throwing twice as much airborne particulate is the "dust cloud rising off
+    // a river" this factor exists to prevent. 0.09 holds the absolute quantity
+    // where it was measured to be right and leaves the read to DebrisSystem's
+    // actual droplets.
+    const rate = Math.min((roll + skid * 240) * weight * (0.35 + load01 * 0.9), 460 * weight)
+      * (isWater ? 0.09 : 1);
     if (rate > 0.5) this.dust.trail(pos, nrm, s.velocity, rate, dt, surf);
 
     if (isWater) {

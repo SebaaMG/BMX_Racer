@@ -107,6 +107,7 @@ import {
   CRASH_OTB,
   CRASH_SETTLE,
   CRASH_TUMBLE,
+  CRASH_BRACE,
   CROUCH,
   LOCK_CHANNELS,
   MANUAL,
@@ -242,6 +243,8 @@ export class RiderRig implements IRiderRig {
   private readonly target: Pose = makePose();
   private readonly applied: Pose = makePose();
   private readonly trickBuf: Pose = makePose();
+  /** Second scratch pose: the crash needs to blend TWO authored poses together. */
+  private readonly crashBuf: Pose = makePose();
 
   // ── IK state ──────────────────────────────────────────────────────────────
   private readonly armState: LimbSolverState[] = [makeLimbState(), makeLimbState()];
@@ -265,8 +268,32 @@ export class RiderRig implements IRiderRig {
   private roughness = 0;
   private speedSm = 0;
   private crankAngle = 0;
+  /**
+   * How fast the cranks are ACTUALLY turning, rad/s, differentiated from the
+   * anchor we just read. Not `cadence` — that is derived from the rear wheel and
+   * is non-zero while the bike freewheels. This is the observable: if the pedals
+   * the rider's feet are welded to are going round, the rider is pedalling, and
+   * the upper body has to answer it.
+   */
+  private crankOmega = 0;
   private cadence = 0;
   private effort = 0;
+  /**
+   * Signed roll of the rig ROOT about its own forward axis, relative to world
+   * up, radians. Positive = right shoulder down, matching `state.lean`.
+   *
+   * This is the number the counter-lean must be computed against, and using
+   * `state.lean` instead was the whole of "the rider does not inherit the bike's
+   * roll". `state.lean` is measured against the SURFACE; through a bermed
+   * switchback it read 0.72 rad while the root the rider actually inherited was
+   * rolled 0.318 rad against gravity. The counter-lean multiplied the wrong one
+   * by 0.46 and took 0.331 rad back out — 104% of the roll the rider had — so
+   * the torso came out at 1.1 degrees from vertical with the bike at 18.2.
+   * Measured on `switchback` f0044-f0091: chest roll 0.5-2.2 degrees for the
+   * whole 780 ms of the corner. A vertical statue with the bike swinging under
+   * it, exactly as briefed.
+   */
+  private rollWorld = 0;
   private airWeight = 0;
   private coastWeight = 0;
   private brakeWeight = 0;
@@ -277,6 +304,21 @@ export class RiderRig implements IRiderRig {
   private crashTime = 0;
   private crashSide = 1;
   private crashPose: Pose = CRASH_TUMBLE;
+  /**
+   * How long the FALL takes, seconds, measured from the end of the brace.
+   *
+   * A rider does not arrive on the floor. Saddle height is about 1.0 m and
+   * s = ½gt² puts a free fall from there at 0.45 s, so a crash that reaches its
+   * final pose faster than that is not a fall — it is a pose swap, which is
+   * what the old single-pose 30 ms blend was: 167 ms from riding to prone.
+   * Set per crash from the severity (a harder hit throws you down quicker) and
+   * jittered per rider so two riders going down together are never in step.
+   */
+  private crashFall = 0.42;
+  /** 0 while still braced on the bike, 1 once the fall is complete. */
+  private crashFallW = 0;
+  /** Deterministic per-rider crash variation, -1..1. Seeded from `phase`. */
+  private crashBias = 0;
   /** Accumulated tumble angle, radians. Integrated, never clamped to a stop. */
   private crashSpin = 0;
   private crashSpinRate = 0;
@@ -547,7 +589,23 @@ export class RiderRig implements IRiderRig {
     // motion below is always in phase with the visible cranks.
     _v0.copy(this.anchorPos[2]).sub(BIKE_GEOM.bb);
     const L = Math.max(BIKE_GEOM.crankLength, 1e-4);
+    const prev = this.crankAngle;
     this.crankAngle = Math.atan2(-_v0.z / L, -_v0.y / L);
+
+    // ...and DIFFERENTIATE it, unwrapped across the ±π seam.
+    //
+    // This is the honest "is this rider pedalling" signal and nothing else in
+    // the rig had it. `effort` was inferred from tyre slip and forward
+    // acceleration, and measured through the switchbacks at 46 km/h with the
+    // cranks visibly turning at 91 rpm it read 0.098 — so the whole upper-body
+    // answer to pedalling (hips rocking, shoulders counter-rocking, elbows
+    // driving) was multiplied by a tenth while the legs pumped underneath it.
+    // The pedals are welded to the feet; if they are going round, the rider is
+    // working, and no inference can be more reliable than watching them.
+    let d = this.crankAngle - prev;
+    if (d > Math.PI) d -= Math.PI * 2;
+    else if (d < -Math.PI) d += Math.PI * 2;
+    this.crankOmega = dampHL(this.crankOmega, d / h, 0.10, h);
   }
 
   private readAnchor(node: Object3D, slot: number, worldToRig: Quaternion): void {
@@ -627,6 +685,24 @@ export class RiderRig implements IRiderRig {
     this.prevVelRig.copy(this.velRig);
     this.angVelRig.copy(state.angularVelocity).applyQuaternion(_q0);
 
+    // ── The roll the rider actually inherited ───────────────────────────────
+    // `syncRoot` copies the bike's orientation onto the rig, so the rider is
+    // already rolled with the bike before a single pose channel is read. What
+    // the counter-lean below has to know is HOW FAR, against gravity — which is
+    // a property of the orientation, not of `state.lean`. See `rollWorld`.
+    _v1.copy(UP).applyQuaternion(state.orientation); // body up, world
+    _v2.copy(FWD).applyQuaternion(state.orientation); // body forward, world
+    _v3.copy(UP).addScaledVector(_v2, -UP.dot(_v2)); // world up, ⊥ forward
+    if (_v3.lengthSq() > 1e-6) {
+      _v3.normalize();
+      _v4.crossVectors(_v3, _v1);
+      this.rollWorld = Math.atan2(_v4.dot(_v2), _v3.dot(_v1));
+    } else {
+      // Nose straight up or straight down: roll about the forward axis is not
+      // defined against gravity. Hold the last value rather than snapping.
+      this.rollWorld = dampHL(this.rollWorld, 0, 0.20, h);
+    }
+
     this.speedSm = dampHL(this.speedSm, state.speed, 0.22, h);
 
     // Terrain roughness from what the suspension is doing. This is the honest
@@ -667,12 +743,19 @@ export class RiderRig implements IRiderRig {
     const groundTerm = state.front.grounded || state.rear.grounded ? 1 : 0;
     const driveSlip = clamp01(state.rear.slipRatio * 7);
     const accelTerm = clamp01(this.accelRig.z / 3.0);
-    const drive = Math.max(driveSlip, accelTerm, state.boosting ? 0.85 : 0);
+    // The cranks going round is not an inference, it is an observation, and it
+    // is the term that was missing. 3.5 rad/s is ~33 rpm — the slowest cadence
+    // anyone would call pedalling; 8 rad/s (76 rpm) is full commitment.
+    const spinTerm = smoothstep(3.5, 8.0, Math.abs(this.crankOmega));
+    const drive = Math.max(driveSlip, accelTerm, spinTerm, state.boosting ? 0.85 : 0);
     // Spin-out is a real constraint — you cannot turn a BMX gear past its
     // terminal cadence — but it has to be a fade at the top of the range rather
     // than a wall, and it must not also kill the effort at 14 m/s.
     const spinOut = 1 - smoothstep(15.5, 21.5, this.speedSm) * 0.92;
-    const effortTarget = groundTerm * spinOut * drive;
+    // Spin-out limits what may be INFERRED, never what is observed: if the
+    // cranks are turning at 40 km/h then the rider is turning them, whatever a
+    // gear-ratio argument says, and the body must not go quiet mid-stroke.
+    const effortTarget = groundTerm * Math.max(drive * spinOut, spinTerm);
     this.effort = dampHL(this.effort, clamp01(effortTarget), 0.24, h);
     this.cadence = Math.abs(state.rear.spinRate) * (BIKE_GEOM.cogRadius / BIKE_GEOM.chainringRadius);
     // Coasting: moving, grounded, not driving. The freewheel pose — heels
@@ -744,6 +827,12 @@ export class RiderRig implements IRiderRig {
     this.crashWeight = dampHL(this.crashWeight, crashTarget, crashTarget > 0 ? 0.030 : 0.30, h);
     if (this.crashWeight > 0.01) this.crashTime += h;
     else this.crashTime = 0;
+    // How far through the FALL we are — 0 while the rider is still braced on
+    // the bike, 1 once the body has arrived. Everything that represents leaving
+    // the bike (the tumble rotation, the separation of the hips from the frame,
+    // the second authored pose) is gated on this and not on the raw clock.
+    this.crashFallW =
+      this.crashWeight > 0.01 ? smoothstep(0.10, 0.10 + this.crashFall, this.crashTime) : 0;
 
     // Settling: once the bike is being stood back up the rider stops fighting
     // and folds. Blending the tumble toward CRASH_SETTLE is what stops the
@@ -758,7 +847,11 @@ export class RiderRig implements IRiderRig {
     // identical frames, and it keeps rotating for as long as the crash lasts.
     if (crashing) {
       this.crashSpinRate = dampHL(this.crashSpinRate, 0, this.settleWeight > 0.5 ? 0.35 : 1.05, h);
-      this.crashSpin += this.crashSpinRate * h;
+      // The tumble only starts once the rider is off the bike. Spinning during
+      // the brace put the body through the frame while a hand was still on the
+      // bar; the fall weight ramps the rotation in over the same window the
+      // pose separates on, so the two agree by construction.
+      this.crashSpin += this.crashSpinRate * this.crashFallW * h;
     } else {
       // Unwind: the rider comes back to square as the crash weight fades, so
       // there is no snap on the frame the pose is released.
@@ -829,9 +922,23 @@ export class RiderRig implements IRiderRig {
     if (this.crashAxis.lengthSq() < 1e-6) this.crashAxis.copy(LEFT);
     this.crashAxis.normalize();
     this.crashSpin = 0;
+
+    // ── Per-rider variation ─────────────────────────────────────────────────
+    // Two riders who go down the same way must not go down the SAME. `phase` is
+    // already a deterministic per-rider constant (hashed from the racer id), so
+    // it costs nothing to seed the crash's own timing and asymmetry from it —
+    // and being deterministic, a replay of the same crash is identical.
+    this.crashBias = Math.sin(this.phase * 2.7 + 1.3);
+    const jitter = 0.86 + 0.28 * (0.5 + 0.5 * Math.cos(this.phase * 1.9));
+
     // ~0.8 rev/s at full severity. Fast enough that the tumble is unmistakable
     // inside three frames, slow enough that the rider is not a propeller.
-    this.crashSpinRate = 2.1 + this.crashSeverity * 3.2;
+    this.crashSpinRate = (2.1 + this.crashSeverity * 3.2) * jitter;
+    // How long the body takes to get to the floor. A harder hit throws the
+    // rider down faster, but never faster than a fall: 0.10 s of brace plus
+    // 0.34 s of fall is 0.44 s at maximum severity, and a gentle one takes
+    // 0.60 s. Below that it is a pose swap, whatever it is blended with.
+    this.crashFall = (0.50 - 0.16 * this.crashSeverity) * jitter;
 
     const d = this.crashDirRig;
     const lateral = Math.abs(d.x);
@@ -940,9 +1047,37 @@ export class RiderRig implements IRiderRig {
       }
     }
 
-    // Crash last: nothing overrides being on the floor.
+    // ── Crash last: nothing overrides being on the floor ────────────────────
+    //
+    // THE CRASH IS A FALL, AND A FALL HAS STAGES. What used to happen here was
+    // one authored pose blended in on a 30 ms half-life: 167 ms from riding to
+    // fully prone, which is faster than gravity. A body cannot travel saddle
+    // height in less than sqrt(2h/g) = 450 ms, and a viewer knows it even if
+    // they could not say why — the old crash read as the rider being replaced
+    // rather than as the rider going down.
+    //
+    // So there are three links, in the order a real one happens:
+    //
+    //   BRACE   0 - 100 ms   something let go. The leading hand comes off the
+    //                        bar, the shoulder drops toward the impact, the
+    //                        hips slide back. The trailing hand is STILL on the
+    //                        bar and both feet are STILL on the pedals — the
+    //                        rider is on the bike here, and knows it.
+    //   FALL    over `crashFall`  the body separates and rotates down onto the
+    //                        chosen shape. This is the part that cannot be
+    //                        rushed, and its duration is set from the severity.
+    //   SETTLE  on recovery  the fight stops and the body folds.
+    //
+    // `crashFall` is jittered per rider, so two riders going down in the same
+    // pile-up are never on the same schedule even when the impact geometry
+    // hands them the same pose.
     if (this.crashWeight > 0.001) {
-      sidedPose(this.crashPose, this.crashSide, this.trickBuf);
+      sidedPose(CRASH_BRACE, this.crashSide, this.trickBuf);
+      const fall = this.crashFallW;
+      if (fall > 0.001) {
+        sidedPose(this.crashPose, this.crashSide, this.crashBuf);
+        lerpPose(this.trickBuf, this.crashBuf, fall);
+      }
       // Coming to rest is a different shape from going over. Folding the chosen
       // crash pose toward CRASH_SETTLE as the bike is stood back up is what
       // stops the rider holding a rag-doll star for the whole recovery.
@@ -951,27 +1086,41 @@ export class RiderRig implements IRiderRig {
       lerpPose(t, this.trickBuf, this.crashWeight);
     }
 
-    // ── Lean and steer, added into the target ───────────────────────────────
-    // The spine bends INTO the lean and the pelvis slides slightly outboard —
-    // the rider is not rigidly bolted to the roll axis, they hold the bike over
-    // and stay a little more upright than it is.
+    // ── Counter-lean: a CORRECTION on top of full inheritance ───────────────
     //
-    // The old gain was 0.22, which put 0.20 rad of side-bend into a corner the
-    // bike was leaned 56° through: eleven degrees of spine against fifty-six of
-    // bike, which is well inside the noise of the outline and reads as a rider
-    // welded to the frame. 0.46 puts roughly half the bike's roll back into the
-    // torso, which is what a rider actually does — and because the lean is
-    // clamped first, a low-side that rolls the bike past 70° cannot fold the
-    // spine in half.
+    // The rider already has all of the bike's roll. `syncRoot` copies
+    // `state.orientation` onto the rig root, so before a single channel is read
+    // the pelvis, the spine, the head and both contacts are rolled with the
+    // frame. Everything below only decides how much of that the rider gives
+    // BACK, and the answer is a fraction — never all of it.
+    //
+    // What this used to do was subtract `state.lean * 0.46`, and `state.lean`
+    // is roll against the SURFACE, not against gravity. On a bermed switchback
+    // the two differ by more than a factor of two: measured f0044-f0091, lean
+    // 0.72 rad against a root rolled 0.318 rad. 0.46 of the first is 104% of
+    // the second, so the correction cancelled the inheritance exactly and the
+    // torso came out vertical — chest roll 0.5 to 2.2 degrees for 780 ms with
+    // the bike at 18 degrees and the trail banked under it.
+    //
+    // Countering `rollWorld` instead makes the gains mean what they say, and
+    // they are staged UP the body, which is the read: the hips are on the bike
+    // and go where it goes, the shoulders come up a little, the head comes up
+    // most. Eyes near level, hips fully committed, a visible twist between
+    // them. A rider countering with their hips is a rider falling off.
+    const roll = clamp(this.rollWorld, -1.3, 1.3);
     const lean = clamp(state.lean, -1.2, 1.2);
     const upright = 1 - this.crashWeight; // no counter-lean once you are down
-    t[PC.spineSide] += -lean * 0.46 * upright;
-    t[PC.chestBend] += -Math.abs(lean) * 0.05 * upright;
+    t[PC.spineSide] += -roll * 0.26 * upright;
+    t[PC.chestBend] += -Math.abs(roll) * 0.05 * upright;
+    // The hips slide to the OUTSIDE of the turn — the rider's mass stays over
+    // the tyres while the frame goes over. This is the one lateral term that is
+    // still driven by lean, because it answers cornering load, not gravity.
     t[PC.pelvisX] += lean * 0.075 * upright;
-    t[PC.pelvisRoll] += lean * 0.16 * upright;
-    // Eyes level. A head that rolls with the bike is the single clearest tell
-    // that the character is a prop bolted to a vehicle.
-    t[PC.headRoll] += -lean * 0.26 * upright;
+    // Eyes nearly level. Not exactly level: a head pinned to the horizon while
+    // the body rolls under it reads as a gimbal, and 0.62 leaves the helmet
+    // about a third of the way over, which is what a rider looking through a
+    // berm actually does.
+    t[PC.headRoll] += -roll * 0.62 * upright;
     const steer = clamp(state.steerAngle, -0.7, 0.7);
     t[PC.spineTwist] += (steer * 0.34 + lean * 0.16) * upright;
     // The inside elbow drops and the outside one lifts through a corner.
@@ -1080,10 +1229,28 @@ export class RiderRig implements IRiderRig {
     p[PC.footOffRY] += -flapB * 0.10 * loose;
     p[PC.footOffLZ] += -d.z * 0.28 * swing + flap * 0.09 * swing;
     p[PC.footOffRZ] += -d.z * 0.28 * swing - flap * 0.09 * swing;
-    p[PC.kneeOutL] += flap * 0.34 * swing;
-    p[PC.kneeOutR] += -flapB * 0.34 * swing;
-    p[PC.ankleFlexL] += flapB * 0.28 * loose;
-    p[PC.ankleFlexR] += flap * 0.28 * loose;
+
+    // ── The legs do not do the same thing as each other ─────────────────────
+    //
+    // The knees were `flap * 0.34` and `-flapB * 0.34` — two noise terms with
+    // no reference to the impact at all, which is why both riders in a crash
+    // came out with the same bend in both knees and only the noise phase told
+    // them apart. A body going down on its left hip traps the LEFT leg between
+    // the bike and the ground, so it folds; the right leg is free above it and
+    // swings out and straightens as the hips rotate over.
+    //
+    // `lead` is 1 when the impact is arriving from this side. Severity scales
+    // the whole asymmetry, so a light case bends both knees a little and a
+    // 60 km/h low-side folds one leg up and throws the other straight.
+    const leadL = clamp01(0.5 + d.x * 0.62);
+    const asym = sev * swing;
+    p[PC.kneeOutL] += (0.72 * leadL - 0.26) * asym + (flap * 0.20 + this.crashBias * 0.10) * loose;
+    p[PC.kneeOutR] += (0.72 * (1 - leadL) - 0.26) * asym - (flapB * 0.20 + this.crashBias * 0.10) * loose;
+    // The trapped leg's foot is pinned and its ankle is forced; the free one
+    // trails. Same asymmetry, opposite channel, so the two legs never read as
+    // a mirrored pair.
+    p[PC.ankleFlexL] += (0.30 - 0.55 * leadL) * asym + flapB * 0.24 * loose;
+    p[PC.ankleFlexR] += (0.30 - 0.55 * (1 - leadL)) * asym + flap * 0.24 * loose;
   }
 
   // ── 5. Integrate ──────────────────────────────────────────────────────────
@@ -1206,7 +1373,14 @@ export class RiderRig implements IRiderRig {
     // objects with different momentum.
     if (this.crashWeight > 0.001) {
       const k = this.crashWeight * this.crashSeverity;
-      const part = (1 - Math.pow(2, -this.crashTime / 0.28)) * (1 - this.settleWeight * 0.55);
+      // Gated on the FALL, not on the clock. The rider is still on the bike
+      // through the brace, so the separation must not have started: an
+      // exponential in `crashTime` alone had the hips 22% of the way off the
+      // frame at 100 ms, while the pose above still had a hand on the bar and
+      // both feet on the pedals. The two disagreed, and the disagreement is
+      // exactly the "pose swap" read.
+      const part =
+        this.crashFallW * (1 - Math.pow(2, -this.crashTime / 0.28)) * (1 - this.settleWeight * 0.55);
       const reach = 0.52 * k * part;
       _v0.copy(this.crashDirRig).multiplyScalar(-reach);
       // Up and back over the bars, then down as the tumble carries through.

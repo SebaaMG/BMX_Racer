@@ -88,6 +88,8 @@ const P = {
 const RIDER_CSS = RIDER_COLORS.map((r) => ({
   jersey: css(r.jersey as Color),
   accent: css(r.accent as Color),
+  /** The rider's colour as a hairline — the profile's leader lines. */
+  lead: cssA(r.jersey as Color, 0.5),
   name: r.name as string,
 }));
 
@@ -109,8 +111,17 @@ const VALUE: TextStyle = { size: 26, weight: 0.15, fill: P.paper, ink: P.ink, tr
 // the clock's TIME label and its own percentage: three strings on one spot in
 // streambed. A label that moves cannot be laid out. This one does not move.
 const PROFILE_TITLE = 'DESCENT PROFILE';
-/** The one baseline the whole header row sits on. */
-const PROFILE_HEAD_BASE = 30;
+/**
+ * The one baseline the whole header row sits on.
+ *
+ * 26 rather than 30. The four units are not cosmetic: the rival rail below
+ * (see PROFILE_RIVAL_*) is a new band inside the same panel, and every unit it
+ * takes comes out of the mountain's relief. The title's caps are 11.5 tall, so
+ * at 26 they still sit 14.5 units clear of the slab's top edge — more air than
+ * the accent stripe gets at the bottom — and the header row reads as tight to
+ * the panel's top rather than floating in it.
+ */
+const PROFILE_HEAD_BASE = 26;
 const PROFILE_TITLE_ST: TextStyle = {
   size: 16, weight: 0.17, fill: P.gold, ink: P.ink, tracking: 0.22, skew: SHEAR,
 };
@@ -165,8 +176,8 @@ const PROFILE_CUT = 20;
  * own band — `skyTop`/`skyBot` — which is inset from the obstacles above and
  * below it by exactly the marker's ink reach:
  *
- *     skyTop = title ink bottom + gap + (how far a marker reaches UP)
- *     skyBot = digit cap top    − gap − (how far a marker reaches DOWN)
+ *     skyTop = rail ink bottom  + gap + (how far the marker reaches UP)
+ *     skyBot = digit cap top    − gap − (how far the marker reaches DOWN)
  *
  * and the plot's left inset is the slab's leaning wall plus the marker's
  * sideways reach, so the chevron at t = 0 is whole and inside the panel. Every
@@ -201,12 +212,88 @@ const PROFILE_MARK_INK = 2.2;
 /** Drawn this far above / right of the skyline point it marks. */
 const PROFILE_MARK_LIFT = 2;
 const PROFILE_MARK_DX = 2;
-/** Rival triangles. `tri` points its tip along `dir` and its base 0.7 back. */
-const PROFILE_RIVAL_R = 8;
-const PROFILE_RIVAL_INK = 2.0;
-const PROFILE_RIVAL_LIFT = 13;
+
+/**
+ * ── AND THE RIVALS COLLIDE WITH THE PLAYER, WHICH IS THE SAME BUG AGAIN ──────
+ *
+ * The rival triangles used to ride the skyline too, floated 13 units above it.
+ * Two markers that both follow the same curve are at the same height whenever
+ * they are at the same place, so a rival within ~3% of the player printed
+ * straight through the player's chevron: at `ridge-exposure` (t = 0.757) the
+ * green triangle sat on the gold one with about half its area inside it, and
+ * the OTHER two rivals were completely underneath it — one visible marker for a
+ * field of three. The previous sweep did not catch it because it swept each
+ * marker against the panel's FURNITURE and never against the other markers.
+ *
+ * A lift cannot fix it. The rivals are at ay, the player at py, and both are
+ * terrain: whatever constant offset separates them when ay = py brings them
+ * together again when the rival is that far up or down the ridge from the
+ * player. The only structural fix is to make one of the two families' y
+ * CONSTANT, and then the separation is a layout fact rather than a coincidence
+ * of the route.
+ *
+ * So the rivals get a RAIL: a fixed line just under the header, tips pointing
+ * down at the mountain, with a leader hairline tying each one to its true point
+ * on the ridge. The player keeps the skyline to itself, which is right — the
+ * gold flood behind it, the drop line under it and the marker on it are one
+ * object, and it is the only marker that has to be findable instantly.
+ *
+ * The rail is worth more than the collision it removes. Three markers on one
+ * line are directly comparable: their order and their spacing IS the race, read
+ * in one glance. On the ridge they were three heights and three sizes of gap,
+ * and the eye had to do the projection itself.
+ *
+ * It costs 7.8 units of the mountain's relief (69.6 → 61.8 of the 184-unit
+ * panel) and 4 of those are bought back by the header baseline above. Markers
+ * on a rail can also be de-collided along it, which the ridge could never do
+ * — see `railLayout()`.
+ */
+const PROFILE_RIVAL_R = 7;
+const PROFILE_RIVAL_INK = 1.8;
+/** `tri` geometry: the base sits 0.7 R behind the tip and 0.78 R either side. */
+const PROFILE_TRI_BACK = 0.7;
+const PROFILE_TRI_HALF = 0.78;
+/** How far a rail marker's ink reaches above / below / either side of its centre. */
+const PROFILE_RAIL_UP = PROFILE_RIVAL_R * PROFILE_TRI_BACK + PROFILE_RIVAL_INK * 0.5;
+const PROFILE_RAIL_DOWN = PROFILE_RIVAL_R + PROFILE_RIVAL_INK * 0.5;
+const PROFILE_RAIL_HALF = PROFILE_RIVAL_R * PROFILE_TRI_HALF + PROFILE_RIVAL_INK * 0.5;
+/**
+ * Minimum centre-to-centre spacing of two rail markers. Two riders inside this
+ * are shown side by side rather than on top of each other, with their leader
+ * lines still landing on their true positions — which is the honest reading of
+ * "these two are together", and the only one where you can still see that there
+ * are two of them.
+ */
+const PROFILE_RAIL_PITCH = 2 * PROFILE_RAIL_HALF + 1.6;
 /** Clear air between a marker's ink and the type it is passing. */
 const PROFILE_MARK_GAP = 3;
+
+/**
+ * The marker metrics, exported so a layout probe asserts against the numbers
+ * the widget actually draws with instead of a copy of them that can rot.
+ * `tools/capture/_profsweep2.mjs` is the sweep; it must stay green.
+ */
+export const PROFILE_METRICS = {
+  markR: PROFILE_MARK_R,
+  markReach: PROFILE_MARK_REACH,
+  markInk: PROFILE_MARK_INK,
+  markLift: PROFILE_MARK_LIFT,
+  markDx: PROFILE_MARK_DX,
+  rivalR: PROFILE_RIVAL_R,
+  rivalInk: PROFILE_RIVAL_INK,
+  triBack: PROFILE_TRI_BACK,
+  triHalf: PROFILE_TRI_HALF,
+  railUp: PROFILE_RAIL_UP,
+  railDown: PROFILE_RAIL_DOWN,
+  railHalf: PROFILE_RAIL_HALF,
+  railPitch: PROFILE_RAIL_PITCH,
+  gap: PROFILE_MARK_GAP,
+  headBase: PROFILE_HEAD_BASE,
+  titleSize: PROFILE_TITLE_ST.size,
+  titleWeight: PROFILE_TITLE_ST.weight ?? 0.17,
+  cpSize: PROFILE_CP_ST.size,
+  shear: SHEAR,
+} as const;
 
 function pad2(n: number): string {
   return n < 10 ? '0' + n : '' + n;
@@ -349,6 +436,8 @@ export class RouteProfileWidget extends Widget {
   /** The band the SKYLINE may occupy. Insets the plot by the markers' reach. */
   private skyTop = 0;
   private skyBot = 0;
+  /** Centre line of the rival rail. Constant — that is the whole point of it. */
+  private railY = 0;
 
   private progress = 0;
   private markerT = 0;
@@ -359,8 +448,13 @@ export class RouteProfileWidget extends Widget {
    * objects a frame, 240 a second, for a list whose length never changes.
    * `aiCount` is how many of the slots are live.
    */
-  private ai: { t: number; color: string; player: boolean }[] = [];
+  private ai: { t: number; color: string; lead: string; player: boolean }[] = [];
   private aiCount = 0;
+  /** Rail slots: indices into `ai`, ordered by t, and their de-collided x.
+   *  Both pooled — `draw()` runs on every frame the marker moves. */
+  private railIdx: number[] = [];
+  private railX: number[] = [];
+  private railN = 0;
   private trackLen = 0;
   private sectionName = '';
   private pulse = 0;
@@ -417,24 +511,27 @@ export class RouteProfileWidget extends Widget {
     this.cpBaseY = this.endBaseY - PROFILE_END_ST.size - 7 - cpInk;
     this.ruleY = this.cpBaseY - PROFILE_CP_ST.size - 6;
 
-    // ── THE SKYLINE'S BAND ───────────────────────────────────────────────────
-    // How far each marker's ink reaches from the skyline point it sits on.
-    // `tri` puts its tip a full radius along `dir` and its base 0.7 back, so a
-    // rival lifted clear of the ridge reaches further UP than the player's
-    // chevron does and is what sets the top of the band.
+    // ── THE RAIL, THEN THE SKYLINE'S BAND ────────────────────────────────────
+    // Top down: the title's ink, the rival rail, then the band the ridge may
+    // occupy, then the checkpoint digits. Every boundary is one term clear of
+    // the next, and every term is the ink extent of the thing it belongs to.
     const markSide = PROFILE_MARK_R * PROFILE_MARK_REACH + PROFILE_MARK_INK * 0.5;
     const markUp = markSide + PROFILE_MARK_LIFT;
     const markDown = markSide - PROFILE_MARK_LIFT;
-    const rivalUp = PROFILE_RIVAL_R * 0.7 + PROFILE_RIVAL_INK * 0.5 + PROFILE_RIVAL_LIFT;
-    const reachUp = Math.max(markUp, rivalUp);
 
     // The obstacles the band sits between: the title's ink above, the
     // checkpoint digits' cap line below. Both measured, not guessed.
+    // The header row is three styles on one baseline and the rail runs under
+    // all of it, so the ink bottom is the HEAVIEST of them — the percentage,
+    // hard right, is a hair fatter than the title.
+    const headWeight = Math.max(PROFILE_TITLE_ST.weight ?? 0.17, PROFILE_PCT_ST.weight ?? 0.18);
     const titleInk = PROFILE_HEAD_BASE
-      + PROFILE_TITLE_ST.size * ((PROFILE_TITLE_ST.weight ?? 0.17) * 0.5 + 0.052);
+      + Math.max(PROFILE_TITLE_ST.size, PROFILE_PCT_ST.size) * (headWeight * 0.5 + 0.052);
     const digitCapTop = this.cpBaseY - PROFILE_CP_ST.size - cpInk;
 
-    this.skyTop = titleInk + PROFILE_MARK_GAP + reachUp;
+    const railTop = titleInk + PROFILE_MARK_GAP;
+    this.railY = railTop + PROFILE_RAIL_UP;
+    this.skyTop = this.railY + PROFILE_RAIL_DOWN + PROFILE_MARK_GAP + markUp;
     // The rule is furniture too: a marker that hangs across it reads as a
     // chart that has broken its own axis, so the band clears that as well as
     // the digits, and with the rows as they are it is the rule that binds.
@@ -445,10 +542,13 @@ export class RouteProfileWidget extends Widget {
 
     // The slab leans: its left wall at height y is SHEAR*h*(1 − y/h) in from
     // the layer edge, widest at the top. The plot starts clear of that wall
-    // PLUS the chevron's sideways reach, so the marker at t = 0 is a whole
-    // shape inside the panel instead of a half one on the chamfer.
-    const wallL = SHEAR * h * (1 - this.skyTop / h);
-    this.plotX = Math.ceil(wallL + 4 + markSide - PROFILE_MARK_DX);
+    // PLUS the widest sideways reach of anything drawn in it, so the markers at
+    // t = 0 are whole shapes inside the panel instead of half ones on the
+    // chamfer. The wall is measured at the RAIL, the topmost thing in the plot
+    // and therefore the point where it leans furthest in.
+    const wallL = SHEAR * h * (1 - railTop / h);
+    const reachLeft = Math.max(markSide - PROFILE_MARK_DX, PROFILE_RAIL_HALF);
+    this.plotX = Math.ceil(wallL + 4 + reachLeft);
     this.plotY = this.skyTop - 6;
     // The right inset clears the slab's bottom-right chamfer: FINISH is
     // right-aligned to the plot, and at the end-label baseline the chamfer has
@@ -610,11 +710,15 @@ export class RouteProfileWidget extends Widget {
         const r = m.standings[i];
         let slot = this.ai[this.aiCount];
         if (!slot) {
-          slot = { t: 0, color: '', player: false };
+          slot = { t: 0, color: '', lead: '', player: false };
           this.ai.push(slot);
+          this.railIdx.push(0);
+          this.railX.push(0);
         }
+        const c = RIDER_CSS[r.colorIndex % RIDER_CSS.length];
         slot.t = clamp01(r.distance / this.trackLen);
-        slot.color = RIDER_CSS[r.colorIndex % RIDER_CSS.length].jersey;
+        slot.color = c.jersey;
+        slot.lead = c.lead;
         slot.player = r.isPlayer;
         this.aiCount++;
       }
@@ -628,6 +732,46 @@ export class RouteProfileWidget extends Widget {
     let s = `${q}|${this.sectionName}`;
     for (let i = 0; i < this.aiCount; i++) s += '|' + Math.round(this.ai[i].t * 400);
     this.sig(s);
+  }
+
+  /**
+   * Place the rival markers along the rail: sort by route position, then push
+   * neighbours apart until nothing is inside anything else.
+   *
+   * Two passes and no allocation. The first sweeps left to right opening every
+   * pair to `PROFILE_RAIL_PITCH`, which cannot break an earlier pair because it
+   * only ever moves markers right; the second sweeps back and does the same
+   * against the plot's right edge, which cannot break the first because it only
+   * ever moves markers left and the field is 3 markers in a 460-unit plot — the
+   * two constraints can only meet if the whole field is inside 30 units of the
+   * finish, and then the leader lines are what carry the true positions anyway.
+   */
+  private railLayout(): void {
+    const idx = this.railIdx;
+    let n = 0;
+    for (let i = 0; i < this.aiCount; i++) {
+      const a = this.ai[i];
+      if (a.player) continue;
+      // Insertion sort by t, in place, on the pooled index array.
+      let k = n++;
+      while (k > 0 && this.ai[idx[k - 1]].t > a.t) {
+        idx[k] = idx[k - 1];
+        k--;
+      }
+      idx[k] = i;
+    }
+    this.railN = n;
+    for (let i = 0; i < n; i++) this.railX[i] = this.plotX + this.ai[idx[i]].t * this.plotW;
+    for (let i = 1; i < n; i++) {
+      const min = this.railX[i - 1] + PROFILE_RAIL_PITCH;
+      if (this.railX[i] < min) this.railX[i] = min;
+    }
+    const right = this.plotX + this.plotW;
+    if (n > 0 && this.railX[n - 1] > right) this.railX[n - 1] = right;
+    for (let i = n - 2; i >= 0; i--) {
+      const max = this.railX[i + 1] - PROFILE_RAIL_PITCH;
+      if (this.railX[i] > max) this.railX[i] = max;
+    }
   }
 
   override draw(ctx: CanvasRenderingContext2D, w: number, h: number): void {
@@ -649,13 +793,20 @@ export class RouteProfileWidget extends Widget {
     ctx.lineJoin = 'miter';
     ctx.restore();
 
-    // Rival markers first so the player always sits on top of them.
-    for (let i = 0; i < this.aiCount; i++) {
-      const a = this.ai[i];
-      if (a.player) continue;
-      const ax = this.plotX + a.t * this.plotW;
-      const ay = this.yAt(a.t);
-      tri(ctx, ax, ay - PROFILE_RIVAL_LIFT, PROFILE_RIVAL_R, Math.PI * 0.5, a.color, P.ink, PROFILE_RIVAL_INK);
+    // ── The field, on its rail ───────────────────────────────────────────────
+    // Leader lines first, then the markers over them, then the player over
+    // everything: three depths, in the order a viewer needs to resolve them.
+    this.railLayout();
+    for (let i = 0; i < this.railN; i++) {
+      const a = this.ai[this.railIdx[i]];
+      const tx = this.plotX + a.t * this.plotW;
+      tick(ctx, this.railX[i], this.railY + PROFILE_RAIL_DOWN, tx, this.yAt(a.t), 1.5, a.lead);
+    }
+    for (let i = 0; i < this.railN; i++) {
+      tri(
+        ctx, this.railX[i], this.railY, PROFILE_RIVAL_R, Math.PI * 0.5,
+        this.ai[this.railIdx[i]].color, P.ink, PROFILE_RIVAL_INK,
+      );
     }
 
     // The player: a drop line to the baseline, then the chevron on the skyline.
@@ -680,7 +831,7 @@ export class RouteProfileWidget extends Widget {
     const pctW = measureText(pct, PROFILE_PCT_ST);
     ctx.save();
     ctx.beginPath();
-    ctx.rect(this.sectionX - 4, 6, (pctR - pctW - 18) - this.sectionX + 4, 32);
+    ctx.rect(this.sectionX - 4, PROFILE_HEAD_BASE - 20, (pctR - pctW - 18) - this.sectionX + 4, 26);
     ctx.clip();
     drawText(ctx, this.sectionName, this.sectionX, PROFILE_HEAD_BASE, PROFILE_SECTION_ST);
     ctx.restore();
@@ -1303,6 +1454,24 @@ const ORDER_ST: TextStyle = {
   size: 15, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.28, align: 'right', skew: SHEAR,
 };
 
+/** Row metrics, hoisted because the layer's height is derived from them. */
+const BOARD_TOP = 38;
+const BOARD_ROW_H = 46;
+const BOARD_ROW_GAP = 8;
+
+/**
+ * The height a board of `n` riders actually needs, ink included.
+ *
+ * The layer was 280 for a board whose last row of ink ends at 247, and those
+ * 33 dead units were not free: the popup column's ceiling is derived from this
+ * panel's rect (see `PopupWidget.setCeiling`), so slack here is a popup bar
+ * that could have been shown and was not. Sized from the row metrics and the
+ * field size instead, it is right for any field the game ever fields.
+ */
+export function standingsHeight(n: number): number {
+  return BOARD_TOP + n * (BOARD_ROW_H + BOARD_ROW_GAP) - BOARD_ROW_GAP + 4;
+}
+
 export class StandingsWidget extends Widget {
   private rows: { pos: number; name: string; gap: string; color: string; player: boolean }[] = [];
   private acc = 0;
@@ -1347,10 +1516,10 @@ export class StandingsWidget extends Widget {
   }
 
   override draw(ctx: CanvasRenderingContext2D, w: number, h: number): void {
-    const rowH = 46;
+    const rowH = BOARD_ROW_H;
     for (let i = 0; i < this.rows.length; i++) {
       const r = this.rows[i];
-      const y = 38 + i * (rowH + 8);
+      const y = BOARD_TOP + i * (rowH + BOARD_ROW_GAP);
       const fill = r.player ? cssA(HUD_PALETTE.gold, 0.88) : P.panelDeep;
       const text = r.player ? P.ink : P.paper;
       const inkc = r.player ? P.ink : cssA(HUD_PALETTE.paperDim, 0.55);
@@ -1442,18 +1611,28 @@ const TRICK_BAR_Y = Math.ceil(SCORE_TOP + 6 + TRICK_BAR_H + 2);
  * the standings board's bottom edge is at design y 304 — so the fourth bar of a
  * six-popup pile printed across the last row of the standings. At 58 the stack
  * is the same six bars in 20 fewer units and the fourth one clears the board.
- * Bars five and six still reach past it; see the sort note in `draw()` for why
- * that is now the right ones being covered.
+ *
+ * That was not enough, and no pitch could be: six bars plus a trick plate plus
+ * a score block is 470 units of column in the 400 that exist between the
+ * speedometer and the standings board. Shrinking the pitch until they fit means
+ * bars that touch, which is the same defect wearing a smaller number. See
+ * `setCeiling()` for what actually fixed it.
  */
 const POPUP_BASE = TRICK_BAR_Y + 62;
 const POPUP_PITCH = 58;
 const POPUP_BAR_H = 50;
+
+/** Exported for `tools/capture/_hudlayout.mjs`, which asserts the column
+ *  against the standings board. Same reason as `PROFILE_METRICS`. */
+export const POPUP_METRICS = { base: POPUP_BASE, pitch: POPUP_PITCH, barH: POPUP_BAR_H, pool: POPUP_POOL } as const;
 
 export class PopupWidget extends Widget {
   private pool: Popup[] = [];
   /** Draw order, reused every frame. See the note in `draw()`. */
   private order: Popup[] = [];
   private live = 0;
+  /** How many bars fit under the ceiling. See `setCeiling()`. */
+  private depth = POPUP_POOL;
   private activeTrick: string | null = null;
   private trickScore = 0;
   private scorePunch = 0;
@@ -1469,6 +1648,53 @@ export class PopupWidget extends Widget {
   override furniture(): void {
     // Popups are transient; there is no furniture to hold. Leaving the layer
     // background empty means every popup redraw starts from a plain clear.
+  }
+
+  /**
+   * ── HOW DEEP THE COLUMN IS ALLOWED TO BE ─────────────────────────────────
+   *
+   * `ceiling` is the highest y, in this layer's own units, that a popup bar's
+   * top edge may reach. `Hud.ts` derives it from the standings board's rect, so
+   * the two panels are laid out against each other instead of both being laid
+   * out against the frame and hoping.
+   *
+   * The alternative was to move the standings, and it is the wrong call. The
+   * board is on screen for the whole race and is read constantly; the popups
+   * are transient and, past four of them, unreadable anyway — six bars land
+   * inside 1.9 s and slide in over 0.2 s each, so a five-deep pile is a
+   * flickering wall, not information. The board keeps the corner every racing
+   * game puts it in; the column takes the constraint.
+   *
+   * The depth is not a cap on what is DRAWN — a bar that is dropped from the
+   * draw would still be counted live, still hold the layer up, and still be a
+   * popup the player was told about and never shown. It is a cap on what is
+   * ALIVE: pushing past it hard-cuts the oldest, which is within a couple of
+   * hundred milliseconds of cutting itself. `POPUP_POOL` stays at 6 so a burst
+   * is never dropped at the source; it is aged out at the top instead.
+   */
+  setCeiling(ceiling: number): void {
+    const room = this.layer.h - POPUP_BASE - ceiling;
+    this.depth = Math.max(1, Math.min(POPUP_POOL, Math.floor(room / POPUP_PITCH) + 1));
+  }
+
+  /** How many bars the column can show at once. */
+  get columnDepth(): number {
+    return this.depth;
+  }
+
+  /** Hard-cut the oldest until the column fits. */
+  private trim(): void {
+    for (;;) {
+      let n = 0;
+      let oldest: Popup | null = null;
+      for (const p of this.pool) {
+        if (!p.active) continue;
+        n++;
+        if (!oldest || p.age > oldest.age) oldest = p;
+      }
+      if (n <= this.depth || !oldest) return;
+      oldest.active = false;
+    }
   }
 
   private push(text: string, value: number, kind: Popup['kind']): void {
@@ -1493,6 +1719,7 @@ export class PopupWidget extends Widget {
       for (const p of m.popups) this.push(p.text, p.value, p.kind);
       m.popups.length = 0;
       this.scorePunch = 1;
+      this.trim();
     }
 
     this.live = 0;
@@ -1596,7 +1823,7 @@ export class PopupWidget extends Widget {
       }
       ord[k] = p;
     }
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < n && i < this.depth; i++) {
       const p = ord[i];
       const k = ease.snap(clamp01(p.age / 0.20));
       const y = h - POPUP_BASE - slot * POPUP_PITCH;

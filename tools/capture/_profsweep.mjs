@@ -1,4 +1,11 @@
 /**
+ * SUPERSEDED by `_profsweep2.mjs`. Its rival checks describe a marker that no
+ * longer exists — the rivals were moved off the skyline onto a rail because
+ * they collided with the PLAYER's marker, which this probe never tested for.
+ * It also hard-codes the marker constants, which have since changed; run
+ * `_profsweep2.mjs` instead, which drives the shipped widget and reads
+ * `PROFILE_METRICS` off the module.
+ *
  * Throwaway probe: sweep the route-profile markers across the whole route and
  * report the closest approach between their INK and every fixed thing in the
  * panel — the title above, the checkpoint digits below, the baseline rule, and
