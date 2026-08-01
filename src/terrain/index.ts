@@ -420,9 +420,20 @@ export class Terrain implements ITerrain, ScatterSource {
       // spoil bank on the low side wants the same. Capped, because the carve
       // cost is quadratic in reach and one deep cut should not stamp a 200 m
       // clearing across the mountain.
+      //
+      // The factor is 2.3, not 1/tan(34 deg) = 1.48, and the difference is the
+      // shape of the blend rather than the angle. The lateral weight is a
+      // SMOOTHSTEP, whose derivative peaks at 1.5x its own mean, so a transition
+      // carrying height H across width W reaches a maximum gradient of
+      // 1.5 H / W in the middle and not H / W. Sizing the width from the mean
+      // builds a wall half again as steep as intended everywhere it matters:
+      // measured across the deepest cut at 1.48, the side slopes came out at
+      // 36, 38, 39 and 51 degrees against the 34 they were specified for.
+      // 1.5 / tan(34 deg) = 2.22, rounded up for the centreline-vs-edge
+      // difference in how deep the cut actually is.
       const ground = this.heightAt(p.x, p.z);
       const move = Math.abs(ground - p.y);
-      const feather = Math.min(baseFeather + move * 1.48, baseFeather + 26);
+      const feather = Math.min(baseFeather + move * 2.3, baseFeather + 40);
       const reach = hw + feather;
 
       // Local left, from the centreline tangent. Left = up x forward.

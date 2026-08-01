@@ -62,6 +62,20 @@ const _n = new Vector3();
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
 
+/**
+ * Stuck detection, in `rescueStuck`. Long enough that a rider fighting for
+ * traction out of a slow corner, or picking a line through the rock garden, is
+ * never yanked off it — a genuinely stuck rider shows 0-2 km/h and no distance
+ * at all, which is nothing like a slow one.
+ */
+const STUCK_SECONDS = 4.5;
+/** Metres of course that count as "still going". */
+const STUCK_PROGRESS = 1.5;
+/** Placed this far ahead, so they do not drop straight back into the trap. */
+const STUCK_NUDGE = 12;
+/** Rolling, not stationary: m/s. */
+const STUCK_SPEED = 7;
+
 export const RUBBER_BAND = {
   /** Maximum speed multiplier deviation. ±6%. */
   maxDeviation: 0.06,
@@ -173,6 +187,11 @@ export class RaceDirector {
   private smoothedSpeed: number[] = [];
   private bandValue: number[] = [];
   private contactCooldown: number[] = [];
+  /** Per-AI stuck detection. See `rescueStuck`. */
+  private stuckTime: number[] = [];
+  private stuckMark: number[] = [];
+  /** How many times a rider had to be put back on the trail this race. */
+  rescues = 0;
   /** racers[i].progress, in racer order. Used to map a progress back to an index. */
   private progressOrder: RacerProgress[] = [];
   private lastCountdownBeep = -1;
@@ -291,6 +310,10 @@ export class RaceDirector {
       this.bandValue.push(1);
       this.standings.push(r.progress);
       this.progressOrder.push(r.progress);
+    }
+    for (let i = 0; i < this.aiRiders.length; i++) {
+      this.stuckTime.push(0);
+      this.stuckMark.push(0);
     }
 
     this.contactCooldown = new Array((count * (count - 1)) / 2).fill(0);
@@ -413,6 +436,11 @@ export class RaceDirector {
       this.smoothedSpeed[i] = 0;
       this.bandValue[i] = 1;
     }
+    for (let i = 0; i < this.stuckTime.length; i++) {
+      this.stuckTime[i] = 0;
+      this.stuckMark[i] = 0;
+    }
+    this.rescues = 0;
     for (let i = 0; i < this.contactCooldown.length; i++) this.contactCooldown[i] = 0;
     for (const s of this.hudSplits) {
       s.time = null;
@@ -462,6 +490,7 @@ export class RaceDirector {
     this.resolveContacts(dt);
     this.updateProgress(dt);
     this.updateRubberBand(dt);
+    this.rescueStuck(dt);
 
     // ── Recording ────────────────────────────────────────────────────────────
     if (this.phase === RacePhase.Racing || this.phase === RacePhase.Finished) {
@@ -698,6 +727,66 @@ export class RaceDirector {
    * "impossible catch-up" the brief forbids; a band on intent produces a rider
    * who is trying a little harder or a little less hard, which is invisible.
    */
+  /**
+   * Put a rider who has stopped making progress back on the trail.
+   *
+   * This exists because no steering controller is ever good enough to make it
+   * unnecessary. A rider who runs wide onto open mountainside, or lands a jump
+   * in a hollow, can end up somewhere the bike physically cannot climb out of —
+   * measured before this: three of three riders wedged in the switchbacks at
+   * 1202, 1223 and 1611 m, pinned at full lock and 2 km/h, and the race simply
+   * never finished. Improving the AI moved that to one rider in three at
+   * 1683 m. It will never move it to zero, because "somewhere a bike cannot
+   * climb out of" is a property of a mountain, not of the controller.
+   *
+   * So the guarantee is structural: a race always completes. The AI's job is to
+   * make this fire rarely; this is what happens on the occasion it does not.
+   *
+   * AI only. The player gets the R key, because a player who has stopped to
+   * look at the view has not made a mistake and must not be teleported for it.
+   */
+  private rescueStuck(dt: number): void {
+    if (this.phase !== RacePhase.Racing && this.phase !== RacePhase.Finished) return;
+
+    for (let i = 0; i < this.aiRiders.length; i++) {
+      const r = this.aiRiders[i];
+      if (r.progress.finished) {
+        this.stuckTime[i] = 0;
+        continue;
+      }
+      const d = r.progress.distance;
+      if (d - this.stuckMark[i] > STUCK_PROGRESS) {
+        this.stuckMark[i] = d;
+        this.stuckTime[i] = 0;
+        continue;
+      }
+      this.stuckTime[i] += dt;
+      if (this.stuckTime[i] < STUCK_SECONDS) continue;
+
+      // Back onto the centreline, a little ahead of where they died so they do
+      // not immediately re-enter whatever caught them, facing down-course and
+      // rolling — dropping a rider in stationary would just hand the same
+      // corner back to them with no speed to carry through it.
+      const ahead = Math.min(d + STUCK_NUDGE, this.track.length);
+      const s = this.track.sampleAtDistance(ahead, this.scratchSample);
+      _v0.copy(s.position);
+      const ground = this.terrain.heightAt(_v0.x, _v0.z);
+      if (ground > _v0.y) _v0.y = ground;
+      _v0.y += 0.35;
+      _v1.copy(s.tangent);
+
+      r.bike.reset(_v0, _v1);
+      r.reseat(_v0, ahead);
+      r.bike.state.velocity.copy(_v1).multiplyScalar(STUCK_SPEED);
+      r.bike.state.forwardSpeed = STUCK_SPEED;
+      r.bike.state.speed = STUCK_SPEED;
+
+      this.stuckMark[i] = ahead;
+      this.stuckTime[i] = 0;
+      this.rescues++;
+    }
+  }
+
   private updateRubberBand(dt: number): void {
     const playerDist = this.player.progress.distance;
     const inGrace = this.elapsed < RUBBER_BAND.graceSeconds;

@@ -781,6 +781,24 @@ export class AIRider extends RacerBase {
     // A rider in a crash/recovery mode has no speed target worth speaking of.
     if (st.mode === BikeMode.Crashing || st.mode === BikeMode.Recovering) target = Math.min(target, 6);
 
+    // ── Off the trail ───────────────────────────────────────────────────────
+    // Every speed above is derived from the TRACK: its curvature, its bank, its
+    // width. None of that describes the open mountainside, and the controller
+    // had no notion that it might not be on the track at all — so a rider who
+    // ran wide kept racing at trail pace across terrain with no trail in it,
+    // got further out, and eventually wedged against a slope it could not
+    // climb. Measured after 100 s: lateral -20.6 m and -12.5 m on a trail whose
+    // half-width is 4.6 m, both pinned at full lock and 2 km/h.
+    //
+    // A real rider who has run off does one thing first: slows down enough to
+    // get back on. Scaled by how far out they are, and floored so they keep
+    // enough momentum to actually climb back rather than bogging in scree.
+    const offBy = Math.abs(this.tracker.lateral) - here.halfWidth;
+    if (offBy > 0.5) {
+      const out = clamp01((offBy - 0.5) / 6);
+      target = Math.min(target, lerp(target, 6.5, out * p.recoverySkill));
+    }
+
     // ── Lip scan ────────────────────────────────────────────────────────────
     // Runs before the line choice because it also produces the roughness figure
     // the line search keys off, and a one-tick-stale roughness is exactly the
@@ -1173,7 +1191,23 @@ export class AIRider extends RacerBase {
 
     // ── Speed control ───────────────────────────────────────────────────────
     this.smoothedTargetSpeed = dampHL(this.smoothedTargetSpeed, this.plan.targetSpeed, 0.18, dt);
-    const vErr = this.smoothedTargetSpeed - st.forwardSpeed;
+    // Judge speed by how fast the bike is ACTUALLY TRAVELLING, not by the
+    // component of that travel along its own nose.
+    //
+    // `forwardSpeed` is signed along the bike's forward axis, so it collapses
+    // toward zero the moment the bike is sliding rather than rolling — and a
+    // sliding bike is exactly when the speed controller matters most. Measured
+    // on ai1: 113 km/h against a 65 km/h target, ten metres off the trail on a
+    // 20 degree face, with brakes at ZERO and PEDAL AT FULL. The rider was
+    // travelling at 31 m/s sideways, the nose component read under 18, so the
+    // loop concluded it was slow and drove it harder down the mountain. It
+    // reached 113 km/h by pedalling into a slide.
+    //
+    // `speed` is the magnitude, so it can never under-report travel. Below the
+    // slide threshold the two agree to within a percent and nothing changes;
+    // this only bites where the old measure was lying.
+    const travelling = Math.max(st.forwardSpeed, st.speed);
+    const vErr = this.smoothedTargetSpeed - travelling;
 
     if (vErr > 0.4) {
       i.pedal = clamp01(vErr * 0.42) * p.throttleDiscipline * caution;
