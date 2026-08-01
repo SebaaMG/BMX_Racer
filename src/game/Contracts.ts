@@ -108,6 +108,25 @@ export interface TrackCarve {
    * incidence of a receding trail projects to 30-70 px of torn edge.
    */
   rideWidths?: number[];
+
+  /**
+   * Rise of the trail surface per metre of LEFT offset — the y component of the
+   * banked surface-left unit vector, which is exactly what the ribbon mesh uses
+   * to place its own vertices (`y = centre.y + surfaceLeft.y * lateral`).
+   *
+   * The carve used to rebuild this from `banks` as `tan(bank)`, and it came out
+   * with the OPPOSITE SIGN. That gave the ground a mirror-image camber to the
+   * trail drawn on it: measured at 300 m, the ribbon fell 0.672 m to the left
+   * across the trail while the heightfield rose 0.613 m, so the two surfaces
+   * were 1.285 m apart at the edge of a trail whose half-width is about 3 m.
+   * The bike rides the heightfield and the player sees the ribbon, so on one
+   * side of every banked corner the drawn trail stood above the rider and cut
+   * him off at the chest.
+   *
+   * Supplying the gradient itself removes the chance to re-derive it wrongly.
+   * `banks` remains for anything that wants the angle.
+   */
+  crossSlopes?: number[];
   /** Bank angle in radians at each point (positive = banked right). */
   banks: number[];
   /** Blend falloff distance beyond the half-width. */

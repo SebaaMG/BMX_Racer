@@ -1016,6 +1016,7 @@ export class TrackSpline {
     const halfWidths: number[] = [];
     const rideWidths: number[] = [];
     const banks: number[] = [];
+    const crossSlopes: number[] = [];
     for (let i = 0; i < this.count; i += step) {
       if (this.gapMask[i] > 0.5) continue;
       // Carve to the centreline height ITSELF, `lift` included.
@@ -1042,8 +1043,12 @@ export class TrackSpline {
       halfWidths.push(this.halfWidth[i] * (1.22 + this.bermStrength[i] * 0.45) + 1.1);
       rideWidths.push(this.halfWidth[i]);
       banks.push(this.bank[i]);
+      // The gradient the RIBBON uses, not the angle it was built from. See the
+      // note on TrackCarve.crossSlopes: rebuilding it as tan(bank) in the carve
+      // produced the opposite sign, and cambered the ground against the trail.
+      crossSlopes.push(this.sly[i]);
     }
-    this.carve = { points, halfWidths, rideWidths, banks, featherWidth: 4.2 };
+    this.carve = { points, halfWidths, rideWidths, banks, crossSlopes, featherWidth: 4.2 };
     return this.carve;
   }
 

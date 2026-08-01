@@ -444,7 +444,14 @@ export class Terrain implements ITerrain, ScatterSource {
       _tan.normalize();
       const lx = _tan.z;
       const lz = -_tan.x;
-      const tanBank = Math.tan(bank);
+      // Rise per metre of LEFT offset, taken from the carve rather than rebuilt
+      // from the bank angle. `Math.tan(bank)` was the opposite sign to what the
+      // ribbon mesh uses for the same trail, so the ground was cambered the
+      // wrong way across every banked corner — the two surfaces diverged by
+      // 1.285 m at 3.2 m off the centreline at 300 m, and since the bike rides
+      // the heightfield and the player sees the ribbon, the drawn trail stood
+      // above the rider and cut him off at the chest. See TrackCarve.crossSlopes.
+      const tanBank = carve.crossSlopes?.[i] ?? -Math.tan(bank);
 
       const ix0 = clamp(Math.floor(this.g(p.x - reach)), 0, size - 1);
       const ix1 = clamp(Math.ceil(this.g(p.x + reach)), 0, size - 1);

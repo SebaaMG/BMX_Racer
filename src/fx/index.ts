@@ -405,6 +405,35 @@ export class Effects implements IEffects {
     this.dust.syncCamera(cam);
 
     const s = this.subject;
+
+    // Tell the dust what the shot is framed on, EVERY FRAME.
+    //
+    // DustSystem has a lens-corridor rule built for exactly one job: fade a
+    // puff that comes between the camera and the rider and covers him. It keys
+    // off `uSubject`, whose w component is the legible radius, and whose own
+    // documentation says "radius 0 disables the rule entirely".
+    //
+    // `setShotSubject` WAS NEVER CALLED. Not from here, not from the camera,
+    // not from the game — the whole corridor was dead code and the radius sat
+    // at 0 for every frame this project has ever rendered. The result is the
+    // defect a player reported three times and I misdiagnosed three times: at
+    // speed the wheel plume is trail-coloured, opaque, and directly between the
+    // lens and the bike, so it reads as GROUND. The bike looks half-buried in
+    // the track. It is not: with the dust material silenced the wheels, cranks
+    // and legs are all there, the physics contact patch never penetrated the
+    // ground (max 0.000 m over a full run), and the drawn axle sits at 0.271 m
+    // against a 0.267 m wheel radius.
+    //
+    // Two full sessions went into terrain, ribbon, carve and camera geometry
+    // looking for a surface that was never there. The elimination that found it
+    // was silencing one material at a time.
+    //
+    // The radius covers rider and bike as one object: the pivot is the chest,
+    // roughly 0.95 m over the bike origin, and the bike extends about the same
+    // again below and ahead of it.
+    if (s) this.dust.setShotSubject(s.position.x, s.position.y + 0.55, s.position.z, 1.45);
+    else this.dust.clearShotSubject();
+
     if (s && this.autoEmit) {
       if (!this.smearWired) this.resolveSmearRig(s);
       this.driveSpinSmear(s);

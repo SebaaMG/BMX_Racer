@@ -278,9 +278,25 @@ export const CAMERA_TUNING = {
    * frame down. Dropping it brings the ground up under the lens where it can
    * actually rush, and it is the framing a downhill run wants anyway — high and
    * back is a spectator, low and close is a rider.
+   *
+   * THAT REASONING IS SOUND AND IT WAS TAKEN TOO FAR. At 1.74 with a -0.52
+   * speed gain the eye sits 1.22 m over the pivot at speed, and the pivot is
+   * the rider's chest — so the lens ends up about 1.5 m above the bike at a
+   * four metre standoff, a seventeen degree look-down. At that angle the bike
+   * is only as visible as the ground in front of it is flat, and the ground on
+   * a mountain is not flat: any roll, crown or rut between the lens and the
+   * contact patch rises through the sight line and takes the wheels, the
+   * cranks and the rider's legs with it. A player hit it repeatedly and
+   * described it exactly right — "can't you just keep my cycle above the road".
+   *
+   * 2.30 with a -0.18 gain keeps the low-and-close intent (it is still well
+   * under the +0.52 spectator framing, and still drops as speed rises) while
+   * putting the look-down at 27-30 degrees, where the bike clears ordinary
+   * ground relief instead of being cut in half by it. Seeing the vehicle you
+   * are driving outranks the ground rushing slightly faster in the lower third.
    */
-  chaseHeight: 1.74,
-  chaseHeightSpeedGain: -0.52,
+  chaseHeight: 2.3,
+  chaseHeightSpeedGain: -0.18,
   /** Height above BikeState.position that the boom pivots on — the chest. */
   subjectPivotHeight: 0.95,
 
