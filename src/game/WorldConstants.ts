@@ -50,6 +50,23 @@ export const METRES_PER_SAMPLE = WORLD_SIZE / HEIGHTMAP_SIZE;
  */
 export const COURSE_SCALE = 0.58;
 
+/**
+ * How long the RACE is, in metres of track. The mountain is unaffected.
+ *
+ * A full descent of this course is a two-and-a-half minute run, and that is
+ * still far too long to play on a keyboard or to show to anyone. This ends the
+ * ribbon — and therefore the finish line, the checkpoints, the HUD profile and
+ * the AI's planning horizon, all of which measure against `track.length` — at
+ * 240 m, which is fifteen to twenty seconds of riding.
+ *
+ * It is the TRACK that is truncated, never the route. The massif's descent
+ * profile, the corridor prior and every terrain feature are built from the full
+ * route, so the mountain still rises behind the start gate and still falls away
+ * for two kilometres past the finish. Shortening the route instead would shrink
+ * the world with it and leave the rider on a 30 m hillock.
+ */
+export const RACE_LENGTH = 240;
+
 /** Vertical range of the mountain. */
 export const SEA_LEVEL = 0;
 export const VALLEY_HEIGHT = 55;
@@ -97,14 +114,27 @@ export interface RouteControl {
 }
 
 export const ROUTE: RouteControl[] = [
-  // ── 1. Technical start: exposed rock, tight, off-camber ──────────────────
-  { x: -69.6, z: -939.6, halfWidth: 5.2, section: TrackSectionKind.TechnicalStart },
-  { x: -60.3, z: -904.8, halfWidth: 4.6, section: TrackSectionKind.TechnicalStart },
-  { x: -38.3, z: -879.3, halfWidth: 4.2, section: TrackSectionKind.TechnicalStart },
-  { x: -10.4, z: -866.5, halfWidth: 4.1, section: TrackSectionKind.TechnicalStart },
-  { x: 19.7, z: -857.2, halfWidth: 4.3, section: TrackSectionKind.TechnicalStart },
-  { x: 45.2, z: -832.9, halfWidth: 4.6, bank: 0.18, section: TrackSectionKind.TechnicalStart },
-  { x: 55.7, z: -795.8, halfWidth: 5.2, bank: 0.22, section: TrackSectionKind.TechnicalStart },
+  // ── 1. The race, in full. See RACE_LENGTH ────────────────────────────────
+  //
+  // These seven points ARE the course: the track is truncated at 240 m, so
+  // everything past the seventh is mountain the rider looks at and never rides.
+  // That makes this stretch the whole of the game, and it was previously the
+  // WORST possible choice for one — the section is authored "exposed rock,
+  // tight, off-camber", the narrowest and most serpentine on the descent, and
+  // handing a player nothing but that is why the pack spent 70% of its samples
+  // off the trail.
+  //
+  // Re-cut as a demo run: one gentle left-to-right diagonal, no switchback, a
+  // tabletop at 150 m, and a trail wide enough to make a mistake on. The x
+  // swing is 120 m across 175 m of z, which is a lean the bike carries rather
+  // than a corner it has to be set up for.
+  { x: -70, z: -940, halfWidth: 7.0, section: TrackSectionKind.TechnicalStart },
+  { x: -58, z: -900, halfWidth: 7.0, section: TrackSectionKind.TechnicalStart },
+  { x: -42, z: -862, halfWidth: 7.0, bank: 0.12, section: TrackSectionKind.TechnicalStart },
+  { x: -22, z: -826, halfWidth: 6.8, bank: 0.14, section: TrackSectionKind.TechnicalStart },
+  { x: -2, z: -796, halfWidth: 6.8, section: TrackSectionKind.TechnicalStart },
+  { x: 22, z: -782, halfWidth: 7.2, section: TrackSectionKind.TechnicalStart },
+  { x: 48, z: -768, halfWidth: 8.0, section: TrackSectionKind.TechnicalStart },
 
   // ── 2. Scree run: open, straight, build speed ────────────────────────────
   { x: 51, z: -742.4, halfWidth: 8, section: TrackSectionKind.ScreeRun },
@@ -257,10 +287,15 @@ export const TABLETOP = {
 };
 
 export const TERRAIN_FEATURES: TerrainFeature[] = [
-  { kind: 'start-plateau', x: -69.6, z: -939.6, params: { radius: 15, flatness: 0.92 } },
+  { kind: 'start-plateau', x: -70, z: -940, params: { radius: 15, flatness: 0.92 } },
   // The tabletop. x/z is the TAKEOFF LIP and sits on the route; everything else
   // is measured along the route from there. See TABLETOP above.
-  { kind: 'tabletop', x: 13.6, z: 77.1, params: { ...TABLETOP } },
+  //
+  // Moved to 150 m along the course, and the finish flat to 240 m, because the
+  // RACE is now 240 m (see RACE_LENGTH). The ravine, ridge and stream anchors
+  // below are left where they are: they are two kilometres past the finish now,
+  // still shaping the mountain the rider is looking at, just not ridden.
+  { kind: 'tabletop', x: -10.1, z: -806, params: { ...TABLETOP } },
   // The ravine: a genuine gap the rider must clear. Steep sides, 11m across.
   { kind: 'ravine', x: 18.6, z: 177.5, params: { width: 11.5, depth: 26, length: 139, angle: 1.44 } },
   // The ridge: narrow the crest and drop the flanks hard.
@@ -268,7 +303,7 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   // The stream: a carved channel with a wet floor.
   { kind: 'stream-channel', x: 31.9, z: 545.2, params: { width: 14, depth: 5.5, length: 151, angle: 0.86 } },
   { kind: 'rock-garden', x: -29, z: -58, params: { radius: 41, roughness: 1.35, boulderCount: 46 } },
-  { kind: 'finish-flat', x: 62.6, z: 864.2, params: { radius: 35, flatness: 0.85 } },
+  { kind: 'finish-flat', x: 51.4, z: -752.9, params: { radius: 35, flatness: 0.85 } },
 ];
 
 // ── The tabletop, as one shape both systems build ────────────────────────────

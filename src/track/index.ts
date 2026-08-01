@@ -27,7 +27,7 @@ import {
   TrackSampleResult,
   TrackSectionKind,
 } from '../game/Contracts';
-import { RACER_COUNT, START_SPACING } from '../game/WorldConstants';
+import { RACER_COUNT, RACE_LENGTH, START_SPACING } from '../game/WorldConstants';
 import { TrackSpline, TrackProjection, SectionRange, createTrackSample } from './TrackSpline';
 import { TrackRibbon } from './TrackRibbon';
 import { Furniture } from './Furniture';
@@ -62,7 +62,7 @@ export class Track implements ITrack {
   constructor(terrain: ITerrain, options: CreateTrackOptions = {}) {
     this.object.name = 'track';
 
-    this.spline = new TrackSpline(terrain);
+    this.spline = new TrackSpline(terrain, { maxLength: RACE_LENGTH });
 
     if (options.applyCarve !== false) {
       terrain.applyTrackCarve(this.spline.getCarve());

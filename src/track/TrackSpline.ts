@@ -144,6 +144,19 @@ export interface TrackSplineOptions {
   lift?: number;
   /** Local search half-window used by `project` when a hint is supplied. */
   hintWindow?: number;
+  /**
+   * Truncate the finished course to this many metres of arc length.
+   *
+   * The MOUNTAIN is built from the full route — the massif's descent profile,
+   * the corridor prior and the terrain features all key off it — so shortening
+   * the route itself would shrink the whole world with it and flatten the
+   * skyline. Truncating the TRACK instead keeps the mountain exactly as it is
+   * and simply ends the ribbon, and with it the race, early: `length` is the
+   * single number the finish line, the checkpoints, the HUD profile and the
+   * AI's planner all measure against, so every one of them follows without
+   * knowing this happened.
+   */
+  maxLength?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,7 +420,7 @@ export class TrackSpline {
       const dy = smoothed[i] - smoothed[i - 1];
       cum3[i] = cum3[i - 1] + Math.hypot(planStep, dy);
     }
-    const total3 = cum3[planCount - 1];
+    const total3 = Math.min(cum3[planCount - 1], opts.maxLength ?? Infinity);
     const count = Math.max(2, Math.round(total3 / spacing) + 1);
     const step3 = total3 / (count - 1);
 
