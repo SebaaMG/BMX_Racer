@@ -139,6 +139,25 @@ export class TrackRibbon {
     this.buildRows(terrain, rows, links);
 
     this.material = buildRibbonMaterial(spline);
+
+    // The ribbon and the ground are now COPLANAR by construction — the terrain
+    // carve targets the ribbon surface exactly, because the heightfield is what
+    // the bike collides with and the ribbon is what the player sees, so any gap
+    // between them is a gap between where the wheels are and where the trail
+    // looks like it is. The ground used to be carved 12 cm low purely to break
+    // the depth tie, which bought a clean raster at the price of burying every
+    // wheel in the game 12 cm under the track.
+    //
+    // Coplanar surfaces are a DEPTH problem, so they get a depth fix: bias the
+    // ribbon toward the camera in window-space Z. Negative units pull it
+    // nearer. The factor term scales with the polygon's depth slope, which is
+    // the part that matters here — the trail is seen at raking angles where the
+    // depth gradient across a single pixel is enormous, and a constant-only
+    // offset that suffices head-on does nothing at 2 degrees of incidence.
+    this.material.polygonOffset = true;
+    this.material.polygonOffsetFactor = -2;
+    this.material.polygonOffsetUnits = -4;
+
     this.emitChunks(links);
   }
 

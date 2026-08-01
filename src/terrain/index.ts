@@ -389,7 +389,7 @@ export class Terrain implements ITerrain, ScatterSource {
     const sumW = new Float32Array(size * size);
     const sumWY = new Float32Array(size * size);
     const zoneMark = new Uint8Array(size * size);
-    const feather = Math.max(carve.featherWidth, 0.5);
+    const baseFeather = Math.max(carve.featherWidth, 0.5);
 
     let bx0 = size;
     let bx1 = 0;
@@ -406,6 +406,23 @@ export class Terrain implements ITerrain, ScatterSource {
       // supply the rideable width, so this cannot silently paint nothing.
       const rideHw = carve.rideWidths?.[i] ?? hw * 0.86;
       const bank = carve.banks[i];
+
+      // The feather widens with how much material the carve is MOVING, so that
+      // cuttings and embankments come out at the angle of repose instead of as
+      // vertical walls.
+      //
+      // The course is now held to a descent (see `limitClimb` in TrackSpline),
+      // which means that wherever the route used to climb a spur it now cuts
+      // through it — the worst case takes about 11 m off a crest at 270 m. At a
+      // fixed feather that is a slot with 11 m sides and a 6 m floor. Loose
+      // alpine scree stands at roughly 34 deg, so a cut of depth d wants
+      // d / tan(34 deg) = 1.48 d of lateral run to lie back naturally, and a
+      // spoil bank on the low side wants the same. Capped, because the carve
+      // cost is quadratic in reach and one deep cut should not stamp a 200 m
+      // clearing across the mountain.
+      const ground = this.heightAt(p.x, p.z);
+      const move = Math.abs(ground - p.y);
+      const feather = Math.min(baseFeather + move * 1.48, baseFeather + 26);
       const reach = hw + feather;
 
       // Local left, from the centreline tangent. Left = up x forward.
@@ -459,10 +476,27 @@ export class Terrain implements ITerrain, ScatterSource {
           if (wAlong <= 0) continue;
           const w = wLat * wAlong;
           sumW[k] += w;
-          // 0.12m below the ribbon surface: enough that the mesh never
-          // z-fights the ground it is lying on, small enough that the skirt
-          // still seals the seam from a low camera.
-          sumWY[k] += w * (p.y - 0.12 + lateral * tanBank);
+          // Carve to the ribbon surface EXACTLY. This used to be `p.y - 0.12`,
+          // pushing the ground 12 cm below the trail mesh so the two could not
+          // z-fight — but the heightfield is not decoration, it is the
+          // COLLISION SURFACE. The bike contacts `terrain.heightAt`; the player
+          // sees the ribbon. Separating them by 12 cm means the wheels ride 12
+          // cm under the trail, for the entire length of the course, and a
+          // player put it plainly: the bikes are "going inside the track ...
+          // not just on the top of the path".
+          //
+          // Measured over the first 260 m: the ribbon floated 0.181 m above the
+          // collision surface on average and on 131 of 131 samples — never once
+          // agreeing. The extra beyond the authored 0.12 is the lattice: a
+          // carve target sampled at grid corners and read back bilinearly
+          // between them loses a little more depth wherever the trail runs
+          // diagonally across cells.
+          //
+          // Z-fighting is a depth-buffer problem and it is fixed in the depth
+          // buffer, with polygonOffset on the ribbon material. Moving physical
+          // geometry to fix a rasteriser tie is paying for a rendering artefact
+          // with gameplay.
+          sumWY[k] += w * (p.y + lateral * tanBank);
         }
       }
     }

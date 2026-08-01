@@ -367,19 +367,15 @@ export interface RacerInit {
   phase: number;
 }
 
-/** Shared plumbing: progress bookkeeping, the scene node, trick adoption. */
-/**
- * Global trim on AI steering output. See the note at its use site: the bike's
- * steering response changed under the AI, and this keeps the closed loop at the
- * gain it was tuned for rather than re-tuning three personalities by hand.
- */
-const AI_STEER_TRIM = 0.36;
 /*
- * 0.36 is measured, not guessed, and it is a STOPGAP.
+ * POST-MORTEM: the steering trim that used to live here, and what it was
+ * really measuring. Kept because the data is the clearest example in this
+ * repo of a measurement that is entirely real and entirely misread.
  *
- * Swept against a 180-frame pack-race run, recording what fraction of frames
- * the controller spent at full lock, how far off the racing line it wandered,
- * and how much course it actually covered:
+ * A global `AI_STEER_TRIM = 0.36` multiplied the steer command. It was swept
+ * against a 180-frame pack-race run, recording what fraction of frames the
+ * controller spent at full lock, how far off the racing line it wandered, and
+ * how much course it actually covered:
  *
  *   gain x   saturated   max |lat|   moved   end speed
  *      1.0        92%       3.9 m     23 m     7 km/h
@@ -388,18 +384,26 @@ const AI_STEER_TRIM = 0.36;
  *      0.35       36%      24.3 m     26 m    21 km/h
  *      0.25       18%      25.7 m     40 m    27 km/h
  *
- * The tension is visible and it is not resolvable with one number: reducing the
- * gain stops the controller sawing the bars and scrubbing every bit of speed,
- * and simultaneously lets it drift off the line. 0.5 of the previous 0.72 is
- * the knee — most course covered at a lateral error the trail can still
- * contain — but 44% of frames at full lock is not a tuned controller.
+ * Every number in that table is accurate. The conclusion drawn from it — that
+ * 0.36 was "the knee", a real trade-off between sawing the bars and drifting
+ * off line — was wrong, and the table itself says so if you read it as
+ * evidence about the SIGN rather than the gain.
  *
- * The real fix is a re-tune of steerKp/steerKd/lateralGain per personality
- * against the CURRENT bike, which gained about 30% more yaw per unit of steer
- * when camber thrust was re-expressed in the unit a leaned bike needs and the
- * yaw damper stopped being referenced to zero. That is a subsystem pass, not a
- * scalar.
+ * The steer command was inverted (see the note at the use site). So the loop
+ * was positive feedback, and the sweep was measuring how fast a divergent loop
+ * diverges. At gain 1.0 it slams to full lock in a fraction of a second and
+ * stays there, which is why max lateral is SMALLEST at the highest gain — the
+ * rider is pinned in a circle, not holding a line. Reducing the gain does not
+ * trade accuracy for smoothness, it just weakens the divergence, so every step
+ * down looks like an improvement in "moved" and "end speed" and never bottoms
+ * out. A sweep whose answer is "less, and still less" all the way to the edge
+ * of its range is not reporting an optimum. It is reporting the wrong sign.
+ *
+ * With the sign corrected the trim is gone entirely — not retuned, removed —
+ * and the personalities run at their authored gains.
  */
+
+/** Shared plumbing: progress bookkeeping, the scene node, trick adoption. */
 
 export abstract class RacerBase implements IRacer {
   readonly id: string;
@@ -1122,16 +1126,32 @@ export class AIRider extends RacerBase {
     // lateral term a rider that gets pushed 2m off line runs the whole rest of
     // the section 2m off line, perfectly parallel to where it should be.
     const lateralErr = this.smoothedTargetLateral - this.tracker.lateral;
-    let steer = err * p.steerKp + errRate * p.steerKd + lateralErr * p.lateralGain;
-
-    // The bike gained about 30% more yaw per unit of steer when camber thrust
-    // was re-expressed in the unit a leaned bike actually needs (load * tan of
-    // the lean angle) and the yaw damper stopped being referenced to zero — it
-    // had been damping the corner itself. At the old gains the closed loop now
-    // overshoots: an autopilot sweep measured mean |lateral| 1.82 m and 25.8%
-    // off-track against 0.74 m and 2.1% before the physics change, with the
-    // optimum gain moving from 2.2 to 1.6.
-    steer *= AI_STEER_TRIM;
+    // NEGATED, and the negation is the whole fix. Three conventions meet here
+    // and two of them run opposite to the third:
+    //
+    //   yaw = atan2(x, z) increases toward +X, and +X is LEFT
+    //     (`buildOrientation`: "Bike space is +Z forward, +Y up, +X left")
+    //   shortAngle(a, b) returns b - a, so err > 0 means TARGET IS LEFT
+    //   lateral = rel · left, so lateralErr < 0 means WE ARE LEFT OF THE LINE
+    //   ...but `Wheel.ts`: "Positive steer is to the RIGHT"
+    //
+    // So `steer = +err * kp` commanded a right turn to reach a target on the
+    // left, and the lateral term pushed further out the side it was already
+    // off. Both error terms fed the bike away from the course.
+    //
+    // This is not a mistuned loop, it is positive feedback: it diverges rather
+    // than wanders. Measured at the start line, 10 s in, heading error against
+    // the course tangent — ai0 102 deg, ai1 173 deg (riding back up the
+    // mountain), ai2 69 deg, with the pack covering 0.7-1.9 m in ten seconds.
+    //
+    // AI_STEER_TRIM lived here at 0.36 and is now gone. It was me tuning the
+    // GAIN of a loop whose SIGN was wrong: with the sign inverted, every
+    // reduction in gain genuinely improved the measured error, because the only
+    // thing it was doing was weakening a divergent loop. That is why the sweep
+    // bottomed out at 0.36 instead of at 1.0, and why 44% of frames sat at full
+    // lock. A sweep that keeps recommending "less" all the way down is evidence
+    // about the sign, not the gain.
+    let steer = -(err * p.steerKp + errRate * p.steerKd + lateralErr * p.lateralGain);
 
     // Steering authority falls off with speed in the physics; ask for more when
     // fast so the closed loop keeps roughly constant response.

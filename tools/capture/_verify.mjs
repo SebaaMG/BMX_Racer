@@ -1,62 +1,41 @@
 import { chromium } from 'playwright';
-const b = await chromium.launch({ headless: true, args: ['--use-angle=default','--enable-gpu','--ignore-gpu-blocklist','--enable-unsafe-swiftshader'] });
-const p = await b.newPage({ viewport: { width: 900, height: 520 } });
-p.on('pageerror', e => console.log('PAGEERR', e.message.slice(0,300)));
-p.on('console', m => { if (m.type()==='error') console.log('[err]', m.text().slice(0,400)); });
-await p.goto('http://127.0.0.1:5173/?capture=1&pr=1', { waitUntil: 'domcontentloaded' });
-await p.waitForFunction(() => !!window.__DESCENT__?.game?.effects, null, { timeout: 240000 });
-await p.evaluate(() => window.__DESCENT__.game.capture.takeControl());
+const b = await chromium.launch({ headless: true, args: ['--use-angle=default','--enable-gpu','--ignore-gpu-blocklist'] });
+const p = await b.newPage();
+p.on('pageerror', e => console.log('PAGEERR', e.message.slice(0,200)));
+await p.goto('http://127.0.0.1:5173/', { waitUntil: 'domcontentloaded' });
+await p.waitForFunction(() => !!window.__DESCENT__?.game?.race, null, { timeout: 300000 });
 
-// Impact-frame timeline: how many consecutive frames carry a flash?
-const timeline = await p.evaluate(() => {
-  const g = window.__DESCENT__.game, fx = g.effects;
-  g.capture.setSequence('landing');
-  const rows = [];
-  for (let i = 0; i < 90; i++) {
-    g.capture.step(1/60);
-    const u = g.post.composite.uniforms;
-    rows.push({ f: i, flash: +u.uImpactFlash.value.toFixed(3), ink: +u.uInkFlood.value.toFixed(3),
-                desat: +u.uDesaturate.value.toFixed(3), ts: +fx.timeScale.toFixed(2),
-                dust: fx.dust.countAlive() });
+// 1. RIBBON vs COLLISION SURFACE, whole course
+const float = await p.evaluate(() => {
+  const g = window.__DESCENT__.game, t = g.track, terr = g.terrain;
+  let sum=0, n=0, mx=-9, mn=9, off=0;
+  for (let d=0; d<=t.length; d+=4) {
+    const s = t.sampleAtDistance(d);
+    const gap = s.position.y - terr.heightAt(s.position.x, s.position.z);
+    sum+=gap; n++; mx=Math.max(mx,gap); mn=Math.min(mn,gap);
+    if (Math.abs(gap) > 0.06) off++;
   }
-  const hot = rows.filter(r => r.flash > 0.01);
-  return { flashFrames: hot.length, peakFlash: Math.max(...rows.map(r=>r.flash)),
-           peakInk: Math.max(...rows.map(r=>r.ink)), peakDesat: Math.max(...rows.map(r=>r.desat)),
-           frozenFrames: rows.filter(r=>r.ts===0).length,
-           maxDust: Math.max(...rows.map(r=>r.dust)),
-           window: hot.slice(0, 8) };
+  return { mean:+(sum/n).toFixed(3), min:+mn.toFixed(3), max:+mx.toFixed(3), n, offBy6cm:off };
 });
-console.log('IMPACT', JSON.stringify(timeline));
+console.log('1. RIBBON FLOAT over the whole course:', JSON.stringify(float));
 
-async function shot(seq, n, tag) {
-  const r = await p.evaluate(([s, k]) => {
-    const g = window.__DESCENT__.game, fx = g.effects;
-    g.capture.setSequence(s);
-    let maxD = 0, maxDeb = 0;
-    for (let i = 0; i < k; i++) {
-      g.capture.step(1/60);
-      maxD = Math.max(maxD, fx.dust.countAlive());
-      maxDeb = Math.max(maxDeb, fx.debris.liveCount ?? 0);
-    }
-    const st = g.race.player.bike.state;
-    return { dust: fx.dust.countAlive(), maxDust: maxD, maxDebris: maxDeb,
-             surf: st.rear.surface?.kind, dustAmt: st.rear.surface?.dustAmount,
-             kmh: +(st.speed*3.6).toFixed(1), mode: st.mode };
-  }, [seq, n]);
-  console.log(tag, JSON.stringify(r));
-  await p.evaluate(() => new Promise(r => requestAnimationFrame(() => r())));
-  await p.screenshot({ path: `captures/_v_${tag}.png` });
-}
-await shot('landing', 34, 'landing');
-await shot('crash', 20, 'crash');
-await p.evaluate(() => { const g = window.__DESCENT__.game; g.capture.setPose('streambed'); for (let i=0;i<40;i++) g.capture.step(1/60); });
-const water = await p.evaluate(() => {
-  const g = window.__DESCENT__.game, st = g.race.player.bike.state, fx = g.effects;
-  return { frontSurf: st.front.surface?.kind, rearSurf: st.rear.surface?.kind,
-           dustAmt: st.rear.surface?.dustAmount, dust: fx.dust.countAlive(),
-           debris: fx.debris.liveCount, kmh: +(st.speed*3.6).toFixed(1) };
+// 2. AI DIRECTION — 20 s of real racing
+await p.evaluate(() => { window.__DESCENT__.game.race.forceRacing?.(); });
+await p.evaluate(() => new Promise(r => setTimeout(r, 20000)));
+const ai = await p.evaluate(() => {
+  const g = window.__DESCENT__.game;
+  const FWD = new g.race.player.bike.state.position.constructor(0,0,1);
+  return g.race.racers.map(r => {
+    const st = r.bike.state;
+    const fwd = FWD.clone().applyQuaternion(st.orientation); fwd.y = 0; fwd.normalize();
+    const s = g.track.sampleAtDistance(r.progress?.distance ?? 0);
+    const tan = s.tangent.clone(); tan.y = 0; tan.normalize();
+    return { id: r.id, kmh: +(st.speed*3.6).toFixed(0),
+             dist: +(r.progress?.distance ?? -1).toFixed(0),
+             headErr: +(Math.acos(Math.max(-1,Math.min(1,fwd.dot(tan))))*180/Math.PI).toFixed(0),
+             lat: +(r.trackLateral ?? 0).toFixed(1), mode: st.mode };
+  });
 });
-console.log('STREAM', JSON.stringify(water));
-await p.evaluate(() => new Promise(r => requestAnimationFrame(() => r())));
-await p.screenshot({ path: 'captures/_v_stream.png' });
+console.log('\n2. AFTER 20 s OF RACING (headErr 0 = facing down-course):');
+for (const r of ai) console.log('  ', JSON.stringify(r));
 await b.close();

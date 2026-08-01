@@ -77,6 +77,18 @@ const _seg = new Vector3();
 const _rel = new Vector3();
 
 /** Section order, so a section can live in a Uint8Array. */
+/**
+ * How much the course is allowed to go UP. See `limitClimb`.
+ *
+ * 4.5 deg and 1.6 m are chosen from what a rider can carry speed over rather
+ * than from what looks tidy on a graph: coasting onto a 1.6 m rise costs
+ * sqrt(2 g h) = 5.6 m/s of stored speed, which a bike already doing 40 km/h
+ * gives up without the player feeling cheated. Rollers, dips and the back side
+ * of a compression all still read; hills do not.
+ */
+const MAX_UPHILL_GRADE = (4.5 * Math.PI) / 180;
+const MAX_UPHILL_RISE = 1.6;
+
 export const SECTION_ORDER: readonly TrackSectionKind[] = [
   TrackSectionKind.TechnicalStart,
   TrackSectionKind.ScreeRun,
@@ -337,6 +349,13 @@ export class TrackSpline {
       raw, preserve, sharp, planStep, smoothRadius, featureRadius, lipRadius,
     );
     limitSlope(smoothed, planStep, 1.05);
+
+    // The course descends. See `limitClimb` — `limitSlope` above bounds the
+    // MAGNITUDE of the gradient and is entirely indifferent to its sign, which
+    // is how a point-to-point downhill race ended up with 74.8 m of climbing in
+    // it. Runs here, before the lip surgery, so authored takeoffs are added to
+    // an already-descending profile and are never themselves cut down.
+    limitClimb(smoothed, planStep, MAX_UPHILL_GRADE, MAX_UPHILL_RISE, preserve);
 
     // ── 4. Lip surgery ───────────────────────────────────────────────────────
     const gapFlagPlan = new Float32Array(planCount);
@@ -999,7 +1018,24 @@ export class TrackSpline {
     const banks: number[] = [];
     for (let i = 0; i < this.count; i += step) {
       if (this.gapMask[i] > 0.5) continue;
-      points.push(new Vector3(this.px[i], this.py[i] - this.lift, this.pz[i]));
+      // Carve to the centreline height ITSELF, `lift` included.
+      //
+      // This used to emit `py - this.lift`, undoing at carve time the 0.06 that
+      // step 5 adds to the profile — so the ground finished 6 cm below the
+      // ribbon that is drawn from `py`. Together with a separate 0.12 drop
+      // inside the carve itself (removed; see the note there) that put the
+      // collision surface a persistent 18 cm under the visible trail, which is
+      // why a player saw the bikes riding INSIDE the track rather than on it.
+      //
+      // The residual after fixing only the 0.12 was mean 0.061 m with the 5th
+      // and 95th percentiles at 0.041 and 0.079 — far too tight a distribution
+      // to be lattice error, and within a millimetre of `lift`. That is what a
+      // systematic offset looks like as opposed to sampling noise, and it is
+      // worth trusting: 6 cm of bias with 4 cm of spread is one cause, not many.
+      //
+      // `lift` still does its job. It raises the trail proud of the surrounding
+      // hillside; it was never meant to sink the ground beneath it.
+      points.push(new Vector3(this.px[i], this.py[i], this.pz[i]));
       // Berms sit outside the nominal width, and the corridor has to be flat
       // enough underneath them that the berm is a built feature rather than a
       // ridge of terrain poking through it.
@@ -1171,6 +1207,54 @@ function limitSlope(h: Float64Array, step: number, maxSlope: number): void {
     else if (d < -maxDelta) bwd[i] = bwd[i + 1] - maxDelta;
   }
   for (let i = 0; i < n; i++) h[i] = (fwd[i] + bwd[i]) * 0.5;
+}
+
+/**
+ * Enforce the one property that makes this course a DOWNHILL course: it may
+ * flatten, it may roll, it must never climb a hill.
+ *
+ * `limitSlope` bounds |dy| symmetrically, which says "rideable gradient" and
+ * says nothing at all about direction. The elevation profile is sampled from
+ * the mountain, so wherever the route crosses a spur it simply climbed it.
+ * Measured on the shipping course before this existed: 74.8 m of total ascent
+ * spread over SIXTEEN separate climbs, the worst of them +12.6 m over 38 m at
+ * a peak of 29.2 deg, at 246 m — about fifteen seconds in. A rider arriving at
+ * a 29 deg wall on a bike with no drivetrain to speak of stops dead, which is
+ * exactly what a player reported: "the first bump is so high we can't even go
+ * past it".
+ *
+ * Two bounds, both needed:
+ *
+ *   - a gradient cap, so nothing kicks up sharply, and
+ *   - a cap on height above the RUNNING MINIMUM, so a long shallow climb
+ *     cannot accumulate into a hill one grade-limited step at a time.
+ *
+ * The second is the one that matters. A pure gradient cap of 6 deg still
+ * permits +4 m over the same 38 m, and permits it indefinitely.
+ *
+ * `protect` (0..1) exempts authored features — a tabletop deck and the far lip
+ * of the ravine gap are climbs on purpose, and this runs BEFORE that surgery
+ * anyway, so the mask is belt and braces for anything the route asks to keep.
+ */
+function limitClimb(
+  h: Float64Array,
+  step: number,
+  maxGrade: number,
+  maxRise: number,
+  protect?: Float32Array,
+): void {
+  const maxDelta = Math.tan(maxGrade) * step;
+  let floor = h[0];
+  for (let i = 1; i < h.length; i++) {
+    const keep = protect ? protect[i] : 0;
+    if (keep < 0.999) {
+      const capped = Math.min(h[i], h[i - 1] + maxDelta, floor + maxRise);
+      // Blend rather than switch, so a partially-protected sample does not
+      // step. At keep = 1 the authored height survives untouched.
+      h[i] = h[i] * keep + capped * (1 - keep);
+    }
+    if (h[i] < floor) floor = h[i];
+  }
 }
 
 function boxSmooth(src: Float32Array, dst: Float32Array, radius: number): void {
