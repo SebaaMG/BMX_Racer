@@ -995,6 +995,7 @@ export class TrackSpline {
     const step = Math.max(1, Math.round(1.5 / this.spacing));
     const points: Vector3[] = [];
     const halfWidths: number[] = [];
+    const rideWidths: number[] = [];
     const banks: number[] = [];
     for (let i = 0; i < this.count; i += step) {
       if (this.gapMask[i] > 0.5) continue;
@@ -1003,9 +1004,10 @@ export class TrackSpline {
       // enough underneath them that the berm is a built feature rather than a
       // ridge of terrain poking through it.
       halfWidths.push(this.halfWidth[i] * (1.22 + this.bermStrength[i] * 0.45) + 1.1);
+      rideWidths.push(this.halfWidth[i]);
       banks.push(this.bank[i]);
     }
-    this.carve = { points, halfWidths, banks, featherWidth: 4.2 };
+    this.carve = { points, halfWidths, rideWidths, banks, featherWidth: 4.2 };
     return this.carve;
   }
 

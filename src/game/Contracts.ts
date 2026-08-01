@@ -96,6 +96,18 @@ export interface TrackCarve {
   points: Vector3[];
   /** Half-width of the flattened corridor at each point. */
   halfWidths: number[];
+  /**
+   * RIDEABLE half-width at each point — what the trail is, as opposed to how
+   * wide the ground was flattened around it.
+   *
+   * `halfWidths` is the flattening reach and is inflated (about 1.22x plus a
+   * berm term plus 1.1 m of shoulder), so it cannot be inverted back to the
+   * trail's real width. Painting the Trail zone out to a fraction of the
+   * INFLATED width left a 1-2 m ring of trail-coloured terrain outside the
+   * ribbon mesh all the way down the course — which at the 1-2 degree grazing
+   * incidence of a receding trail projects to 30-70 px of torn edge.
+   */
+  rideWidths?: number[];
   /** Bank angle in radians at each point (positive = banked right). */
   banks: number[];
   /** Blend falloff distance beyond the half-width. */

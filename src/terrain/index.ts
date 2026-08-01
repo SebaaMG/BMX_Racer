@@ -402,6 +402,9 @@ export class Terrain implements ITerrain, ScatterSource {
     for (let i = 0; i < n; i++) {
       const p = carve.points[i];
       const hw = carve.halfWidths[i];
+      // Fall back to the old inflated-width behaviour if a track does not
+      // supply the rideable width, so this cannot silently paint nothing.
+      const rideHw = carve.rideWidths?.[i] ?? hw * 0.86;
       const bank = carve.banks[i];
       const reach = hw + feather;
 
@@ -439,10 +442,15 @@ export class Terrain implements ITerrain, ScatterSource {
 
           const k = row + ix;
           if (wLat > cover[k]) cover[k] = wLat;
-          // Strictly INSIDE the ribbon mesh (0.86 of the half-width), so the
-          // mesh always covers the zone patch and its 2 m texel edge can never
-          // be the visible boundary.
-          if (Math.abs(lateral) < hw * 0.86 && along < reach) zoneMark[k] = 1;
+          // Paint the Trail zone to the RIDEABLE width, not the flattening
+          // reach. `hw` is inflated (1.22x plus a berm term plus 1.1 m), so
+          // 0.86 of it painted a 1-2 m ring of trail-coloured terrain outside
+          // the ribbon mesh for the entire length of the course. On ground
+          // receding at 1-2 degrees of grazing incidence that ring projects to
+          // 30-70 px, which is the row of triangular teeth hanging off the
+          // trail edge in valley-vista. Measured off the built geometry: ribbon
+          // drawn edge 4.16 m, skirt 5.49 m, zone collar 6.11 m.
+          if (Math.abs(lateral) < rideHw && along < reach) zoneMark[k] = 1;
 
           // The tent. Zero at one point-spacing away, so exactly two points
           // contribute to any position on a straight run and their weights sum
