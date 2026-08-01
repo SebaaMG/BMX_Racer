@@ -240,7 +240,7 @@ export class Sky {
         //    two unrelated palettes instead of a horizon. A far ridge and the
         //    sky immediately behind it now belong to the same family, which is
         //    what aerial perspective is.
-        uUpperPale: { value: mixed(SKY.upper, SKY.cloudLit, 0.42) },
+        uUpperPale: { value: mixed(SKY.upper, SKY.cloudLit, 0.30) },
         uGlow: { value: mixed(SKY.belowHorizon, SKY.sunGlow, 0.50) },
         uFoot: { value: mixed(SKY.belowHorizon, FOG_BANDS.colors[3], 0.55) },
         uSunDisc: { value: SKY.sunDisc.clone() },
@@ -588,13 +588,25 @@ export class Sky {
           // the top of the sky.
           float hZenith  = h + wander * 0.240 + brushField(sp, 27.0) * 0.055;
 
+          // ── THE SOFTNESS FLOORS ARE NOW BELOW THE PIXEL, NOT ABOVE IT ────────
+          // These were 0.0018 to 0.0030 in dir.y. At 1453 native rows per unit of
+          // dir.y that is a boundary 5 to 9 ROWS deep, against an fwidth-derived
+          // one-pixel cut of 0.00055 — so the floor was winning everywhere and
+          // every band edge in the sky was several pixels of ramp. It does not
+          // show as a gradient going down the frame, because 6 rows is nothing;
+          // it shows when a nearly-level boundary is traced ALONG its length,
+          // which is how the stills critic measures, and it turns a hard cut into
+          // 890 pixels of sub-4-unit steps. Rule 4 of Palette.ts says never a
+          // smoothstep between bands wider than the antialiasing width, and these
+          // were three to five times it. The floors are now under the fwidth term,
+          // so every one of these is a genuine one-pixel cut.
           vec3 col = uFoot;
-          col = mix(col, uBelow,     bandStepS(hBelow,   -0.090, 0.0018));
-          col = mix(col, uGlow,      bandStepS(hGlow,    -0.034, 0.0018));
-          col = mix(col, uHorizon,   bandStepS(hHorizon,  0.016, 0.0018));
-          col = mix(col, uUpperPale, bandStepS(hWarm,     0.070, 0.0020));
-          col = mix(col, uUpper,     bandStepS(hUpper,    0.145, 0.0022));
-          col = mix(col, uZenith,    bandStepS(hZenith,   0.500, 0.0030));
+          col = mix(col, uBelow,     bandStepS(hBelow,   -0.090, 0.0007));
+          col = mix(col, uGlow,      bandStepS(hGlow,    -0.034, 0.0007));
+          col = mix(col, uHorizon,   bandStepS(hHorizon,  0.016, 0.0007));
+          col = mix(col, uUpperPale, bandStepS(hWarm,     0.070, 0.0007));
+          col = mix(col, uUpper,     bandStepS(hUpper,    0.145, 0.0008));
+          col = mix(col, uZenith,    bandStepS(hZenith,   0.500, 0.0010));
 
           // Warm plateaus hugging the horizon on the sun side. Dawn light does
           // not wrap a sky evenly, and a gradient that is symmetric in azimuth

@@ -320,6 +320,20 @@ export class Game {
     });
     await frame();
 
+    // Make the terrain's own zone ids authoritative for the line pass.
+    //
+    // LinesPass needs to know which material ids are PAINTED terrain zones,
+    // because on those a material-id edge is a colour step and must never carry
+    // a stroke — the terrain prepass writes its normal from the blurred normal
+    // map and its depth from the rasteriser, so the two channels describe
+    // different surfaces and an id edge there is paint, not geometry. It
+    // otherwise rebuilds that list from the same `terrain:<name>` naming
+    // convention TerrainMaterial uses, which is correct today and would drift
+    // silently if either side were renamed. Handing it the real array closes
+    // that.
+    const zoneIds = this.terrain.materials?.shared?.uZoneIds?.value as number[] | undefined;
+    if (zoneIds) this.post.lines.setPaintIds?.(zoneIds);
+
     progress(0.78, 'Effects');
     this.effects = createEffects({
       scene,

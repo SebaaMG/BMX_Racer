@@ -596,14 +596,22 @@ export class CompositePass {
        * per-frame dramatic dial. Left addressable so tools/capture/_ab.mjs and
        * _skyab.mjs can force it to 0 and measure the frame against itself.
        *
-       * 24 steps is 10.6/255 per riser: coarse enough that the critic's
-       * "maximum single-pixel step of 1.0 across 750 pixels" becomes a run of
-       * hard cuts, fine enough that no authored plateau is merged into its
-       * neighbour (the smallest gap between two adjacent band colours anywhere
-       * in Palette.ts is larger than one step).
+       * 20 steps is 12.75/255 per riser. Chosen by measurement rather than
+       * taste: on the critic's own trace — ravine-gap y = 1000, x 2400..3150 —
+       * 24 steps gave a maximum single-pixel step of 7.1 spread over 62
+       * crossings, and 20 gives 12.9 over 22. Fewer, harder cuts is the correct
+       * direction as well as the better number; many small crossings is a
+       * texture, a few large ones is a cel band.
+       *
+       * It cannot merge two authored plateaus, and the reason is the low gate
+       * below rather than the step size: a flat region has a tone rate of zero
+       * and is returned bit-identical, so two flat bands 11 units apart both
+       * come out untouched however coarse the staircase is. Only a region that
+       * is genuinely ramping can be snapped, and a ramp has no plateaus to
+       * merge.
        */
       uTonePost: { value: 1 },
-      uToneSteps: { value: 24 },
+      uToneSteps: { value: 20 },
       uDebug: { value: 0 },
       // Grade tail (declared by GLSL_GRADE).
       uLut: { value: lut },

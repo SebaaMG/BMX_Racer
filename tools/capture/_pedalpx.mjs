@@ -90,6 +90,16 @@ const out = await p.evaluate(async () => {
     gapL: +sL.distanceTo(pL).toFixed(4),
     gapR: +sR.distanceTo(pR).toFixed(4),
     pedalWorldY: [+pL.y.toFixed(3), +pR.y.toFixed(3)],
+    // Hands vs the bar anchors — the "a hand leaves the bars" check.
+    barL: proj(wp(an.barLeft)),
+    barR: proj(wp(an.barRight)),
+    handL: proj(wp(bones[idx.handL])),
+    handR: proj(wp(bones[idx.handR])),
+    handGap: [
+      +wp(bones[idx.handL]).distanceTo(wp(an.barLeft)).toFixed(4),
+      +wp(bones[idx.handR]).distanceTo(wp(an.barRight)).toFixed(4),
+    ],
+    lockH: [+r.rig.applied[15].toFixed(3), +r.rig.applied[16].toFixed(3)],
   };
 });
 console.log(JSON.stringify(out, null, 1));

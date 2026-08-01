@@ -41,10 +41,10 @@ async function shot(name) {
 const setMode = (mode) => page.evaluate((m) => {
   const u = window.__DESCENT__.game.post.lines.uniforms;
   if (m === 'before') {
-    u.uPaintIdCount.value = 0;          // no paint gating at all
+    u.uPaintMask.value = 0;          // no paint gating at all
     u.uPressure.value.set(0.95, 0.95);  // the old flat mix(0.82,1.0,weight)
   } else {
-    u.uPaintIdCount.value = 7;
+    u.uPaintMask.value = 254;
     u.uPressure.value.set(0.45, 1.05);
   }
 }, mode);

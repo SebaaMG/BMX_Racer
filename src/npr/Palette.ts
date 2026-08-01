@@ -531,6 +531,27 @@ export const LINES = {
    */
   contourFogCap: 0.12,
   /**
+   * PEN PRESSURE. `pow(interior, 1/weight)` is the IDENTITY when interior is
+   * 1.0, and every edge detector ends in a smoothstep that saturates — so on a
+   * faceted solid four facet edges of dihedral 27-55 degrees all inked at
+   * 0.85-0.91 and the rock read as a wireframe. That is why curvatureWeight and
+   * curvatureFloor appeared to thin nothing: they were being handed a saturated
+   * input. Pressure now comes from the SIZE of the fold rather than from a
+   * saturated detector, and `pow` keeps only the width shoulder it was ever
+   * good for.
+   */
+  pressureRange: [0.45, 1.05] as [number, number],
+  /** Normal turn / depth step, as a multiple of the crease threshold. */
+  pressureFold: [0.95, 2.66] as [number, number],
+  /**
+   * CORROBORATION. The terrain prepass writes its normal from the BLURRED
+   * normal map (so the Sobel matches the paint) and its depth from the
+   * rasteriser — the two channels describe different surfaces. A depth step on
+   * painted terrain is therefore a self-occlusion contour, not a crease, unless
+   * the paint's own normal turns with it.
+   */
+  corroboration: [0.34, 1.0] as [number, number],
+  /**
    * DISTANCE IDENTITY. `RIDER_COLORS` promises riders are "instantly
    * distinguishable at 200 m in silhouette-plus-hue", and a plain Fresnel rim
    * plus fog cannot keep that promise: below about 40 px the rim collapses and

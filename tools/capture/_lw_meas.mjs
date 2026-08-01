@@ -56,8 +56,8 @@ const out = await p.evaluate(async (poses) => {
     const modes = {};
     for (const mode of ['before', 'after']) {
       const u = g.post.lines.uniforms;
-      if (mode === 'before') { u.uPaintIdCount.value = 0; u.uPressure.value.set(0.95, 0.95); }
-      else { u.uPaintIdCount.value = 7; u.uPressure.value.set(0.45, 1.05); }
+      if (mode === 'before') { u.uPaintMask.value = 0; u.uPressure.value.set(0.95, 0.95); }
+      else { u.uPaintMask.value = 254; u.uPressure.value.set(0.45, 1.05); }
       const d7 = probe(7);           // r contour, a alpha
       g.post.lines.setDebug(0);
       g.capture.step(0);
@@ -67,7 +67,7 @@ const out = await p.evaluate(async (poses) => {
     }
     // restore
     const u = g.post.lines.uniforms;
-    u.uPaintIdCount.value = 7; u.uPressure.value.set(0.45, 1.05);
+    u.uPaintMask.value = 254; u.uPressure.value.set(0.45, 1.05);
 
     const stat = () => ({ n: 0, sum: 0, h: new Array(6).fill(0) });
     const acc = {};

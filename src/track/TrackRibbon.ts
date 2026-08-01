@@ -221,10 +221,55 @@ export class TrackRibbon {
     _up.copy(sample.up);
     s.surfaceLeftAt(d, _sl);
 
-    const hw = sample.halfWidth;
+    const hwRide = sample.halfWidth;
     const berm = s.bermStrength[i];
     const bermSide = s.bermSide[i];
-    const bermHeight = berm * hw * 0.34;
+
+    // ── THE MESH HAS TO COVER THE GROUND THE CARVE PAINTED AS TRAIL ─────────
+    //
+    // `applyTrackCarve` stamps SurfaceKind.Trail over everything within 0.86 of
+    // the CARVE half-width, and its comment says that is "strictly INSIDE the
+    // ribbon mesh, so the mesh always covers the zone patch and its 2 m texel
+    // edge can never be the visible boundary". That was true of the carve's own
+    // half-width and false of THIS one: TrackSpline.getCarve widens the ribbon
+    // half-width to hw * (1.22 + berm * 0.45) + 1.1 before handing it over. So
+    // 0.86 of a widened width is not inside the un-widened mesh at all.
+    //
+    // Measured off the built geometry: the ribbon's drawn edge sits at a median
+    // 4.16 m from the centreline and its skirt at 5.49 m, while the trail zone
+    // runs out to 6.11 m. That leaves a ring of TERRAIN, one to two metres
+    // wide, painted with the trail ramp and covered by nothing — the trail is
+    // already visibly twelve metres wide in every frame; only the middle eight
+    // of it is the ribbon.
+    //
+    // On flat ground the ring is invisible, because it is the same paint on the
+    // same plane. Where the trail crosses a convex break it is the whole of the
+    // valley-vista defect: the ring hangs over the fall-away, is seen at one to
+    // two degrees of grazing incidence, and its outer boundary — a plan-view
+    // level set on a folding surface, cusping wherever the fold turns — comes
+    // out as a row of sharp downward tan spikes thirty to seventy pixels long.
+    // Proved by elimination: hiding the ribbon leaves the spikes untouched, the
+    // skirt measures a 0.20-1.45 m hang with at most 0.63 m of row-to-row
+    // change, and painting the zone index flat picks the spikes out exactly.
+    //
+    // So the ribbon is built to the radius the carve painted, not to the radius
+    // the rider is allowed. That does NOT widen the trail as it reads: the
+    // twelve metres were already tan. What changes is that the outer ring is
+    // now MESH — it takes the ribbon's own shading, its own AO-inked edge, its
+    // own plan-view irregularity and its own G-buffer normal break, and the
+    // tan/hillside boundary becomes a swept edge instead of a level set.
+    //
+    // hwRide is untouched and is still what the physics and the AI read.
+    const carveHw = hwRide * (1.22 + berm * 0.45) + 1.1;
+    const zoneR = carveHw * 0.86;
+    // Divided by the wander so that even at its inward extreme the drawn edge
+    // still clears the zone patch. 0.30 m of margin covers the zone map's own
+    // 2 m texel quantisation and the sub-texel jitter the shader adds to it.
+    const hw = Math.max(hwRide, (zoneR + 0.3) / EDGE_MIN);
+    // The berm is a RIDEABLE wall, so its height stays keyed to the rideable
+    // width. Scaling it with the drawn width would build a bank the rider has
+    // no reason to expect.
+    const bermHeight = berm * hwRide * 0.34;
 
     // ── Plan-view edge irregularity ──────────────────────────────────────────
     // Two scales per side plus an occasional pinch. Biased outward so the
@@ -283,9 +328,20 @@ export class TrackRibbon {
       if (isSkirt) {
         const tY = terrain.heightAt(x, z);
         const ground = Number.isFinite(tY) ? Math.min(y, tY) : y;
-        // See SKIRT_MAX_DROP. `y` here is still the trail-edge height at this
+        // See SKIRT_MAX_DROP. y here is still the trail-edge height at this
         // column, which is what the cap has to be measured from.
         y = Math.max(ground - SKIRT_DROP, y - SKIRT_MAX_DROP);
+        // AND IT MUST STAY BELOW THE EDGE IT IS SEALING.
+        //
+        // The skirt sits at 1.09 half-widths and the trail edge at 1.00, so on
+        // a banked section the skirt's own base height is already above the
+        // edge's — by 0.09 of the bank across the half-width. That was worth
+        // 0.1 m on the old width and is worth more on the width the mesh now
+        // has to cover, which measured as a skirt hanging 0.84 m ABOVE the
+        // trail edge on the high side of the bank: a sealing curtain turned
+        // into a raised outer rail. Clamped, the curtain is a curtain again.
+        const latEdge = side * edge * hw;
+        y = Math.min(y, _c.y + _sl.y * latEdge - SKIRT_DROP);
       }
 
       pos[c * 3] = x;
@@ -446,8 +502,21 @@ function edgeIrregularity(n: Noise2D, pinch: Noise2D, d: number, phase: number):
   const slow = n.noise(d * 0.032 + phase, 11.3);
   const mid = n.noise(d * 0.082 + phase, 4.7);
   const scallop = Math.max(0, pinch.noise(d * 0.017 + phase, 21.1) - 0.42) * 0.62;
-  return 1.07 + slow * 0.075 + mid * 0.026 + scallop;
+  return EDGE_BASE + slow * EDGE_SLOW + mid * EDGE_MID + scallop;
 }
+
+const EDGE_BASE = 1.07;
+const EDGE_SLOW = 0.075;
+const EDGE_MID = 0.026;
+/**
+ * The inward extreme of `edgeIrregularity`. Noise2D returns [-1, 1] and the
+ * scallop is one-sided outward, so this is the whole of it.
+ *
+ * Named because buildRow has to divide by it: the ribbon must clear the trail
+ * zone patch at every row, and the row where it comes closest to failing is the
+ * row where the wander happens to be at its most inward.
+ */
+const EDGE_MIN = EDGE_BASE - EDGE_SLOW - EDGE_MID;
 
 function duplicateRow(src: Row, fixedNormal: boolean): Row {
   return {

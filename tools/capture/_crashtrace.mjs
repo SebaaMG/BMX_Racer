@@ -49,6 +49,11 @@ for (let f = 0; f < N; f++) {
     const dx = e[12] - st.position.x, dy = e[13] - st.position.y, dz = e[14] - st.position.z;
     const offBike = +Math.hypot(dx, dy, dz).toFixed(3);
     const vis = rig.meshes.meshes.map((m) => (m.visible ? 1 : 0)).join('');
+    const an = window.__DESCENT__.game.race.player.bike.anchors;
+    const cw = (o) => { o.updateWorldMatrix(true, false); return o.matrixWorld.elements[13]; };
+    const groundY = (cw(an.frontContact) + cw(an.rearContact)) / 2;
+    const pelvisY = e[13];
+    const above = +(pelvisY - groundY).toFixed(3);
     return {
       mode: st.mode,
       cw: +rig.crashWeight.toFixed(3),
@@ -61,7 +66,7 @@ for (let f = 0; f < N; f++) {
       lockF: [+a[25].toFixed(2), +a[26].toFixed(2)],
       knee: [+a[33].toFixed(3), +a[34].toFixed(3)],
       sBend: +a[6].toFixed(3),
-      offBike, vis,
+      offBike, vis, above,
     };
   });
   console.log(f, JSON.stringify(row));

@@ -328,6 +328,22 @@ export class RiderRig implements IRiderRig {
   private prevTrickKind: TrickKind = TrickKind.None;
   private phase: number;
 
+  /**
+   * World height of the trail under the bike, from the two contact anchors.
+   *
+   * The crash needs a floor. Measured on the `crash` sequence, the pelvis went
+   * from 0.82 m ABOVE the contact plane while riding to 0.88 m BELOW it 0.7 s
+   * later: the bike lies down, the rig root lies down with it, and the crash
+   * pose and the separation offset then push the hips further along what is now
+   * a downward axis. The rider was underneath the mountain for the whole second
+   * half of every crash — which is why a crash strip shot on a camera locked to
+   * his own pelvis showed an empty hillside.
+   */
+  private groundWorldY = 0;
+  private groundValid = false;
+  /** Rig↔world for the crash floor. Private so it cannot collide with `_m0`. */
+  private readonly worldToRig = new Matrix4();
+
   private readonly velRig = new Vector3();
   private readonly prevVelRig = new Vector3();
   private readonly accelRig = new Vector3();
@@ -580,8 +596,28 @@ export class RiderRig implements IRiderRig {
         for (let i = 0; i < 4; i++) this.anchorRest[i].copy(this.anchorQuat[i]);
         this.anchorRefCaptured = true;
       }
+
+      // The trail surface, in WORLD height. Both contact anchors are written by
+      // the bike from its own physics contact points, so this is the real
+      // ground under the bike rather than an assumption about rig space — and
+      // it has to be world, because once the frame is lying on its side "up" in
+      // rig space points sideways.
+      a.frontContact.updateWorldMatrix(true, false);
+      a.rearContact.updateWorldMatrix(true, false);
+      const gy =
+        (a.frontContact.matrixWorld.elements[13] + a.rearContact.matrixWorld.elements[13]) * 0.5;
+      if (Number.isFinite(gy)) {
+        this.groundWorldY = gy;
+        this.groundValid = true;
+      }
     } else {
       this.fallbackAnchors(state, trick, h);
+      // No bike: the harness spawns the rig with the wheels on the ground, so
+      // the trail is one wheel radius below the rig origin.
+      this.object.updateWorldMatrix(true, false);
+      this.groundWorldY =
+        this.object.matrixWorld.elements[13] - BIKE_GEOM.wheelRadius;
+      this.groundValid = true;
     }
 
     // Crank phase, recovered from wherever the left pedal actually is. Works
@@ -1396,6 +1432,27 @@ export class RiderRig implements IRiderRig {
     p.x += a[PC.pelvisX] + this.crashOffset.x;
     p.y += a[PC.pelvisY] + this.crashOffset.y;
     p.z += a[PC.pelvisZ] + this.crashOffset.z;
+
+    // ── The floor ───────────────────────────────────────────────────────────
+    //
+    // A crashed rider must not go through the mountain, and the rig has no
+    // other mechanism that would stop it: every term above is expressed in the
+    // BIKE's frame, and the bike ends a crash lying on its side, so "down" for
+    // the crash pose and "down" for gravity are ninety degrees apart. The hips
+    // ended up 0.88 m under the trail.
+    //
+    // The clamp is in WORLD height, against the surface the bike's own contact
+    // anchors report, and it only ever pushes UP. 0.26 m is where the hip of a
+    // body lying on its side sits — half a hip width plus the shorts.
+    if (this.crashWeight > 0.02 && this.groundValid) {
+      _v1.copy(p).applyMatrix4(this.object.matrixWorld);
+      const floor = this.groundWorldY + 0.26;
+      if (_v1.y < floor) {
+        _v1.y = floor;
+        this.worldToRig.copy(this.object.matrixWorld).invert();
+        p.copy(_v1.applyMatrix4(this.worldToRig));
+      }
+    }
 
     // Pelvis attitude, plus the tumble rotation during a crash. Rotating the
     // pelvis rotates the entire rider, which is exactly what a tumble is.
