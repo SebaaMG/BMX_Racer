@@ -57,7 +57,7 @@ export const COURSE_SCALE = 0.58;
  * still far too long to play on a keyboard or to show to anyone. This ends the
  * ribbon — and therefore the finish line, the checkpoints, the HUD profile and
  * the AI's planning horizon, all of which measure against `track.length` — at
- * 240 m, which is fifteen to twenty seconds of riding.
+ * 480 m, which is forty to forty-five seconds of riding.
  *
  * It is the TRACK that is truncated, never the route. The massif's descent
  * profile, the corridor prior and every terrain feature are built from the full
@@ -65,7 +65,7 @@ export const COURSE_SCALE = 0.58;
  * for two kilometres past the finish. Shortening the route instead would shrink
  * the world with it and leave the rider on a 30 m hillock.
  */
-export const RACE_LENGTH = 240;
+export const RACE_LENGTH = 480;
 
 /** Vertical range of the mountain. */
 export const SEA_LEVEL = 0;
@@ -303,7 +303,7 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   // The stream: a carved channel with a wet floor.
   { kind: 'stream-channel', x: 31.9, z: 545.2, params: { width: 14, depth: 5.5, length: 151, angle: 0.86 } },
   { kind: 'rock-garden', x: -29, z: -58, params: { radius: 41, roughness: 1.35, boulderCount: 46 } },
-  { kind: 'finish-flat', x: 51.4, z: -752.9, params: { radius: 35, flatness: 0.85 } },
+  { kind: 'finish-flat', x: 15.9, z: -533.6, params: { radius: 35, flatness: 0.85 } },
 ];
 
 // ── The tabletop, as one shape both systems build ────────────────────────────
