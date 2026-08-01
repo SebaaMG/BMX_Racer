@@ -10,3 +10,6 @@ dist/
 # deploy for images nothing in the build reads.
 captures/
 tools/capture/_out/
+
+# Claude Code local state and agent worktrees.
+.claude/
