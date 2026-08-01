@@ -175,8 +175,21 @@ export const SPEED_TUNING = {
    * and the pattern starts to break up. 45 rad/s is ~53 km/h, by which point
    * it is unambiguously a solid disc.
    */
-  spinStart: 14,
-  spinFull: 45,
+  /**
+   * Wheel spin (rad/s) at which the rotational smear starts and saturates.
+   *
+   * 14 rad/s is 13 km/h on a 0.267 m wheel — a bike rolling at walking pace,
+   * where every tread knob is plainly countable and must stay that way. The
+   * smear is a statement that the wheel has become unreadable, so it has to
+   * begin where that is actually true: knobs stop resolving somewhere around
+   * 40 km/h (37 rad/s) and are a solid band by 70 (73 rad/s).
+   *
+   * A previous round set these to 14/45 to fix the opposite failure — 26/88,
+   * where 88 rad/s is 105 km/h, a speed this bike never reaches, so the smear
+   * never fired at all. This is the middle.
+   */
+  spinStart: 37,
+  spinFull: 76,
 
   // ── Motion smear ───────────────────────────────────────────────────────────
   /**
