@@ -3,12 +3,33 @@
  * disc, and a quantised fan of sun shafts.
  *
  * The dome is a single inverted sphere locked to the camera. Every value in it
- * is banded: the vertical gradient steps between four plateaus rather than
+ * is banded: the vertical gradient steps between SEVEN plateaus rather than
  * blending, every cloud is an alpha-cut shape with a drawn contour and a
  * three-value interior, and the sun glow is a set of concentric hard rings
  * rather than a falloff. A smooth sky behind a banded mountain is the fastest
  * way to break the illusion — the eye reads the gradient as "3D render"
  * instantly.
+ *
+ * ── THE THREE DEFECTS OF THE LATEST ROUND, AND WHERE EACH IS ANSWERED ───────
+ *
+ * A. THE HORIZON SLAB. "A 285-475 px orange slab floating above the terrain
+ *    horizon, a colour-correction stripe, not a dawn sky." Measured before
+ *    touching anything: on scree-speed the warm zone was 385 native rows, 21%
+ *    of the frame, holding exactly TWO colours. It is now SEVEN plateaus at
+ *    50-110 rows each, the lowest of which is mixed toward FOG_BANDS' furthest
+ *    haze colour so the sky and the far ridges share a palette where they meet.
+ *    See the uUpperWarm / uGlow / uFoot uniforms and skyGradient().
+ *
+ * B. CLOUD CONFETTI. "Fourteen sub-20 px fragments in one crop, each carrying a
+ *    full ink contour." A level set of fBm always sprays small components
+ *    around its large ones. cloudSupport() reads the LOCAL AREA of the mask out
+ *    of the mip chain and walks the layer's threshold closed under about 25
+ *    screen pixels. See cloudSupport().
+ *
+ * C. THE TWO DASHED HAIRLINES ON CLEAN BLUE SKY. Not the speed field, not the
+ *    ink pass, not the shafts — all three cleared by A/B. A layer whose
+ *    envelope had already switched it off, drawn anyway, because a signed
+ *    distance to an EMPTY level set is not a large distance. See cutMask().
  *
  * ── THE THREE DEFECTS THIS FILE WAS REBUILT AROUND ──────────────────────────
  *
@@ -237,7 +258,12 @@ export class Sky {
         /**
          * Sky debug view. 0 off, 1 near alpha, 2 far alpha, 3 bank alpha,
          * 4 the boundary wander field, 5 mask detail, 6 island support,
-         * 7 the raw tile.
+         * 7 the horizon bank's ENVELOPE, 8 the raw tile.
+         *
+         * 7 is the one that found the hairline. The layer's envelope read 0.004
+         * at the pixel the hairline runs through — the layer was switched off and
+         * still drawing — which is what pointed at cutMask rather than at the
+         * envelope, after three other passes had been cleared by A/B.
          * Kept in the shipping shader on purpose: every sky defect this file
          * has had was a question about one scalar field, and answering it by
          * commenting out lines and reloading is how you end up shipping the
@@ -698,12 +724,74 @@ export class Sky {
           return dir * (billow - 0.45) * 0.018 * detail;
         }
 
-        /** x = coverage 0..1, y = ink 0..1, z = signed pixel distance. */
+        /**
+         * x = coverage 0..1, y = ink 0..1, z = signed pixel distance.
+         *
+         * ── THE GRADIENT IS THE MASK'S, NOT THE MASK-MINUS-THRESHOLD'S ─────────
+         *
+         * This used to be written as one expression:
+         *
+         *     float s = texture(tex, uv).a - thr;
+         *     float g = length(vec2(dFdx(s), dFdy(s)));
+         *
+         * which looks equivalent and is not, because thr IS NOT CONSTANT ACROSS
+         * THE SCREEN. Every layer walks its threshold toward 1.03 through an
+         * envelope in dir.y, so dFdy(s) picks up dFdy(thr) as well — and near the
+         * end of a walk that term is the larger of the two.
+         *
+         * The consequence is precise and it was the two dashed hairlines the
+         * critic found on clean blue sky in bike-detail. Once thr has walked past
+         * 1.0 the layer should be gone: no value the mask can return is inside
+         * it. But at the row where thr crosses the mask's solid value, s crosses
+         * ZERO, and the old g there was not the mask's gradient (which is exactly
+         * 0 in the middle of a solid region) but the THRESHOLD's, about 0.004 per
+         * row. So dpx came out near zero rather than at minus infinity, and
+         * smoothstep(-0.75, 0.75, 0) is 0.5: half-strength cloud, painted in a
+         * two-pixel band along a level curve of dir.y, dashed wherever the mask
+         * was not saturated. A horizontal dashed hairline across the whole frame,
+         * produced by a layer whose envelope had already switched it off.
+         *
+         * Diagnosis, in order, because three innocent suspects were cleared
+         * first: the speed field is gated off at bike-detail's 0.0084 intensity,
+         * the ink pass emits nothing above y = 426, the shaft fan is at zero
+         * intensity; forcing this layer's alpha to zero took the vertical step at
+         * (1700, 322) from 20.2 luminance units to 1.0, and the debug view of the
+         * layer's own envelope read 0.004 at that pixel — switched off, and still
+         * drawing.
+         *
+         * Taking the gradient of the MASK ALONE restores the promise the walk was
+         * written to keep: dpx is a true signed distance to the mask's level set,
+         * the shape shrinks and closes as thr rises, and the instant thr passes
+         * the mask's maximum there is nothing inside at all.
+         */
         vec3 cutMask(sampler2D tex, vec2 uv, float thr) {
-          float s = texture(tex, uv).a - thr;
-          float g = max(length(vec2(dFdx(s), dFdy(s))), 1e-7);
-          float dpx = s / g;
-          float inside = smoothstep(-0.75, 0.75, dpx);
+          float a = texture(tex, uv).a;
+          float g = max(length(vec2(dFdx(a), dFdy(a))), 1e-7);
+          float dpx = (a - thr) / g;
+
+          // ── AND A DISTANCE TO NOTHING IS NOT A SMALL DISTANCE ─────────────────
+          //
+          // dpx is a linearisation: it says how many pixels away the level set
+          // {a = thr} is, ASSUMING one exists. Every layer here walks thr up to
+          // 1.03, above anything the mask can return, and at that point the level
+          // set is empty — but the linearisation does not know that. Where the
+          // mask is minified hard the alpha crosses its whole range inside one
+          // pixel, so g is of order 0.5 per pixel, and a threshold overshoot of
+          // 0.028 comes back as "0.06 pixels outside": smoothstep(-0.75, 0.75,
+          // -0.06) is 0.47, half-strength cloud, from a layer that is switched
+          // off. That is the second half of the hairline, and it survives taking
+          // the gradient of the mask alone — the arithmetic is right and the
+          // question is wrong.
+          //
+          // So the shape is closed explicitly over the last four percent of the
+          // walk. This is a smooth multiply on a hard mask, which is the thing
+          // that sliced the clouds along a horizontal line in an earlier build,
+          // and it is safe here for one specific reason: at thr = 0.96 the shape
+          // is already down to the handful of texels where the mask saturates, so
+          // the fade has almost nothing left to act on. It closes a shape that
+          // has already closed. Applied at thr = 0.5 it would be the old bug.
+          float reach = 1.0 - smoothstep(0.960, 1.000, thr);
+          float inside = smoothstep(-0.75, 0.75, dpx) * reach;
           float ink = inside * (1.0 - smoothstep(uInkPx, uInkPx + 1.3, dpx));
           return vec3(inside, ink, dpx);
         }
@@ -780,9 +868,10 @@ export class Sky {
          * translation. Periods here are 12 and 16 minutes, so within any shot
          * the motion is an ordinary constant-velocity drift.
          */
-        vec3 clouds(vec3 dir, vec2 sp, float wander, vec3 col) {
+        vec3 clouds(vec3 dir, vec2 sp, float wander, vec3 col, out float bankEnv) {
           float h = dir.y;
           float t = uTime;
+          bankEnv = 0.0;
 
           // The sun's own position on the stereographic plane. "Toward the sun"
           // is then just the direction to that point, which is correct
@@ -849,18 +938,49 @@ export class Sky {
           // envelope now spans -0.145..0.110, which covers the foot, below, glow
           // and cream bands, and it rides the horizon boundary's own swell so it
           // cannot slide out of the bands it is drawn to fill.
+          //
+          // ── AND THE TOP OF IT IS PINNED UNDER THE CREAM BOUNDARY ─────────────
+          //
+          // MEASURED. bike-detail carried two faint dashed hairlines across clean
+          // blue sky at native y 275 and y 325 — the critic read them as dirt on
+          // the lens, and three separate suspects were cleared by A/B before this
+          // one was caught: the speed field is at intensity 0.0084 in that pose
+          // and gated off entirely, the ink pass has no output above y = 426, and
+          // the shaft fan is at zero. Forcing this layer's alpha to zero took the
+          // vertical step at (1700, 322) from 20.2 luminance units to 1.0.
+          //
+          // The mechanism is the threshold walk, not the mask. cutMask measures
+          // its contour as (alpha - thr) divided by the SCREEN GRADIENT OF THAT
+          // WHOLE EXPRESSION, and near the end of the envelope thr is changing
+          // far faster with height than the mask is changing with position — so
+          // the gradient is dominated by the walk, the signed distance collapses,
+          // and what should be a shape shrinking to nothing is drawn instead as a
+          // two-pixel band along the level curve where thr crosses the mask. A
+          // level curve of a function of dir.y is a horizontal line across the
+          // frame. The island cull cannot see it: it measures the mean of the raw
+          // mask, which is 0.99 there, because the mask genuinely is solid — it is
+          // the THRESHOLD that has become a knife.
+          //
+          // Rather than fight the last few percent of the walk, the layer is now
+          // gone by hb = 0.065, and since hb rides the same swell as the band
+          // boundaries (0.293 against the cream boundary's 0.291) that is ALWAYS
+          // just under the cream-to-warm cut at 0.070, whatever the wander is
+          // doing. The residual streak therefore lands inside the cream band,
+          // where a thin warm line is a cirrus and not a scratch, instead of 300
+          // rows up in open blue.
           float bankIn  = saturate1((hb + 0.145) / 0.050);
-          float bankOut = 1.0 - saturate1((hb - 0.010) / 0.100);
+          float bankOut = 1.0 - saturate1((hb - 0.020) / 0.045);
           float liveBank = bankIn * bankOut;
           float detBank = cloudDetail(uvBank);
           uvBank += cloudScallop(uvBank, detBank);
           float keepBank = smoothstep(0.22, 0.42, cloudSupport(uCloudBank, uvBank, 34.0));
           float thrBank = mix(1.03, 0.46, detBank * liveBank * keepBank);
+          bankEnv = liveBank;
           vec3 cBank = celCloud(
             uCloudBank, uvBank, toSun * 0.016, thrBank,
             uBankLit, uBankMid, uBankShadow, uBankInk, alpha
           );
-          col = mix(col, cBank, alpha * 0.0);
+          col = mix(col, cBank, alpha * 0.95);
 
           return col;
         }
@@ -873,7 +993,8 @@ export class Sky {
 
           vec3 col = skyGradient(dir, sp, wander, fc);
           col = sunDisc(dir, col);
-          col = clouds(dir, sp, wander, col);
+          float bankEnv;
+          col = clouds(dir, sp, wander, col, bankEnv);
 
           if (uSkyDebug > 0.5) {
             vec2 uvN = sp * 1.70 + vec2(0.5);
@@ -888,6 +1009,7 @@ export class Sky {
             // 6 = the island-support field for the near layer, which is the one
             // thing that decides whether a fragment is a cloud or litter.
             else if (uSkyDebug < 6.5) d = vec3(cloudSupport(uCloudNear, uvN, 34.0));
+            else if (uSkyDebug < 7.5) d = vec3(bankEnv);
             else d = vec3(texture(uCloudNear, fc / uResolution).a);
             col = d;
           }

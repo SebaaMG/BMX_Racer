@@ -42,6 +42,7 @@ import { RAMPS } from '../npr/Palette';
 import { Rng } from '../core/RNG';
 import { clamp, clamp01, lerp } from '../core/MathX';
 import { SECTION_ORDER, TrackSpline, createTrackSample } from './TrackSpline';
+import { buildStoneGeometry } from '../terrain/Scatter';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scratch
@@ -608,7 +609,7 @@ export class Furniture {
 
     for (let v = 0; v < 3; v++) {
       if (!variants[v].length) continue;
-      this.addInstanced(rockGeometry(new Rng(`stream-rock-${v}`), 0.55), 'wetRock', `stream-rock:${v}`, variants[v], {
+      this.addInstanced(buildStoneGeometry(`stream-rock-${v}`, 0.55), 'wetRock', `stream-rock:${v}`, variants[v], {
         outlineWidth: 0.011,
       });
     }
@@ -716,27 +717,27 @@ function bannerGeometry(width: number, height: number, sag: number, segs: number
 }
 
 /**
- * A faceted boulder. Icosahedron, displaced per vertex by a seeded hash, then
- * split to hard facets so the cel ramp bands each plane separately and the rock
- * reads as cut stone rather than as a lumpy sphere.
+ * Stream boulders.
+ *
+ * This used to be a local `rockGeometry` that displaced an IcosahedronGeometry
+ * per vertex. `IcosahedronGeometry` is ALREADY NON-INDEXED — it emits one
+ * vertex per triangle corner — so each corner of the solid existed five or six
+ * times and every copy took a DIFFERENT random scale. The mesh separated into
+ * eighty loose triangles. The inverted hull is a BackSide draw sharing that
+ * same buffer, so every loose triangle facing away from the camera was filled
+ * as a solid ink wedge with nothing in front of it: the 112 px dark violet
+ * shards a stills critic ranked the worst defect in the build. `finalizeGeometry`
+ * ran and could not help, because after the displacement nothing was at a
+ * shared position left to weld.
+ *
+ * The build had been announcing it on every boot — three
+ * "toNonIndexed(): BufferGeometry is already non-indexed" warnings, one per
+ * stream-rock variant — for as long as the warning has been in the log.
+ *
+ * `buildStoneGeometry` is the welded plane-cut stone the scatter system uses,
+ * which is closed (zero open edges) and carries an edge-length-weighted
+ * curvature rather than a saturated one.
  */
-function rockGeometry(rng: Rng, radius: number): BufferGeometry {
-  const g = new IcosahedronGeometry(radius, 1);
-  const pos = g.getAttribute('position') as BufferAttribute;
-  const v = new Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const scale = 0.62 + rng.next() * 0.62;
-    v.multiplyScalar(scale);
-    // Flatten slightly: water-worn stones sit low, they do not sit up like dice.
-    v.y *= 0.68;
-    pos.setXYZ(i, v.x, v.y, v.z);
-  }
-  const flat = g.toNonIndexed();
-  g.dispose();
-  flat.computeVertexNormals();
-  return flat;
-}
 
 /**
  * Merge geometries sharing position/normal/uv. Written here rather than pulled

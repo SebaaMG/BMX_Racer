@@ -71,6 +71,7 @@ import {
 } from 'three';
 
 import { finalizeGeometry } from '../npr/OutlineGeometry';
+import { NPR } from '../npr/NprGlobals';
 import { WORLD_HALF } from '../game/WorldConstants';
 import { clamp } from '../core/MathX';
 import type { TerrainMaterialSet } from './TerrainMaterial';
@@ -80,6 +81,10 @@ const _camPos = new Vector3();
 const _frustum = new Frustum();
 const _projScreen = new Matrix4();
 const _minMax = new Float32Array(2);
+const _shadowRun = new Vector3();
+/** Per-axis growth that sweeps a caster's box along the shadow it throws. */
+const _sweepLo = new Vector3();
+const _sweepHi = new Vector3();
 
 export interface ClipmapOptions {
   materials: TerrainMaterialSet;
@@ -285,6 +290,13 @@ export class TerrainClipmap {
     _projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_projScreen);
 
+    // The shadow run for this frame, decomposed per axis. Read from the shared
+    // uniform rather than from a constructor option so a sun that moves — or a
+    // pose that rotates it — cannot leave the cull describing yesterday's light.
+    _shadowRun.copy(NPR.uSunDir.value).normalize().multiplyScalar(-this.shadowKeep);
+    _sweepLo.set(Math.min(0, _shadowRun.x), Math.min(0, _shadowRun.y), Math.min(0, _shadowRun.z));
+    _sweepHi.set(Math.max(0, _shadowRun.x), Math.max(0, _shadowRun.y), Math.max(0, _shadowRun.z));
+
     // ── Snap every level ──────────────────────────────────────────────────
     for (const lv of this.levels) {
       const q = lv.spacing * 2;
@@ -343,13 +355,32 @@ export class TerrainClipmap {
         const y0 = _minMax[0] - 2;
         const y1 = _minMax[1] + 2;
 
-        // Shadow casters are tested against a frustum expanded by the cascade
-        // reach. A ridge just off the left edge of the screen at a 21-degree
-        // sun throws its shadow a long way into shot; culling it to the visible
-        // frustum deletes that shadow, and the deletion pops the moment the
-        // camera turns. Levels that no longer cast use the exact frustum.
-        const slack = mesh.castShadow ? this.shadowKeep : 0;
-        const visible = frustumIntersectsBox(x0, y0, z0, x1, y1, z1, slack);
+        // Shadow casters are tested against the volume their own shadow can
+        // reach, not against a ball of slack around them.
+        //
+        // A ridge just off the left edge of the screen at a 21-degree sun
+        // throws its shadow a long way into shot, and culling it to the visible
+        // frustum deletes that shadow — which then pops back the moment the
+        // camera turns. The previous guard against that pushed every frustum
+        // plane out by the full cascade reach, which is the Minkowski sum with
+        // a 470 m SPHERE: it keeps the ridge up-sun of the camera, and equally
+        // keeps every block 470 m down-sun, below, and behind, none of which
+        // can cast a single pixel into the frame.
+        //
+        // Sweeping the block's own box along the direction the light TRAVELS is
+        // the same guarantee for a fraction of the volume. `uSunDir` points
+        // toward the sun, so the shadow runs along its negation, and the swept
+        // box is just the box grown by that vector's positive and negative
+        // components on their own axes.
+        const cast = mesh.castShadow;
+        const visible = frustumIntersectsBox(
+          x0 + (cast ? _sweepLo.x : 0),
+          y0 + (cast ? _sweepLo.y : 0),
+          z0 + (cast ? _sweepLo.z : 0),
+          x1 + (cast ? _sweepHi.x : 0),
+          y1 + (cast ? _sweepHi.y : 0),
+          z1 + (cast ? _sweepHi.z : 0),
+        );
         mesh.visible = visible;
 
         if (visible) {
@@ -565,7 +596,6 @@ function frustumIntersectsBox(
   x1: number,
   y1: number,
   z1: number,
-  slack: number,
 ): boolean {
   const planes = _frustum.planes;
   for (let i = 0; i < 6; i++) {
@@ -575,7 +605,7 @@ function frustumIntersectsBox(
     const px = p.normal.x > 0 ? x1 : x0;
     const py = p.normal.y > 0 ? y1 : y0;
     const pz = p.normal.z > 0 ? z1 : z0;
-    if (p.normal.x * px + p.normal.y * py + p.normal.z * pz + p.constant + slack < 0) return false;
+    if (p.normal.x * px + p.normal.y * py + p.normal.z * pz + p.constant < 0) return false;
   }
   return true;
 }

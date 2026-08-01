@@ -173,15 +173,15 @@ function unwrap(rec) {
 }
 
 const report = { tag: TAG, at: new Date().toISOString(), runs: [] };
-const SPEEDS = [8, 14, 20];
+const SPEEDS = [[8,1.0],[14,1.0],[20,1.0],[16,0.5],[16,0.25]];
 const SECS = 2.5;
 
 console.log(`SKIDPAD — flat plane, full steer (1.0) held for ${SECS}s\n`);
 console.log('  v      heading  pathRate  chassisYaw  radius   lean(p50/max)  target  steerA   |v|end');
-for (const v of SPEEDS) {
+for (const [v, stk] of SPEEDS) {
   const rec = await evalRetry(
-    ([v, secs]) => window.__TURN__.skidpad(v, 1.0, secs, { pedal: 0 }),
-    [v, SECS],
+    ([v, stk, secs]) => window.__TURN__.skidpad(v, stk, secs, { pedal: 0 }),
+    [v, stk, SECS],
   );
   const hdg = unwrap(rec);
   const N = rec.length;
@@ -210,7 +210,7 @@ for (const v of SPEEDS) {
   const radius = Math.abs(steadyPath) > 1e-4 ? steadySpeed / Math.abs(steadyPath) : Infinity;
   const leans = rec.map((r) => r.lean).sort((a, c) => a - c);
   const run = {
-    v, totalHeadingDeg: +(totalHeading * 180 / Math.PI).toFixed(1),
+    v, stick: stk, totalHeadingDeg: +(totalHeading * 180 / Math.PI).toFixed(1),
     meanYaw: +meanYaw.toFixed(4), steadyYaw: +steadyYaw.toFixed(4),
     steadyPath: +steadyPath.toFixed(4),
     radius: +radius.toFixed(2),
@@ -227,7 +227,7 @@ for (const v of SPEEDS) {
   };
   report.runs.push(run);
   console.log(
-    `${String(v).padStart(3)} m/s  ${String(run.totalHeadingDeg).padStart(7)}°  ` +
+    `${String(v).padStart(3)}@${stk.toFixed(2)} ${String(run.totalHeadingDeg).padStart(7)}°  ` +
     `${String(run.steadyPath).padStart(8)}  ${String(run.steadyYaw).padStart(9)}  ` +
     `${String(run.radius).padStart(7)}  ${String(run.leanP50).padStart(6)}/${String(run.leanMax).padStart(6)}  ` +
     `${String(run.target).padStart(6)}  ${String(run.steerA).padStart(7)}  ${String(run.endSpeed).padStart(6)}`,

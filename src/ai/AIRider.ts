@@ -368,6 +368,39 @@ export interface RacerInit {
 }
 
 /** Shared plumbing: progress bookkeeping, the scene node, trick adoption. */
+/**
+ * Global trim on AI steering output. See the note at its use site: the bike's
+ * steering response changed under the AI, and this keeps the closed loop at the
+ * gain it was tuned for rather than re-tuning three personalities by hand.
+ */
+const AI_STEER_TRIM = 0.36;
+/*
+ * 0.36 is measured, not guessed, and it is a STOPGAP.
+ *
+ * Swept against a 180-frame pack-race run, recording what fraction of frames
+ * the controller spent at full lock, how far off the racing line it wandered,
+ * and how much course it actually covered:
+ *
+ *   gain x   saturated   max |lat|   moved   end speed
+ *      1.0        92%       3.9 m     23 m     7 km/h
+ *      0.7        59%       6.8 m     23 m    12 km/h
+ *      0.5        44%       7.6 m     32 m    37 km/h
+ *      0.35       36%      24.3 m     26 m    21 km/h
+ *      0.25       18%      25.7 m     40 m    27 km/h
+ *
+ * The tension is visible and it is not resolvable with one number: reducing the
+ * gain stops the controller sawing the bars and scrubbing every bit of speed,
+ * and simultaneously lets it drift off the line. 0.5 of the previous 0.72 is
+ * the knee — most course covered at a lateral error the trail can still
+ * contain — but 44% of frames at full lock is not a tuned controller.
+ *
+ * The real fix is a re-tune of steerKp/steerKd/lateralGain per personality
+ * against the CURRENT bike, which gained about 30% more yaw per unit of steer
+ * when camber thrust was re-expressed in the unit a leaned bike needs and the
+ * yaw damper stopped being referenced to zero. That is a subsystem pass, not a
+ * scalar.
+ */
+
 export abstract class RacerBase implements IRacer {
   readonly id: string;
   readonly bike: IBike;
@@ -461,6 +494,21 @@ export abstract class RacerBase implements IRacer {
 
   get trackSample(): TrackSampleResult {
     return this.tracker.sample;
+  }
+
+  /**
+   * Re-seat this racer's track tracker after an external teleport.
+   *
+   * The capture harness moves racers straight to a point on the course, but the
+   * tracker kept its previous distance — so an AI woke up believing it was
+   * still on the start line and steered toward a target hundreds of metres
+   * behind it. Measured: the pack covered 0 m in 40 s at a mean 1.16 m/s and
+   * sat 97-98% off-track from frame zero. No capture has ever contained AI
+   * riders actually riding.
+   */
+  reseat(position: Vector3, hintDistance = 0): void {
+    this.tracker.reset(position, hintDistance);
+    this.progress.distance = this.tracker.distance;
   }
 
   abstract gatherInput(dt: number, ctx: RaceContext): BikeInput;
@@ -1075,6 +1123,15 @@ export class AIRider extends RacerBase {
     // the section 2m off line, perfectly parallel to where it should be.
     const lateralErr = this.smoothedTargetLateral - this.tracker.lateral;
     let steer = err * p.steerKp + errRate * p.steerKd + lateralErr * p.lateralGain;
+
+    // The bike gained about 30% more yaw per unit of steer when camber thrust
+    // was re-expressed in the unit a leaned bike actually needs (load * tan of
+    // the lean angle) and the yaw damper stopped being referenced to zero — it
+    // had been damping the corner itself. At the old gains the closed loop now
+    // overshoots: an autopilot sweep measured mean |lateral| 1.82 m and 25.8%
+    // off-track against 0.74 m and 2.1% before the physics change, with the
+    // optimum gain moving from 2.2 to 1.6.
+    steer *= AI_STEER_TRIM;
 
     // Steering authority falls off with speed in the physics; ask for more when
     // fast so the closed loop keeps roughly constant response.

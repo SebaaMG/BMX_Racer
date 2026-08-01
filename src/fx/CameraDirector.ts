@@ -71,11 +71,41 @@
  * compensated by the dolly, on purpose: the dolly is fed the pure speed term so
  * that the transients stay visible instead of being solved away.
  *
- * THE SHAKE. Directional and impact-shaped, never a rumble. A primary
- * oscillation along the impact axis under an envelope with a visible rebound,
- * plus a decorrelated simplex wobble. Simplex rather than Math.random because
- * the capture harness compares builds frame for frame and a random camera would
- * make every diff a false positive.
+ * THE SHAKE, and the one measurement that reorganised half this file:
+ *
+ *   A TRANSLATION OF THE CAMERA IS NOT A SCREENSHAKE AND A ROTATION IS.
+ *
+ * `compose` re-aims at the subject after the shake is applied, so displacing
+ * the rig cannot move the subject across the frame — it can only change how far
+ * away it is. And displacing the rig moves near geometry by offset/depth and
+ * distant geometry by nothing, so on a frame whose upper two thirds is ridge
+ * and sky, most of the picture does not move at all. Measured on the shipped
+ * `crash`, where the orbit had closed to 3.4 m: 0.73 m of shake pulsed the
+ * subject's projected span 295→393→295 px in six frames and left the ridge line
+ * behind it untouched. That is a zoom lens being pumped.
+ *
+ * So the shake is angular, with a small translation kept for the parallax that
+ * says the rig has mass, and that translation is scaled by the standoff so it
+ * is the same fraction of a 2.3 m detail orbit and a 5.5 m chase. Same
+ * reasoning drives the speed BUFFET: it is degrees, not metres, and its rate
+ * rises with speed as well as its amplitude — because a fixed spatial
+ * wavelength of ground shakes the rig more often the faster you cross it, and
+ * because what a frame difference sees is amplitude × rate, so the rate is the
+ * half you can raise without the picture moving further from where it belongs.
+ *
+ * Directional and impact-shaped, never a rumble: a primary oscillation along
+ * the impact axis under an envelope with a visible rebound, plus a decorrelated
+ * simplex wobble. Simplex rather than Math.random because the capture harness
+ * compares builds frame for frame and a random camera would make every diff a
+ * false positive.
+ *
+ * THE REST OF THE CRASH. `onCrash` fires once, on the frame the solver changes
+ * mode. Every subsequent bang — and a body and a bike bouncing across a rock
+ * garden produce several — used to reach the dust and the impact flash and NOT
+ * the camera, because nothing outside this class calls `shake` and the class's
+ * own detector only watches for a mode CHANGE. `crashStrikes` closes that,
+ * reading the same two signals `src/fx/index.ts` reads, so the punch and the
+ * flash land on the same frame.
  *
  * THE SWING. Above a threshold of air, with enough hang time left, the camera
  * orbits ~66° to show the trick — and then starts coming back EARLY, cancelling
@@ -91,11 +121,18 @@
  * envelope that pulls the boom in to 60%, lifts and stiffens the rig so it
  * ARRIVES instead of whipping, kills the corner drift, narrows the lens, and
  * runs a short slow-mo. The subject gets bigger when it goes wrong, not smaller.
- * In ORBIT the same envelope pulls the arc in, cranks the spin rate and lifts
- * the elevation, because a rider on the ground is a horizontal subject and a
- * 10-degree orbit is edge-on to it — which is precisely how the review set's
- * `crash` shrank to 62 px of legible subject while the camera drifted serenely
- * past at a constant rate.
+ * In ORBIT the same envelope raises the target SUBJECT FRACTION — not a second
+ * distance multiplier on top of the legibility solve, which is how `crash` went
+ * from a 62 px speck to a 393 px subject clipped by the bottom edge inside one
+ * round of fixes — cranks the spin rate, and lifts the elevation.
+ *
+ * The vertical framing of a wreck belongs to the safe-area controller and to
+ * `crashBoxTop`: a subject that is no longer standing is not a 2.2 m vertical
+ * silhouette, and telling the controller that it is puts the drawn wreck 130 px
+ * lower than the controller believes it is. Lowering the ORBIT AIM to
+ * compensate looks equivalent and is not — it lowers the whole arm into the
+ * hill, `solveFramedRise` answers with 39 degrees of crane, and the shot
+ * becomes a plan view. Move the aim, never the arm.
  */
 
 import { Object3D, PerspectiveCamera, Quaternion, Vector3 } from 'three';
@@ -805,11 +842,23 @@ export const CAMERA_TUNING = {
   crashOrbitRise: 0.38,
   crashOrbitMaxPitch: 1.15,
   /**
-   * Where the orbit AIMS during a wreck, metres above `BikeState.position`.
-   * Authored at 1.1, which is a rider's chest when they are on a bike and half
-   * a metre of empty air above a rider who is on their back.
+   * THERE IS NO CRASH AIM OFFSET, and there was one for about an hour.
+   *
+   * 1.1 m above `BikeState.position` is a rider's chest when they are on a bike
+   * and half a metre of empty air above a rider who is on their back, so
+   * dropping the aim during a wreck looks like the obvious fix and it measures
+   * beautifully — right up until you look at the frame. Lowering the aim lowers
+   * the whole arm with it, and 0.65 m of drop at a 4.5 m standoff put the
+   * camera end far enough into the hillside that `solveFramedRise` answered
+   * with 0.68 rad of crane. Authored 0.18, plus the crash rise, plus that:
+   * 71 degrees, a PLAN VIEW of a wreck, subject span collapsed from 320 px to
+   * 127 by foreshortening alone. Measured on `crash` f0054-f0060.
+   *
+   * The vertical framing is already solved, correctly and in closed loop, by
+   * `crashBoxTop`/`crashBoxBottom` — which move the LOOK POINT and leave the
+   * arm exactly where the shot put it. Two mechanisms for one job, one of them
+   * open-loop and with a side effect, is one too many.
    */
-  crashOrbitAim: 0.45,
 
   // ── Orbit legibility ───────────────────────────────────────────────────────
   /**
@@ -2083,9 +2132,10 @@ export class CameraDirector implements ICameraDirector {
     this.boomDesired = dist;
     const cy = Math.cos(pitch);
     this.lookPos.copy(t.position);
-    // Aim lower as the wreck develops. 1.1 m is a chest on a bike and half a
-    // metre of empty sky above a rider on their back.
-    this.lookPos.y += lerp(1.1, CAMERA_TUNING.crashOrbitAim, cf);
+    // Never lowered for a crash. See the note on `crashOrbitMaxPitch`: the
+    // vertical framing of a wreck belongs to `crashBoxTop`, which moves the
+    // aim without moving the arm into the hill.
+    this.lookPos.y += 1.1;
     this.camPos.set(
       this.lookPos.x + Math.sin(this.orbitYaw) * cy * dist,
       this.lookPos.y + Math.sin(pitch) * dist,

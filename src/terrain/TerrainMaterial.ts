@@ -76,8 +76,35 @@ import { globalUniformBlock } from '../npr/NprGlobals';
 import { RAMPS, RampPreset } from '../npr/Palette';
 import { barkTexture, paperGrain, trailSurface } from '../npr/GeneratedTextures';
 import { SurfaceKind } from '../game/Contracts';
-import { WORLD_HALF, ZONE } from '../game/WorldConstants';
+import { TERRAIN_FEATURES, WORLD_HALF } from '../game/WorldConstants';
 import { ZONE_KIND_COUNT, zoneMipLevels } from './Zones';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The direction the water runs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The stream channel's own plan bearing, READ FROM THE FEATURE that carves it.
+ *
+ * The flow strokes have to run WITH the current, and the current runs down the
+ * channel. The previous version built its phase from `w.x * 1.35 + w.y * 0.90`,
+ * whose gradient points along (0.83, 0.55) — and the channel that
+ * `carveFeatures` cuts runs along (sin 0.86, cos 0.86) = (0.758, 0.652). Those
+ * are eleven degrees apart, so the bands the phase produced ran very nearly
+ * ACROSS the stream: a set of rungs laid over the water like a ladder, which is
+ * the one thing a painter would never draw on moving water. The measured frame
+ * had no readable flow direction in it at all.
+ *
+ * Taken from the feature list rather than written as a number here, because a
+ * constant copied out of an authoring table is a constant that will be wrong
+ * the first time somebody rotates the stream.
+ */
+const STREAM_ANGLE =
+  (TERRAIN_FEATURES.find((f) => f.kind === 'stream-channel')?.params.angle as number | undefined) ??
+  0.86;
+/** Unit vector ALONG the flow, in world XZ. */
+const FLOW_X = Math.sin(STREAM_ANGLE);
+const FLOW_Z = Math.cos(STREAM_ANGLE);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data textures
@@ -363,6 +390,28 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
    * rasterised. Its wavelength is tied to the mip texel, so it stays a few
    * pixels across at every distance, and its amplitude is about one mip texel,
    * so the edge wanders by roughly a pixel: a drawn edge, not a stair.
+   *
+   * ── AND ITS AMPLITUDE IS BOUNDED IN PIXELS, NOT IN TEXELS ───────────────
+   * "The edge wanders by roughly a pixel" is only true while the pixel
+   * footprint is ISOTROPIC. It is not, on ground seen at a grazing angle:
+   * a fine raycast down a valley-vista column found a hundred and forty
+   * consecutive screen rows covering nine metres of range, so one screen pixel
+   * spanned tens of texels along the view direction and two or three across it.
+   * The mip level is picked from the LONG axis, so mtex — and with it the
+   * jitter, which is measured in mip texels — grows with the long axis, while
+   * the boundary being frayed runs along the SHORT one. A displacement that is
+   * a pixel and a half across the footprint is thirty to seventy pixels along
+   * it, and that is the whole of the "eleven downward triangular teeth, sharp
+   * points, like a torn paper fringe" hanging off the trail into the snow in
+   * valley-vista: not the ribbon, not its skirt (measured: the skirt hangs
+   * 0.20-1.45 m and changes at most 0.63 m from row to row), but the trail
+   * zone's own painted boundary, torn by tens of pixels.
+   *
+   * A displacement of d texels moves the sample by at most d / fpMin pixels,
+   * where fpMin is the SHORTER footprint axis. Capping d at three times fpMin
+   * therefore caps the tear at three pixels in every direction. On isotropic
+   * ground fpMin and fp are equal and the cap is above the amplitude already in
+   * use, so nothing there changes at all — this only bites where it must.
    */
   int sampleZone(vec2 worldXZ, vec2 uvT, int kindCount) {
     float texels = uHeightParams.z;
@@ -374,6 +423,7 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
     vec2 dtx = dFdx(tc);
     vec2 dty = dFdy(tc);
     float fp = max(length(dtx), length(dty));
+    float fpMin = max(min(length(dtx), length(dty)), 1e-4);
     // The +0.85 bias is not a fudge: it makes one mip texel cover roughly TWO
     // screen pixels rather than one. At parity a boundary can still fall
     // between every adjacent pixel pair, which is a one-pixel checkerboard by
@@ -387,7 +437,8 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
     // to the same ladder as the mip and therefore cannot crawl within a level.
     float nf = 0.25 / mtex;
     vec2 jit = vec2(fbm2(tc * nf, 2), fbm2(tc * nf + 47.3, 2)) - 0.5;
-    vec2 tcj = tc + jit * (mtex * uZoneJitter);
+    // See the note above: texels for the wander, PIXELS for the cap.
+    vec2 tcj = tc + jit * min(mtex * uZoneJitter, fpMin * 3.0);
 
     return clamp(int(textureLod(uZoneTex, tcj / texels, lvl).r * 255.0 + 0.5), 0, kindCount - 1);
   }
@@ -431,7 +482,7 @@ const SHAPE_RUNG = 0.26;
  * The total spread, 3 rungs, is 1.55:1 across a hillside; the previous scheme's
  * worst case was 1.96:1, delivered as illegible fizz.
  */
-const SHAPE_STEP = 0.155;
+const SHAPE_STEP = 0.135;
 
 /**
  * The third value system, and the only one that works on the surface that
@@ -774,8 +825,21 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // it. Multiplying before the lookup sweeps the ramp continuously wherever
     // the penumbra is partial, re-introducing a gradient at exactly the edges
     // that are supposed to be the sharpest thing in the frame.
+    // WATER TAKES A THIRD OF THAT STEP, and the reason is geometric rather
+    // than a preference. The stream sits on the floor of a channel cut five and
+    // a half metres deep, so at a 21.5 degree sun the whole bed is inside the
+    // bank's shadow, all of it, always. A full 0.42 step-down puts lit at 0.16
+    // against RAMPS.water's first threshold of 0.20 — so the ramp was pinned on
+    // band ZERO over the entire stream and its three lit colours could never be
+    // reached by the paint at all. Measured: 44,76,135 repeated identically at
+    // every sample across the visible width, which is band 0 and nothing else.
+    // A shadowed water surface is not a dark surface: what it mirrors is the
+    // SKY, and a five-metre bank does not occlude the sky. Water is also the
+    // one zone whose ramp is built to be swept by its own wave field rather
+    // than by the terrain normal, so leaving it a range to sweep is the whole
+    // point of forcing it level in the first place.
     float shadow = sunShadow(wp, N, s.viewDist, saturate1(ndlRaw));
-    lit = max(lit - (1.0 - shadow) * 0.42, 0.0);
+    lit = max(lit - (1.0 - shadow) * mix(0.42, 0.13, isWater), 0.0);
 
     vec3 col = evalZoneRamp(zone, lit);
     float bIdx = zoneBandIndex(zone, lit);
@@ -902,84 +966,30 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // ── Ground shapes: the third value system, and the only one that works ──
     // ── on the surface that defeats the other two ──────────────────────────
     //
-    // A plate map of the treeline frame settled the argument. Below the crest,
-    // 385 consecutive rows — a third of the picture — sat on ONE aerial plate,
-    // because the far wall of a bowl is very nearly equidistant from the camera
-    // across its whole visible face. The ramp is constant there too: a dune
-    // face of uniform slope has a constant normal, so the lighting term cannot
-    // move either. Every quantised system in this shader was correctly
-    // returning the same answer for every pixel, and the correct answer was a
-    // flat wash covering a third of the frame.
+    // The whole argument for this term, and for the exact shape of the
+    // quantiser it uses, is in the block comment on TERRAIN_GROUND_SHAPES.
+    // What belongs HERE is only why it is applied as it is.
     //
-    // A background painter never leaves that surface flat. They break it into a
-    // handful of large tonal shapes — where the sand is coarser, where the wind
-    // has scoured, where an old slip has left a paler fan — and they draw an
-    // edge round each one. That is a fact about the GROUND, not about the light
-    // or the air, so it has to come from a spatial field, and this is the only
-    // term in the file that does.
+    // ONE call, one ladder, one multiply. The previous version evaluated four
+    // INDEPENDENT ternary fields and multiplied their four gains together,
+    // which is where the "fixed the column that was measured" verdict came
+    // from: eighty-one distinct products, so the surface came out as a dense
+    // stack of small steps whose size depended on where in the product space a
+    // given patch of ground happened to sit. On the one column that had been
+    // named — treeline x=1100 — the answer landed at forty-one distinct values
+    // with a 80-row flat run, and on rockgarden-low x=2400 and crash
+    // x=2400 the same code produced ZERO steps over ten levels across 350 and
+    // 250 rows. Both of those are correct evaluations of the same expression;
+    // it simply has no property that guarantees a boundary anywhere.
     //
-    // THREE octaves, and the shortest one is the one that matters, because the
-    // 34 m and 130 m octaves below do not touch the surface the review actually
-    // measured. A distance trace down the treeline frame settles it: at the
-    // camera heights this game uses, the bottom FORTY PER CENT of every frame
-    // is ground between six and nine metres away, and it spans about two metres
-    // of world from the bottom edge of the picture to the crest of the near
-    // dune. Four hundred and forty rows of pixels over two metres of ground.
+    // Summing the octaves and quantising ONCE against a REPEATING ladder does
+    // have that property, by construction, and that is the entire fix. See
+    // groundShapeLevel.
     //
-    // Nothing keyed on distance can put a boundary in there — the whole swath
-    // is inside one aerial plate by construction, and it always will be. Nothing
-    // keyed on the normal can either, because it is flat. And a 34 m noise
-    // octave is constant across two metres. Every system in this shader was
-    // returning one answer for four hundred and forty rows, and the measured
-    // result was a 443-row column with no step in it anywhere.
-    //
-    // FOUR octaves — 1.05 m, 4.8 m, 34 m and 130 m — because they have to
-    // ladder the same way the plates do: whatever distance the ground in front
-    // of the camera happens to be at, one of them is at the size a painter
-    // would have blocked in at that distance, and the two either side of it are
-    // too big to see and too small to resolve. One octave leaves a hole, and
-    // the hole was at a metre, which is exactly where the frame needed it.
-    //
-    // Each is cut into THREE flat levels by a pair of hard thresholds, and the
-    // SOFTNESS FLOOR is the whole difference between a drawn shape and a
-    // bruise. At 0.02 the two smoothsteps overlap across most of the noise's
-    // own slope, the field never reaches its outer levels at all, and a 5.5%
-    // shape arrived on screen as two levels. At 0.006 it reached them but spent
-    // six rows getting there, which measures as a ramp rather than as a step.
-    // At 0.0015 the floor is below the field's own per-pixel change nearly
-    // everywhere, so bandStep's fwidth term takes over and the edge is one
-    // pixel wide and correctly antialiased — a boundary, drawn.
-    //
-    // The amplitudes are MEASURED, not guessed. Driving one octave up to 0.30
-    // and scanning a row across its boundary in the resulting still gave 20
-    // levels of 255 for a 30% multiply — about 67 levels per unit, after the
-    // grade has taken its cut. So 0.10 buys a boundary of seven levels, which
-    // is the size the review asked to be able to point at, and the four of them
-    // together give a hillside a range of about a quarter of its own value:
-    // roughly what a background painter spends blocking one in.
-    //
-    // Nothing here is continuous, so nothing here can put a gradient back on
-    // the mountain — which is the whole reason the shapes are quantised rather
-    // than simply added as noise.
-    float shpN = fbm2(w * 1.70 + 61.7, 2);
-    float shpM = fbm2(w * 0.21 + 8.3, 2);
-    float shpA = fbm2(w * 0.029 + 5.1, 2);
-    float shpB = fbm2(w * 0.0077 + 91.3, 2);
-    float shapeN = bandStep(shpN, 0.430, 0.0015) + bandStep(shpN, 0.575, 0.0015) - 1.0;
-    float shapeM = bandStep(shpM, 0.452, 0.0015) + bandStep(shpM, 0.556, 0.0015) - 1.0;
-    float shapeA = bandStep(shpA, 0.455, 0.0015) + bandStep(shpA, 0.552, 0.0015) - 1.0;
-    float shapeB = bandStep(shpB, 0.455, 0.0015) + bandStep(shpB, 0.552, 0.0015) - 1.0;
-    // Each retires once its own wavelength stops resolving, or it would become
-    // the far field's noise floor instead of its drawing. Quantised, as
-    // everything that fades in this shader must be. The two long octaves never
-    // stop resolving inside the draw distance and so carry no fade.
-    float nearFade = detailFade(w * 1.70, 40.0);
-    float midFade  = detailFade(w * 0.21, 60.0);
-    float shapeFade = detailFade(w * 0.029, 3.0);
-    col *= 1.0 + (shapeN * 0.100 * nearFade
-                + shapeM * 0.085 * midFade
-                + shapeA * 0.075 * shapeFade
-                + shapeB * 0.065) * (1.0 - isWater);
+    // Water is exempt for the same reason it is exempt from the erosion cut
+    // mark: the tonal shapes are a statement about what the GROUND is made of,
+    // and the ground is under the water rather than being it.
+    col *= mix(groundShapeGain(w), 1.0, isWater);
 
     // ── Surface detail ─────────────────────────────────────────────────────
     // Two vertical projections plus a horizontal one, blended by how the face
@@ -1132,38 +1142,81 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // it. Both terms are rebuilt here at exponents the geometry can actually
     // reach, which is why they are not simply read from the ramp block.
     //
-    // Everything stays HARD: two glint tiers and one rim step, so the result is
-    // a drawn glitter track broken up by the ripple rather than a wet sheen.
+    // ── AND EVERY HIGHLIGHT IS PAINT, NOT ADDITIVE WHITE ───────────────────
+    //
+    // That is the second half of the same defect, and it was the larger half.
+    // The block used to add uSpecColor * 1.20 for the glitter, * 0.55 for the
+    // sheet and uRimColor * 0.40 for the Fresnel, all on a surface whose base
+    // colour is the most saturated in the palette. Sampled across the stream in
+    // `streambed`, the water body itself measured hue 219 at 67% saturation —
+    // correct, that is band 0 — while the areas those three terms covered
+    // measured 203,191,193 / 211,208,211 / 245,230,255: value 200 to 255 at
+    // ONE TO ELEVEN PER CENT. Not highlights, but soft white blooms tens of
+    // pixels across, and enough of the surface for the region as a whole to
+    // average out at the 14-30% the review measured against an authored 48%.
+    //
+    // An additive term is the wrong operator for a cel highlight for a reason
+    // that has nothing to do with its strength: adding a grey drives every
+    // channel toward equality, so it CANNOT produce a colour from the palette
+    // and it always drains chroma. RAMPS.water already contains the two colours
+    // this surface wants where light hits it — 9fd0dd and e6fbff, the pale and
+    // the foam — and a mix reaches them exactly and stops there.
+    //
+    // The thresholds are also tighter than they were. N.H on this geometry runs
+    // to about 0.7 once the wave field has tilted the normal, and the old ones
+    // (0.478 and 0.573 after the pow) were crossed over most of the surface,
+    // which is why the "shapes" came out as blooms. These are crossed on the
+    // wave crests only, which is where a painter puts them.
     vec3  Hw   = normalize(L + V);
-    float glint = pow(saturate1(dot(N, Hw)), 4.0);
-    float fleck = bandStep(glint, 0.052, 0.004) * 0.55
-                + bandStep(glint, 0.108, 0.003) * 0.45;
-    float wrim = bandStep(pow(1.0 - saturate1(dot(N, V)), 1.6), 0.40, 0.03);
+    float nh   = saturate1(dot(N, Hw));
+    vec3  wPale = uZoneColor[${SurfaceKind.Water * 4 + 2}];
+    vec3  wFoam = uZoneColor[${SurfaceKind.Water * 4 + 3}];
 
     // ── Flow contours ──────────────────────────────────────────────────────
     // The current, drawn. Water in a cel background is not simulated and it is
     // not a shader effect on a plane — it is a set of long, tapering, hard-
-    // edged strokes running with the flow, and a painter draws maybe four of
+    // edged strokes running WITH the flow, and a painter draws maybe four of
     // them across a stream this wide.
     //
-    // Two tiers at different wavelengths so the field never reads as a grating:
-    // a wide, dim carrier and a narrow, hot core drawn only where the carrier
-    // and the wave crest agree. Both are advected by the ripple field, so the strokes
-    // bend around the wave rather than crossing it. And both are BRIGHT
-    // ADDITIVE — this is the one surface in the game allowed a white line.
-    float flowPhase = w.x * 1.35 + w.y * 0.90 + uTime * 0.85 + ripple * 0.9;
-    float flowWide  = bandStep(sin(flowPhase), 0.55, 0.03);
-    float flowCore  = bandStep(sin(flowPhase * 2.13 + 1.7), 0.86, 0.02) * flowWide;
+    // The phase therefore advances ACROSS the channel and the strokes run
+    // ALONG it. See STREAM_ANGLE for why the previous version had that exactly
+    // backwards. The stroke is bent by a long wave along the channel and by the
+    // ripple field, so it meanders the way a real current line does instead of
+    // ruling a straight edge, and it is advected downstream by uTime so the
+    // water moves in the direction the channel goes.
+    float acrossFlow = w.x * ${FLOW_Z.toFixed(5)} - w.y * ${FLOW_X.toFixed(5)};
+    float alongFlow  = w.x * ${FLOW_X.toFixed(5)} + w.y * ${FLOW_Z.toFixed(5)};
+    float flowPhase  = acrossFlow * 1.55
+                     + sin(alongFlow * 0.23 - uTime * 0.9) * 1.15
+                     + ripple * 0.45;
+    float flowWide = bandStep(sin(flowPhase), 0.42, 0.03);
+    float flowCore = bandStep(sin(flowPhase * 2.13 + 1.7), 0.80, 0.02) * flowWide;
 
-    // A hard-edged HIGHLIGHT SHAPE, not a specular falloff: the flat patch of
-    // sky the water is mirroring back, thresholded into one solid form and cut
-    // by the wave field so it breaks into the shards a painter would draw.
-    float sheet = bandStep(dot(N, Hw) + ripple * 0.06, 0.905, 0.006);
+    // The flat patch of sky the water mirrors back, as ONE hard shape cut by
+    // the wave field so it breaks into the shards a painter would draw, and
+    // the tighter tier of glitter on the crests inside it.
+    float sheet = bandStep(nh + ripple * 0.045, 0.575, 0.006);
+    float fleck = bandStep(nh + chop * 0.05, 0.665, 0.004);
 
-    col += isWater * (uSpecColor * fleck * 1.20 * shadow
-                    + uSpecColor * sheet * 0.55 * shadow
-                    + uRimColor * wrim * 0.40
-                    + uSpecColor * (flowWide * 0.13 + flowCore * 0.30));
+    // The glancing-angle band. A Fresnel on a horizontal plane seen from a
+    // chase camera is very nearly constant — N.V sits around 0.42 over the
+    // whole surface — so as an ADDITIVE it was a flat wash over the entire
+    // stream rather than a rim on anything. As a mix toward the ramp's own pale
+    // band at a fifth strength it is what it should always have been: the far
+    // water reading a shade lighter and cooler than the near water, in palette.
+    float wrim = bandStep(pow(1.0 - saturate1(dot(N, V)), 1.6), 0.44, 0.03);
+
+    vec3 wcol = col;
+    wcol = mix(wcol, wPale, sheet * 0.66 * mix(0.55, 1.0, shadow));
+    wcol = mix(wcol, wFoam, fleck * 0.52 * shadow);
+    wcol = mix(wcol, wPale, wrim  * 0.20);
+    wcol = mix(wcol, wPale, flowWide * 0.20);
+    wcol = mix(wcol, wFoam, flowCore * 0.46);
+    // ONE additive term survives, at a twelfth of what the block used to spend,
+    // because the hot core of a current line is the single place on this course
+    // where a stroke brighter than the palette is correct.
+    wcol += uSpecColor * flowCore * 0.10 * shadow;
+    col = mix(col, wcol, isWater);
 
     return col;
   }
@@ -1328,7 +1381,7 @@ export function createTerrainMaterials(o: TerrainMaterialOptions): TerrainMateri
     fog: true,
     varyings: TERRAIN_SHARED_DECLS,
     vertexBody: TERRAIN_DISPLACE,
-    fragmentPreamble: TERRAIN_ZONE_LOOKUP + TERRAIN_FRAGMENT,
+    fragmentPreamble: TERRAIN_ZONE_LOOKUP + TERRAIN_GROUND_SHAPES + TERRAIN_FRAGMENT,
     uniforms: { ...shared, ...fragUniforms },
   });
   main.side = FrontSide;

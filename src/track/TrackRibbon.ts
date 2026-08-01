@@ -42,6 +42,7 @@ import { CelMaterial, disposeCelMaterial, registerNprMesh } from '../npr/CelMate
 import { finalizeGeometry } from '../npr/OutlineGeometry';
 import { RAMPS } from '../npr/Palette';
 import { trailSurface } from '../npr/GeneratedTextures';
+import { TERRAIN_GROUND_SHAPES } from '../terrain/TerrainMaterial';
 import { Noise2D } from '../core/Noise';
 import { clamp, clamp01, lerp, smoothstep } from '../core/MathX';
 import { SECTION_ORDER, TrackSpline } from './TrackSpline';
@@ -607,16 +608,16 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       }
 
       /**
-       * How much of a world-space marking survives at this pixel, in THREE
-       * HARD STEPS. The twin of detailFade in TerrainMaterial, and it has to
-       * behave identically: the near-field tonal shapes cross the trail edge,
-       * so if the two sides retired them at different distances the boundary
-       * between ribbon and ground would draw itself a second time.
+       * The ground's tonal ladder, IMPORTED VERBATIM from TerrainMaterial.
+       *
+       * Not re-typed, not adapted — the same exported string. The near-field
+       * tonal shapes cross the trail edge, so a shape that ended at a
+       * different value on one side of that line would draw the trail edge a
+       * second time, in the wrong place, with no stroke on it. Two copies of a
+       * quantiser this fiddly will always drift apart; this is the same
+       * lesson, and the same remedy, as the single shared sampleZone().
        */
-      float ribbonDetailFade(vec2 uv, float texSize) {
-        float fp = max(length(dFdx(uv)), length(dFdy(uv))) * texSize;
-        return floor(clamp(1.85 - fp * 0.55, 0.0, 1.0) * 3.0 + 0.5) / 3.0;
-      }
+      ${TERRAIN_GROUND_SHAPES}
     `,
     fragmentBody: /* glsl */ `
       // ── Trail surface detail ─────────────────────────────────────────────
@@ -754,31 +755,14 @@ function buildRibbonMaterial(spline: TrackSpline): CelMaterial {
       // ── Ground shapes ────────────────────────────────────────────────────
       // The plate ladder cannot help the near field and never will. A distance
       // trace down a chase frame puts the bottom forty per cent of the picture
-      // on ground six to nine metres away spanning about two metres of world:
-      // one plate, one lit value, one of everything. The measured column was
-      // 259 rows without a step of even three levels.
+      // on ground six to nine metres away spanning about 1.7 m of world: one
+      // plate, one lit value, one of everything. The measured column was 259
+      // rows without a step of even three levels.
       //
-      // These are the SAME three quantised world-space octaves TerrainMaterial
-      // draws, sampled in WORLD space rather than in ribbon uv so that a shape
-      // running off the side of the trail continues across the ground beside
-      // it. A shape that stopped dead at the trail edge would draw the edge
-      // twice.
-      vec2 gw = vWorldPos.xz;
-      float shpN = fbm2(gw * 1.70 + 61.7, 2);
-      float shpM = fbm2(gw * 0.21 + 8.3, 2);
-      float shpA = fbm2(gw * 0.029 + 5.1, 2);
-      float shpB = fbm2(gw * 0.0077 + 91.3, 2);
-      float shapeN = bandStep(shpN, 0.430, 0.0015) + bandStep(shpN, 0.575, 0.0015) - 1.0;
-      float shapeM = bandStep(shpM, 0.452, 0.0015) + bandStep(shpM, 0.556, 0.0015) - 1.0;
-      float shapeA = bandStep(shpA, 0.455, 0.0015) + bandStep(shpA, 0.552, 0.0015) - 1.0;
-      float shapeB = bandStep(shpB, 0.455, 0.0015) + bandStep(shpB, 0.552, 0.0015) - 1.0;
-      float nearFade = ribbonDetailFade(gw * 1.70, 40.0);
-      float midFade  = ribbonDetailFade(gw * 0.21, 60.0);
-      float shapeFade = ribbonDetailFade(gw * 0.029, 3.0);
-      celCol *= 1.0 + shapeN * 0.100 * nearFade
-                    + shapeM * 0.085 * midFade
-                    + shapeA * 0.075 * shapeFade
-                    + shapeB * 0.065;
+      // Sampled in WORLD space rather than in ribbon uv, so a shape running
+      // off the side of the trail continues across the ground beside it. A
+      // shape that stopped dead at the trail edge would draw that edge twice.
+      celCol *= groundShapeGain(vWorldPos.xz);
     `,
   });
   // CelMaterial sets the NPR_VERTEX_COLOR define but three only declares the

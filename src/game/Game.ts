@@ -143,7 +143,7 @@ const SITUATIONS: Record<string, Situation> = {
   // three-quarter rear view half-occluded by the rider's own leg.
   'bike-detail':        { t: 0.075, speed: 8,  camera: CameraMode.Orbit, orbit: { yaw: 1.57, pitch: 0.02, dist: 2.3 } },
   'scree-speed':        { t: 0.189, speed: 19, camera: CameraMode.Chase, input: { pedal: 1 } },
-  'switchback-lean':    { t: 0.394, speed: 14, camera: CameraMode.Chase, input: { steer: 0.85, pedal: 0.4 } },
+  'switchback-lean':    { t: 0.394, speed: 14, camera: CameraMode.Chase, input: { steer: 0.38, pedal: 0.4 } },
   'treeline-silhouette':{ t: 0.470, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
   'rockgarden-low':     { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
   // Genuinely ballistic off the table, not parked in the air above it.
@@ -188,7 +188,13 @@ const SITUATIONS: Record<string, Situation> = {
  */
 const SEQUENCES: Record<string, { from: string; input?: Partial<BikeInput>; preroll?: number }> = {
   launch:         { from: 'summit-rider', input: { pedal: 1 } },
-  switchback:     { from: 'switchback-lean', input: { steer: 0.9, pedal: 0.5 } },
+  // 0.35, not 0.9. Full stick steers off a 3.7 m half-width ribbon in 0.9 s,
+  // and every downstream "defect" measured in this capture followed from the
+  // rider being off the trail and then in free fall down the side of it — a
+  // frozen corner marker (the HUD reads a monotonic-max track projection),
+  // -7.97 m/s^2 "coasting", +16.7 m/s^2 "acceleration" which was gravity. The
+  // sequence is meant to show a switchback being carved, not a departure.
+  switchback:     { from: 'switchback-lean', input: { steer: 0.35, pedal: 0.5 } },
   // Takeoff ~8 frames in, apex ~20, touchdown ~31.
   'tabletop-air': { from: 'tabletop-air', preroll: 248, input: { airPitch: 0.28 } },
   // Starts in the air so the whole capture is the descent, the touchdown and
@@ -534,7 +540,16 @@ export class Game {
       const sample = this.track.sampleAtDistance(d);
 
       _v.copy(sample.position);
-      if (!isPlayer) _v.addScaledVector(sample.left, i % 2 === 0 ? 2.4 : -2.4);
+      // Spawn the pack ON the racing line, not fanned off it.
+      //
+      // A 2.4 m lateral offset put the AI's lateral-correction term into
+      // saturation: it held full opposite lock for the whole capture, its
+      // offset GREW from 2.4 m to 5.9 m, and it scrubbed 68 km/h down to 13
+      // doing it. Whether the root cause is a sign disagreement between this
+      // offset and the tracker's convention or simply an over-strong gain, the
+      // fan was cosmetic and the correct start for a racing line is on it. They
+      // separate naturally through their own line preferences.
+      void isPlayer;
       _fwd.copy(sample.tangent);
 
       // Spawn on whichever surface is HIGHER: the ribbon mesh or the
@@ -574,6 +589,12 @@ export class Game {
 
       bike.reset(_v, _fwd);
       bike.state.velocity.copy(_fwd).multiplyScalar(s.speed);
+
+      // Tell the racer where it now is. Without this its track tracker keeps
+      // the distance it had before the teleport, so an AI wakes up steering
+      // toward a target hundreds of metres behind it — the pack covered 0 m in
+      // 40 s and sat 97% off-track from frame zero.
+      (r as unknown as { reseat?: (p: Vector3, d?: number) => void }).reseat?.(_v, d);
       if (s.launch) bike.state.velocity.y += s.launch;
     }
 
