@@ -57,7 +57,7 @@ export const COURSE_SCALE = 0.58;
  * still far too long to play on a keyboard or to show to anyone. This ends the
  * ribbon — and therefore the finish line, the checkpoints, the HUD profile and
  * the AI's planning horizon, all of which measure against `track.length` — at
- * 480 m, which is forty to forty-five seconds of riding.
+ * 800 m, which is a little over a minute of riding.
  *
  * It is the TRACK that is truncated, never the route. The massif's descent
  * profile, the corridor prior and every terrain feature are built from the full
@@ -65,7 +65,7 @@ export const COURSE_SCALE = 0.58;
  * for two kilometres past the finish. Shortening the route instead would shrink
  * the world with it and leave the rider on a 30 m hillock.
  */
-export const RACE_LENGTH = 480;
+export const RACE_LENGTH = 800;
 
 /** Vertical range of the mountain. */
 export const SEA_LEVEL = 0;
@@ -144,13 +144,23 @@ export const ROUTE: RouteControl[] = [
   { x: 13.9, z: -458.2, halfWidth: 9.4, section: TrackSectionKind.ScreeRun },
 
   // ── 3. Switchbacks: six bermed corners, tightening ───────────────────────
-  { x: 30.2, z: -411.8, halfWidth: 6.7, bank: -0.34, section: TrackSectionKind.Switchbacks },
-  { x: 68.4, z: -394.4, halfWidth: 6.1, bank: -0.46, section: TrackSectionKind.Switchbacks },
-  { x: 87, z: -365.4, halfWidth: 5.8, bank: -0.40, section: TrackSectionKind.Switchbacks },
-  { x: 69.6, z: -335.2, halfWidth: 5.7, bank: 0.44, section: TrackSectionKind.Switchbacks },
-  { x: 23.2, z: -322.5, halfWidth: 5.7, bank: 0.48, section: TrackSectionKind.Switchbacks },
-  { x: -24.4, z: -310.9, halfWidth: 5.5, bank: 0.44, section: TrackSectionKind.Switchbacks },
-  { x: -55.7, z: -287.7, halfWidth: 5.4, bank: -0.50, section: TrackSectionKind.Switchbacks },
+  //
+  // The FIRST SEVEN are inside the 800 m race (see RACE_LENGTH) and have been
+  // opened out; the rest are past the finish and left as authored.
+  //
+  // As written they swung x from 30 to 87 and back to 23 across ninety metres
+  // of z — a hairpin pair on a 27 m radius with the trail down to 5.6 m — and
+  // that one stretch produced 105 of the pack's 130 excursions and blew the
+  // finishing spread from 2.3 s to 24 s. Halving the swing and widening to 8 m
+  // keeps a pair of real corners at the end of the run without making the last
+  // quarter of the race the only part anyone struggles with.
+  { x: 30.2, z: -411.8, halfWidth: 8.6, bank: -0.30, section: TrackSectionKind.Switchbacks },
+  { x: 56, z: -392, halfWidth: 8.4, bank: -0.36, section: TrackSectionKind.Switchbacks },
+  { x: 70, z: -364, halfWidth: 8.2, bank: -0.32, section: TrackSectionKind.Switchbacks },
+  { x: 56, z: -338, halfWidth: 8.0, bank: 0.34, section: TrackSectionKind.Switchbacks },
+  { x: 28, z: -322, halfWidth: 8.0, bank: 0.38, section: TrackSectionKind.Switchbacks },
+  { x: -14, z: -308, halfWidth: 8.0, bank: 0.34, section: TrackSectionKind.Switchbacks },
+  { x: -46, z: -288, halfWidth: 7.6, bank: -0.38, section: TrackSectionKind.Switchbacks },
   { x: -49.9, z: -251.7, halfWidth: 5.2, bank: -0.52, section: TrackSectionKind.Switchbacks },
   { x: -11.6, z: -234.3, halfWidth: 5.2, bank: -0.44, section: TrackSectionKind.Switchbacks },
   { x: 31.3, z: -225, halfWidth: 5.4, bank: 0.46, section: TrackSectionKind.Switchbacks },
@@ -303,7 +313,7 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   // The stream: a carved channel with a wet floor.
   { kind: 'stream-channel', x: 31.9, z: 545.2, params: { width: 14, depth: 5.5, length: 151, angle: 0.86 } },
   { kind: 'rock-garden', x: -29, z: -58, params: { radius: 41, roughness: 1.35, boulderCount: 46 } },
-  { kind: 'finish-flat', x: 15.9, z: -533.6, params: { radius: 35, flatness: 0.85 } },
+  { kind: 'finish-flat', x: 4.4, z: -318.7, params: { radius: 35, flatness: 0.85 } },
 ];
 
 // ── The tabletop, as one shape both systems build ────────────────────────────
