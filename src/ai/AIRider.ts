@@ -1111,16 +1111,39 @@ export class AIRider extends RacerBase {
 
     // ── Target line, smoothed. The smoothing is the rider's own hands: a target
     // that snapped would produce a steering step no human could make.
-    const wantLateral = clamp(
+    let wantLateral = clamp(
       this.plan.targetLateral + this.avoidLateral,
       -s.halfWidth * 1.05,
       s.halfWidth * 1.05,
     );
+
+    // Off the trail, stop racing and go back to the middle.
+    //
+    // A rider that has run wide was still chasing a RACING LINE — an offset up
+    // to a full half-width toward the outside of the next corner — which is
+    // both the wrong target and, at 12 m out, a target that keeps it out. The
+    // measured shape was a slow oscillation rather than a divergence: out to
+    // -7 m, back to +3, out to -15 m, back, on a roughly ten second period.
+    // That is a loop being asked to hold a line it cannot reach while aiming
+    // past the point it needs to get back to.
+    //
+    // So while off, the target is the centreline, flatly. The hands smoothing
+    // below is what keeps this from reading as a snap.
+    const outBy = Math.abs(this.tracker.lateral) - s.halfWidth;
+    if (outBy > 0) wantLateral *= 1 - clamp01(outBy / 2.5);
+
     this.smoothedTargetLateral = dampHL(this.smoothedTargetLateral, wantLateral, 0.14, dt);
 
     // ── Lookahead point ─────────────────────────────────────────────────────
     const speed = Math.max(st.speed, 1);
-    const look = clamp(8 + speed * 0.95 * p.lookaheadScale, 8, 25);
+    // Shorten the lookahead when off the trail. A rider recovering from an
+    // excursion looks at where they are rejoining, not 25 m down the course —
+    // a distant aim point barely differs in bearing from the one they are
+    // already pointed at, so the heading error stays small while the position
+    // error does not, and the loop takes seconds to do something urgent.
+    const look =
+      clamp(8 + speed * 0.95 * p.lookaheadScale, 8, 25) *
+      (1 - 0.55 * clamp01((Math.abs(this.tracker.lateral) - s.halfWidth) / 4));
     const aheadD = Math.min(this.tracker.distance + look, this.track.length);
     const aim = this.track.sampleAtDistance(aheadD, this.scratchSample);
     _v1.copy(aim.position).addScaledVector(aim.left, this.smoothedTargetLateral);
@@ -1210,7 +1233,20 @@ export class AIRider extends RacerBase {
     const vErr = this.smoothedTargetSpeed - travelling;
 
     if (vErr > 0.4) {
-      i.pedal = clamp01(vErr * 0.42) * p.throttleDiscipline * caution;
+      // 0.18, not 0.42, because the bike's drive authority more than doubled.
+      //
+      // This gain converts a speed error in m/s into a pedal demand, so it is
+      // only meaningful relative to what full pedal actually produces. At
+      // 460 N on 92 kg that was 5.0 m/s^2 and 0.42 asked for everything at a
+      // 2.4 m/s error, which was aggressive but survivable. At 980 N it is
+      // 10.6 m/s^2, and the same command drives twice the acceleration into a
+      // loop tuned for half of it: the pack left the start line overshooting
+      // its own planned corner speeds and ran wide, max |lateral| going from
+      // 2.2 m to 12.9 m in the first twenty seconds.
+      //
+      // Scaled by the force ratio, which puts the closed loop back where it was
+      // measured. Any future change to `pedalForce` has to come through here.
+      i.pedal = clamp01(vErr * 0.18) * p.throttleDiscipline * caution;
       i.brakeRear = 0;
       i.brakeFront = 0;
     } else {

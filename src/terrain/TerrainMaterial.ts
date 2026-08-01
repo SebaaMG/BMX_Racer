@@ -1421,6 +1421,25 @@ export function createTerrainMaterials(o: TerrainMaterialOptions): TerrainMateri
   });
   main.side = FrontSide;
 
+  // Lose the depth tie against the trail ribbon, which is coplanar with this
+  // surface by construction (the carve targets the ribbon exactly, because the
+  // heightfield is what the wheels collide with).
+  //
+  // The bias goes on the GROUND, pushing it away, rather than on the ribbon
+  // pulling it nearer. Nearer is the obvious choice and it is wrong: a tyre
+  // resting on the trail is tangent to it, so a ribbon biased toward the camera
+  // wins the depth test against the bottom of the wheel and draws over it. That
+  // is what buried the rear wheel in the trail — the physics contact patch
+  // never penetrated (max 0.000 m over a full run) and the drawn axle sat at
+  // 0.271 m against a 0.267 m wheel radius, so the tyre was four millimetres
+  // clear of the ground and the ribbon was simply painted on top of it.
+  //
+  // Biasing the ground backwards resolves the same tie without ever moving a
+  // surface in front of something standing on it.
+  main.polygonOffset = true;
+  main.polygonOffsetFactor = 2;
+  main.polygonOffsetUnits = 4;
+
   const prepass = createTerrainPrepassMaterial(shared, zoneIds);
   const shadow = createTerrainShadowMaterial(shared);
 

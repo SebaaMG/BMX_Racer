@@ -338,13 +338,36 @@ export const BIKE = {
   forkDamping: 2300,      // Ns/m
   shockStiffness: 46000,
   shockDamping: 3100,
-  /** Peak drive force from pedalling, newtons. */
-  pedalForce: 460,
-  /** Speed beyond which pedalling adds nothing (spun out), m/s. */
-  spinOutSpeed: 17.5,
+  /**
+   * Peak drive force from pedalling, newtons.
+   *
+   * 460 N on a 92 kg bike+rider is 5.0 m/s^2 at a standstill and far less as
+   * soon as the spin-out term bites, which made recovering from any stop a
+   * chore and made a 5 degree rise genuinely impassable: measured, a player
+   * holding pedal from the line reached 70 km/h at 67 m and then sat between 11
+   * and 32 km/h unable to get up the 4.9 degree section at 244-252 m. This is
+   * an arcade downhill racer, not a simulation of a tired cyclist.
+   */
+  pedalForce: 720,
+  /**
+   * Speed beyond which pedalling adds nothing (spun out), m/s.
+   *
+   * Was 17.5 (63 km/h), so the drive died right where the game gets fast and
+   * the whole midrange coasted. 27 m/s is 97 km/h.
+   */
+  spinOutSpeed: 19.5,
   brakeForceRear: 1450,
   brakeForceFront: 2350,
-  /** Aerodynamic drag coefficient — 0.5 * rho * Cd * A. */
+  /**
+   * Aerodynamic drag coefficient — 0.5 * rho * Cd * A.
+   *
+   * Drag is what actually sets terminal speed on a long descent: at 0.42 it
+   * reached 262 N by 25 m/s, which is more than the gravity component on a
+   * 15 degree slope, so the course could not accelerate the rider past about
+   * 23 m/s no matter how steep it got. 0.25 moves that ceiling well past what
+   * the trail is wide enough for, and leaves the corners as the speed limit
+   * instead of the air.
+   */
   dragK: 0.42,
   /** Maximum steering angle at the bars, radians. */
   maxSteer: 0.62,

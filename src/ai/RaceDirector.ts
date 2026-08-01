@@ -68,6 +68,9 @@ const _n = new Vector3();
  * never yanked off it — a genuinely stuck rider shows 0-2 km/h and no distance
  * at all, which is nothing like a slow one.
  */
+/** Metres of trail kept between the outermost grid slot and the edge. */
+const GRID_EDGE_MARGIN = 1.0;
+
 const STUCK_SECONDS = 4.5;
 /** Metres of course that count as "still going". */
 const STUCK_PROGRESS = 1.5;
@@ -233,8 +236,24 @@ export class RaceDirector {
       const lane = slot - (count - 1) / 2;
       const setback = Math.abs(lane) * 1.1;
 
+      // Fit the grid to the TRAIL, never to a fixed spacing.
+      //
+      // START_SPACING is 2.1 m, so four riders sit at -3.15, -1.05, +1.05 and
+      // +3.15 — and the trail's half-width on the start line is 3.55 m. The
+      // outer two therefore began 40 cm from the edge, which is less than half
+      // a handlebar, and the first steering input of the race put them over it.
+      // A player watching the start saw a rival simply ride off to the left and
+      // fall over before the clock reached 1.3 s.
+      //
+      // The grid is squeezed to keep every rider a full bike inside the edge,
+      // and only ever squeezed — a wide start line still uses the authored
+      // spacing.
+      const halfSpan = (count - 1) / 2;
+      const usable = Math.max(start.halfWidth - GRID_EDGE_MARGIN, 0.6);
+      const spacing = halfSpan > 0 ? Math.min(START_SPACING, usable / halfSpan) : START_SPACING;
+
       _v0.copy(start.position)
-        .addScaledVector(start.left, lane * START_SPACING)
+        .addScaledVector(start.left, lane * spacing)
         .addScaledVector(start.tangent, -setback);
       // A small lift; the bike's own reset settles it onto the ground.
       _v0.y += 0.35;

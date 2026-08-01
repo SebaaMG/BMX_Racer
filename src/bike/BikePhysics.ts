@@ -205,7 +205,24 @@ export const BODY_TUNE = {
   /** Deceleration above this in one step is a wall strike, in m/s. */
   wallImpactSpeed: 7.5,
 
-  /** Rolling resistance scale — the surface table supplies the per-surface part. */
+  /**
+   * Rolling resistance scale — the surface table supplies the per-surface part.
+   *
+   * DO NOT lower this to make the bike faster. It was briefly cut to 15 along
+   * with the drive and drag changes, on the reasoning that it was part of what
+   * made the bike sluggish. It is not: on trail (0.24) it costs 6.2 N against
+   * 980 N of drive, which is nothing. What it actually governs is the PENALTY
+   * FOR LEAVING THE TRAIL — scree is 0.70 and snow 1.05, so this is the term
+   * that makes open mountainside slow.
+   *
+   * Halving it doubled how far a rider who ran wide travelled before the ground
+   * pulled them up, and the AI's excursions went from a maximum of 3.0-3.9 m to
+   * 11.8-16.6 m. Measured by A/B with identical AI code, which is the only
+   * reason the cause was ever attributed correctly: the symptom looked exactly
+   * like a steering bug, and three attempts to fix it as one changed nothing.
+   *
+   * Drive force, spin-out speed and drag are where speed comes from.
+   */
   rollingResistance: 26,
 
   // ── Ground hold ───────────────────────────────────────────────────────────

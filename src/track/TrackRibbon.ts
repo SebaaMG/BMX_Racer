@@ -148,15 +148,12 @@ export class TrackRibbon {
     // the depth tie, which bought a clean raster at the price of burying every
     // wheel in the game 12 cm under the track.
     //
-    // Coplanar surfaces are a DEPTH problem, so they get a depth fix: bias the
-    // ribbon toward the camera in window-space Z. Negative units pull it
-    // nearer. The factor term scales with the polygon's depth slope, which is
-    // the part that matters here — the trail is seen at raking angles where the
-    // depth gradient across a single pixel is enormous, and a constant-only
-    // offset that suffices head-on does nothing at 2 degrees of incidence.
-    this.material.polygonOffset = true;
-    this.material.polygonOffsetFactor = -2;
-    this.material.polygonOffsetUnits = -4;
+    // Coplanar surfaces are a DEPTH problem and they get a depth fix — but the
+    // bias lives on the TERRAIN, pushing the ground away, not here pulling the
+    // ribbon nearer. See the note in `TerrainMaterial`: a ribbon biased toward
+    // the camera also wins the depth test against the tyre standing on it, and
+    // draws over the bottom of the wheel. Pulling the near surface forward is
+    // the intuitive fix and it puts the trail in front of the bike.
 
     this.emitChunks(links);
   }
