@@ -18,7 +18,7 @@
  *    of the frame, holding exactly TWO colours. It is now SEVEN plateaus at
  *    50-110 rows each, the lowest of which is mixed toward FOG_BANDS' furthest
  *    haze colour so the sky and the far ridges share a palette where they meet.
- *    See the uUpperWarm / uGlow / uFoot uniforms and skyGradient().
+ *    See the uUpperPale / uGlow / uFoot uniforms and skyGradient().
  *
  * B. CLOUD CONFETTI. "Fourteen sub-20 px fragments in one crop, each carrying a
  *    full ink contour." A level set of fBm always sprays small components
@@ -211,11 +211,25 @@ export class Sky {
         // apiece, which is the interval an animator paints a dawn sky at. Two of
         // them are new colours and one of them matters for a second reason:
         //
-        //  - uUpperWarm sits between the blue and the cream. The complaint about
+        //  - uUpperPale sits between the blue and the cream. The complaint about
         //    a "hard boundary against the cream" is a complaint about a single
         //    step from a cool blue to a warm cream, which is the largest hue
-        //    jump anywhere in the picture. A band that is half way between them
-        //    turns one impossible step into two ordinary ones.
+        //    jump anywhere in the picture, and a dawn sky answers it by PALING
+        //    before it warms.
+        //
+        //    AND IT MUST NOT BE THE AVERAGE OF THE TWO. The first build made this
+        //    band mix(upper, horizon, 0.52) — the obvious choice, and it produced
+        //    the critic's fourth defect from scratch. Written in linear light,
+        //    upper is (0.176, 0.383, 0.714) and horizon is (0.871, 0.616, 0.348):
+        //    GREEN IS THE MIDDLE CHANNEL IN BOTH, so the average lands at
+        //    (0.537, 0.504, 0.538) with green BELOW the other two, which is
+        //    magenta by definition. It measured hsv(332, 10%) on finish-sprint —
+        //    the exact "magenta near-white" signature the critic had reported
+        //    against an earlier build and which the FOG_BANDS and gamut-roll work
+        //    had already removed everywhere else. Any mix of a blue and an orange
+        //    passes through magenta; the way between them is through a PALE BLUE,
+        //    so this is the blue lifted toward the cloud highlight instead, which
+        //    keeps green in the middle and the hue at 205.
         //  - uGlow is the hot band that sits ON the skyline, where the sun
         //    actually is.
         //  - uFoot is the lowest band, and it is mixed toward FOG_BANDS' most
@@ -226,7 +240,7 @@ export class Sky {
         //    two unrelated palettes instead of a horizon. A far ridge and the
         //    sky immediately behind it now belong to the same family, which is
         //    what aerial perspective is.
-        uUpperWarm: { value: mixed(SKY.upper, SKY.horizon, 0.52) },
+        uUpperPale: { value: mixed(SKY.upper, SKY.cloudLit, 0.42) },
         uGlow: { value: mixed(SKY.belowHorizon, SKY.sunGlow, 0.50) },
         uFoot: { value: mixed(SKY.belowHorizon, FOG_BANDS.colors[3], 0.55) },
         uSunDisc: { value: SKY.sunDisc.clone() },
@@ -294,7 +308,7 @@ export class Sky {
         uniform vec3  uSunDir;
         uniform vec2  uResolution;
         uniform vec3  uZenith, uUpper, uHorizon, uBelow;
-        uniform vec3  uUpperWarm, uGlow, uFoot;
+        uniform vec3  uUpperPale, uGlow, uFoot;
         uniform vec3  uSunDisc, uSunGlow;
         uniform vec3  uCloudLit, uCloudMid, uCloudShadow, uCloudInk;
         uniform vec3  uFarLit, uFarMid, uFarShadow, uFarInk;
@@ -578,7 +592,7 @@ export class Sky {
           col = mix(col, uBelow,     bandStepS(hBelow,   -0.090, 0.0018));
           col = mix(col, uGlow,      bandStepS(hGlow,    -0.034, 0.0018));
           col = mix(col, uHorizon,   bandStepS(hHorizon,  0.016, 0.0018));
-          col = mix(col, uUpperWarm, bandStepS(hWarm,     0.070, 0.0020));
+          col = mix(col, uUpperPale, bandStepS(hWarm,     0.070, 0.0020));
           col = mix(col, uUpper,     bandStepS(hUpper,    0.145, 0.0022));
           col = mix(col, uZenith,    bandStepS(hZenith,   0.500, 0.0030));
 

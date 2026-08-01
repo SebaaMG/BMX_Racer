@@ -1147,8 +1147,8 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // That is the second half of the same defect, and it was the larger half.
     // The block used to add uSpecColor * 1.20 for the glitter, * 0.55 for the
     // sheet and uRimColor * 0.40 for the Fresnel, all on a surface whose base
-    // colour is the most saturated in the palette. Sampled across the stream in
-    // `streambed`, the water body itself measured hue 219 at 67% saturation —
+    // colour is the most saturated in the palette. Sampled across the stream
+    // in streambed, the water body itself measured hue 219 at 67% saturation —
     // correct, that is band 0 — while the areas those three terms covered
     // measured 203,191,193 / 211,208,211 / 245,230,255: value 200 to 255 at
     // ONE TO ELEVEN PER CENT. Not highlights, but soft white blooms tens of
@@ -1161,6 +1161,8 @@ const TERRAIN_FRAGMENT = /* glsl */ `
     // and it always drains chroma. RAMPS.water already contains the two colours
     // this surface wants where light hits it — 9fd0dd and e6fbff, the pale and
     // the foam — and a mix reaches them exactly and stops there.
+    //
+    // (Sampled across the stream: see the note above for the measured values.)
     //
     // The thresholds are also tighter than they were. N.H on this geometry runs
     // to about 0.7 once the wave field has tilted the normal, and the old ones

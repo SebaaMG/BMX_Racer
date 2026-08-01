@@ -75,6 +75,17 @@ await p.evaluate(async () => {
 await p.evaluate((d) => {
   window.__DIST = d;
 }, DIST);
+// The impact plume is emitted on top of the rider and never dissipates, so from
+// the frame of the hit onward it is the only thing in shot. Hidden here because
+// this probe is about the BODY; the dust is another agent's defect.
+await p.evaluate(() => {
+  window.__HIDE = () => {
+    window.__DESCENT__.engine.scene.traverse((o) => {
+      const n = (o.name || '').toLowerCase();
+      if (n.includes('dust') || n.includes('debris') || n.includes('puff') || n.includes('smear')) o.visible = false;
+    });
+  };
+});
 await p.evaluate(() => {
   for (let i = 0; i < 4; i++) window.__DESCENT__.game.capture.step(1 / 60);
 });
@@ -84,6 +95,12 @@ const want = new Set(FRAMES);
 const kept = [];
 for (let f = 0; f <= last; f++) {
   await p.evaluate(() => window.__DESCENT__.game.capture.step(1 / 60));
+  if (want.has(f)) {
+    await p.evaluate(() => {
+      window.__HIDE();
+      window.__DESCENT__.game.capture.step(0);
+    });
+  }
   const file = want.has(f) ? `${OUT}/f${String(f).padStart(4, '0')}.png` : `${OUT}/_scratch.png`;
   await p.screenshot({ path: file, animations: 'disabled' });
   if (want.has(f)) kept.push([f, file]);
