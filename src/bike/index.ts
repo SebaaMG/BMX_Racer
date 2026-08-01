@@ -28,6 +28,7 @@ import {
 import { BikePhysics, BODY_TUNE, buildOrientation, type BikePhysicsOptions, type BikeStateEx } from './BikePhysics';
 import { BikeVisual, crankRate, type BikeVisualState } from './BikeVisual';
 import { BIKE_GEOM as G } from './BikeModel';
+import { BIKE } from '../game/WorldConstants';
 import type { BikeTerrain } from './Wheel';
 import { clamp01, dampHL, lerp } from '../core/MathX';
 import { ease } from '../core/MathX';
@@ -83,6 +84,8 @@ export class Bike implements IBike {
   };
 
   private crankOmega = 0;
+  /** Set by reset(); snaps the cranks to the geared rate on the next frame. */
+  private crankNeedsSeed = false;
   private cameraRef: Object3D | null = null;
 
   constructor(opts: BikeOptions) {
@@ -150,9 +153,20 @@ export class Bike implements IBike {
     // Chain-driven: the cranks are geared to the rear wheel, so a pedalling
     // rider's cadence is a consequence of speed and gearing rather than an
     // animation speed that happens to look about right. Coasting freewheels.
+    const gear = G.cogRadius / G.chainringRadius;
+
+    // A bike placed at speed has its cranks already turning. Ramping them up
+    // from a standstill on a 0.12 s half-life meant every capture opened with
+    // about 250 ms of near-static cranks — measured on `launch`, the cranks
+    // moved 0.78 rad over the first 15 frames while the rider held full pedal
+    // and the knee moved 8 px, which reads as a rider not pedalling.
+    if (this.crankNeedsSeed && Math.abs(s.forwardSpeed) > 0.5) {
+      this.crankOmega = (s.forwardSpeed / BIKE.wheelRadius) * gear;
+      this.crankNeedsSeed = false;
+    }
+
     const pedalling = this.lastPedal > 0.06 && s.mode === BikeMode.Grounded;
     if (pedalling) {
-      const gear = G.cogRadius / G.chainringRadius;
       this.crankOmega = dampHL(this.crankOmega, this.physics.rear.spinRate * gear, 0.12, dt);
     } else {
       this.crankOmega = crankRate(s.forwardSpeed, false, dt, this.crankOmega);
@@ -216,6 +230,23 @@ export class Bike implements IBike {
     this.vis.crankAngle = 0;
     this.vis.chainOffset = 0;
     this.vis.whipAngle = 0;
+
+    // Seed the cranks from the speed the bike is being placed at.
+    //
+    // `reset` used to zero `crankOmega`, and `lastPedal` is only written by
+    // `noteInput` — which the race layer calls AFTER the first physics step —
+    // so the visual opened every capture believing the rider was coasting and
+    // spent a 0.12 s half-life ramping from a standstill. Measured on `launch`:
+    // the cranks moved 0.78 rad total over the first 15 frames while the rider
+    // held full pedal, and the knee moved 8 px. A bike teleported to 19 m/s has
+    // its cranks already turning; starting them from zero is a claim about the
+    // world that is not true.
+    // Cannot seed from the wheel here: `physics.reset()` has just zeroed the
+    // wheel spin, and the caller sets the velocity AFTER this returns. Flag it
+    // instead and snap on the first moving visual frame.
+    this.crankOmega = 0;
+    this.lastPedal = 0.5;
+    this.crankNeedsSeed = true;
     this.vis.barTwist = 0;
     this.crankOmega = 0;
     this.lastPedal = 0;

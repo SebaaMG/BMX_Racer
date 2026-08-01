@@ -451,13 +451,24 @@ export const TERRAIN_ZONE_LOOKUP = /* glsl */ `
 /**
  * Composite units of the tonal field between one tonal level and the next.
  *
- * The field below is a sum of four noise octaves, each with a standard
- * deviation near 0.15, so the sum has one near 0.25. A rung of 0.26 is
- * therefore about one sigma: the two middle levels take roughly a third of the
- * ground each and the two outer ones about a sixth each, which is the spread a
- * painter's four-value block-in has.
+ * SIZED AGAINST ONE OCTAVE, NOT AGAINST THE SUM, and that is the whole
+ * difference between a ladder that holds on nine columns and one that holds on
+ * seven. Each octave below has a standard deviation near 0.13, so over one of
+ * its own wavelengths it sweeps roughly 0.36 peak to peak. At the 0.26 this
+ * started at, a single octave therefore covered about 1.4 rungs per wavelength
+ * — enough for about one crossing, which is enough only while nothing else has
+ * gone wrong. On a column where exactly one octave was still resolving and
+ * happened to sit near the middle of a level, it produced NONE: measured on
+ * switchback-lean x=2350, 350 rows all at 127,79,76.
+ *
+ * At 0.20 the same octave covers 1.8 rungs and the two live neighbours cover
+ * about 2.4 between them, so a crossing inside a wavelength stops being a
+ * coin-flip. The cost is that the field saturates against the outer levels more
+ * often — about seven per cent of the ground sits at each end — and that is not
+ * a cost at all: a painter's block-in has large flat darks and large flat
+ * lights in it, and only the mid-values do the wandering.
  */
-const SHAPE_RUNG = 0.26;
+const SHAPE_RUNG = 0.2;
 
 /**
  * Value multiply per tonal level. MEASURED, not chosen.
@@ -504,29 +515,43 @@ const SHAPE_STEP = 0.135;
  * it comes from a spatial field, and this is the only term in the material that
  * does.
  *
- * FOUR OCTAVES — 0.59 m, 4.8 m, 34 m and 130 m — because whatever distance the
- * ground in front of the camera happens to be at, one of them is at the size a
- * painter would have blocked in at that distance and the two either side are
- * too big to see and too small to resolve. The shortest one is not optional: at
- * the camera heights this game uses the bottom FORTY PER CENT of every frame is
- * ground six to nine metres away spanning about 1.7 m of world — four hundred
- * and forty rows of pixels over 1.7 m. Nothing keyed on distance can put a
- * boundary in there, nothing keyed on the normal can either because it is flat,
- * and a 34 m octave is constant across 1.7 m.
+ * SIX OCTAVES, AT A RATIO OF ABOUT THREE — 0.59, 1.7, 4.9, 14, 41 and 119 m.
+ *
+ * The ratio is the point of the rewrite. The first version of this ran four
+ * octaves at a ratio of EIGHT, and justified it with "whatever distance the
+ * ground is at, one of them is the size a painter would have blocked in and the
+ * two either side are too big to see and too small to resolve". The second half
+ * of that sentence is true at a ratio of eight and it is the problem: at eight,
+ * the neighbours really are useless, so exactly ONE octave is doing the drawing
+ * at any given distance, and one octave with the contrast this field is allowed
+ * covers about one and a half rungs per wavelength. That is one crossing if it
+ * is lucky and none if it is not, which is precisely what a 350-row column on
+ * switchback-lean measured: sixteen plateaus, all of them at luma 93, and zero
+ * boundaries. At a ratio of three, two or three octaves are live and varying
+ * over any span the camera can see, at genuinely different sizes, and the
+ * crossing stops depending on luck.
+ *
+ * The shortest is not optional: at the camera heights this game uses, the
+ * bottom FORTY PER CENT of every frame is ground six to nine metres away
+ * spanning about 1.7 m of world — four hundred and forty rows of pixels over
+ * 1.7 m. Nothing keyed on distance can put a boundary in there, nothing keyed
+ * on the normal can either because it is flat, and a 34 m octave is constant
+ * across 1.7 m. The longest is not optional either: it is the only thing that
+ * blocks in a mountainside seen whole from a kilometre.
  *
  * THEY ARE SUMMED AND THEN QUANTISED ONCE. See SHAPE_STEP for why that is the
  * whole difference between a ladder and a wobble. The sum is the right operator
- * for a second reason too: the long octaves act as a BIAS on the short one, so
- * wherever the short octave is the only thing moving — which is the entire near
- * field — it still crosses rungs, because the rungs are uniformly spaced and
- * repeat rather than being three fixed thresholds the bias can sit between.
+ * for a second reason too: the long octaves act as a BIAS on the short ones, so
+ * wherever a short octave is the only thing moving it still crosses rungs,
+ * because the rungs are uniformly spaced and repeat rather than being fixed
+ * thresholds the bias can sit between.
  *
  * Each octave retires once its own wavelength stops resolving on screen, or it
  * would become the far field's noise floor instead of its drawing. Because the
  * terms are summed and then quantised, a retiring octave removes its own
  * contribution from the sum without shifting the ladder — the field stays
- * centred on zero at every distance. The 130 m octave never stops resolving
- * inside the draw distance and so carries no fade.
+ * centred on zero at every distance. The two longest never stop resolving
+ * inside the draw distance and so carry no fade.
  */
 export const TERRAIN_GROUND_SHAPES = /* glsl */ `
   /**
@@ -561,15 +586,23 @@ export const TERRAIN_GROUND_SHAPES = /* glsl */ `
    * a boundary, drawn.
    */
   float groundShapeLevel(vec2 w) {
-    float shpN = fbm2(w * 1.70   + 61.7, 2);
-    float shpM = fbm2(w * 0.21   + 8.3,  2);
-    float shpA = fbm2(w * 0.029  + 5.1,  2);
-    float shpB = fbm2(w * 0.0077 + 91.3, 2);
+    // ONE lattice tap per octave, not an fbm. Six rungs of a ratio-three ladder
+    // already carry every size the picture needs, so a second sub-octave inside
+    // each one would only be adding detail that the octave below it is drawing
+    // properly. Six taps against the previous scheme's eight: this rewrite is
+    // cheaper than the thing it replaces, on the largest surface in the frame.
+    vec2 uvN = w * 1.70;
+    vec2 uvM = w * 0.585;
+    vec2 uvA = w * 0.203;
+    vec2 uvB = w * 0.0700;
 
-    float form = (shpN - 0.5) * 1.00 * groundShapeFade(w * 1.70,  40.0)
-               + (shpM - 0.5) * 0.92 * groundShapeFade(w * 0.21,  60.0)
-               + (shpA - 0.5) * 0.80 * groundShapeFade(w * 0.029,  3.0)
-               + (shpB - 0.5) * 0.66;
+    float form =
+        (vnoise(uvN + 61.7) - 0.5) * 0.74 * groundShapeFade(uvN, 50.0)
+      + (vnoise(uvM +  8.3) - 0.5) * 0.72 * groundShapeFade(uvM, 50.0)
+      + (vnoise(uvA +  5.1) - 0.5) * 0.70 * groundShapeFade(uvA, 50.0)
+      + (vnoise(uvB + 91.3) - 0.5) * 0.67 * groundShapeFade(uvB, 50.0)
+      + (vnoise(w * 0.0242 + 23.9) - 0.5) * 0.62
+      + (vnoise(w * 0.00835 + 47.1) - 0.5) * 0.52;
 
     float t = form * ${(1 / SHAPE_RUNG).toFixed(5)};
     float aa = max(fwidth(t) * 0.75, 0.0015);
