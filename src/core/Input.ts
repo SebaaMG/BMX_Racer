@@ -232,10 +232,10 @@ export class Input {
       i.usingGamepad = true;
     } else {
       const steerTarget = (i.buttons.steerRight.pressed ? 1 : 0) - (i.buttons.steerLeft.pressed ? 1 : 0);
-      // Asymmetric: ~110ms to full lock, ~70ms to centre. Quick to release so
+      // Asymmetric: ~60ms to full lock, ~55ms to centre. Quick to release so
       // corrections feel sharp; slower to engage so the bike doesn't snap.
-      const attack = dt / 0.11;
-      const release = dt / 0.07;
+      const attack = dt / 0.06;
+      const release = dt / 0.055;
       i.steer =
         steerTarget === 0
           ? moveTowards(i.steer, 0, release)

@@ -229,7 +229,16 @@ export const FRONT_TYRE: TyreConfig = {
   tailLat: 0.68,
   camber: 1.0,
   muLongScale: 1.04,
-  muLatScale: 1.03,
+  // Lateral grip, as a multiple of the surface grip. Raised from 1.03/0.96.
+  //
+  // This is the ceiling on cornering acceleration (`aMax = g * muLatScale *
+  // grip`), which the steering model turns directly into the lean it will hold
+  // — so it is the other half of how hard the bike can turn, alongside maxLean.
+  // A player reported the controls as "very weak"; at the old values the bike
+  // was pinned near the real-tyre limit, which is the correct number for a
+  // simulation and the wrong one for a game someone has to steer with four
+  // keys on a mountainside.
+  muLatScale: 1.30,
   relaxLat: 0.34,
   loadSensitivity: 0.10,
   nominalLoad: 850,
@@ -246,7 +255,7 @@ export const REAR_TYRE: TyreConfig = {
   tailLat: 0.72,
   camber: 0.94,
   muLongScale: 1.08,
-  muLatScale: 0.96,
+  muLatScale: 1.22,
   relaxLat: 0.40,
   loadSensitivity: 0.11,
   nominalLoad: 1050,

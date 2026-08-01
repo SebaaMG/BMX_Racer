@@ -27,18 +27,44 @@ export const WORLD_SIZE = 4096;
 export const WORLD_HALF = WORLD_SIZE / 2;
 export const METRES_PER_SAMPLE = WORLD_SIZE / HEIGHTMAP_SIZE;
 
+/**
+ * COURSE SCALE — one number that makes the whole mountain smaller.
+ *
+ * The course was 3807 m with 571 m of drop, which is four to five minutes of
+ * riding. That is a long way to ask anyone to hold a line on a keyboard, and
+ * far too long to show. Everything below is expressed so that scaling this
+ * shrinks the course WITHOUT changing how it rides:
+ *
+ *   - route control points and feature anchors scale in XZ, so the plan shape
+ *     is identical and every section keeps its share of the course;
+ *   - the vertical range scales about the valley floor, so the average grade
+ *     is unchanged — halving the length and keeping the drop would double the
+ *     steepness of every section;
+ *   - the altitude zone boundaries scale with it, so snow, scree, rock, dirt
+ *     and grass still band across the descent in the same places;
+ *   - what a bike interacts with does NOT scale: trail widths, jump gaps, lip
+ *     heights, ravine width. A 11.5 m gap needs the same speed to clear at any
+ *     course length, and a 3 m trail is as wide as the bike needs it to be.
+ *
+ * 0.58 gives roughly 2.2 km and a two-and-a-half minute run.
+ */
+export const COURSE_SCALE = 0.58;
+
 /** Vertical range of the mountain. */
 export const SEA_LEVEL = 0;
-export const SUMMIT_HEIGHT = 640;
 export const VALLEY_HEIGHT = 55;
+export const SUMMIT_HEIGHT = VALLEY_HEIGHT + (640 - 55) * COURSE_SCALE;
+
+/** Scale an altitude about the valley floor, so bands keep their place. */
+const zoneAt = (h: number): number => VALLEY_HEIGHT + (h - 55) * COURSE_SCALE;
 
 /** Altitude zone boundaries, metres. Hard cel transitions, not blends. */
 export const ZONE = {
-  waterLine: 62,
-  grassTop: 210,
-  dirtTop: 330,
-  rockTop: 470,
-  screeTop: 545,
+  waterLine: zoneAt(62),
+  grassTop: zoneAt(210),
+  dirtTop: zoneAt(330),
+  rockTop: zoneAt(470),
+  screeTop: zoneAt(545),
   // Above screeTop is snow.
   /** Slopes steeper than this are always rock, regardless of altitude. */
   rockSlopeRad: 0.72,
@@ -72,72 +98,72 @@ export interface RouteControl {
 
 export const ROUTE: RouteControl[] = [
   // ── 1. Technical start: exposed rock, tight, off-camber ──────────────────
-  { x: -120, z: -1620, halfWidth: 3.6, section: TrackSectionKind.TechnicalStart },
-  { x: -104, z: -1560, halfWidth: 3.2, section: TrackSectionKind.TechnicalStart },
-  { x: -66, z: -1516, halfWidth: 2.9, section: TrackSectionKind.TechnicalStart },
-  { x: -18, z: -1494, halfWidth: 2.8, section: TrackSectionKind.TechnicalStart },
-  { x: 34, z: -1478, halfWidth: 3.0, section: TrackSectionKind.TechnicalStart },
-  { x: 78, z: -1436, halfWidth: 3.2, bank: 0.18, section: TrackSectionKind.TechnicalStart },
-  { x: 96, z: -1372, halfWidth: 3.6, bank: 0.22, section: TrackSectionKind.TechnicalStart },
+  { x: -69.6, z: -939.6, halfWidth: 5.2, section: TrackSectionKind.TechnicalStart },
+  { x: -60.3, z: -904.8, halfWidth: 4.6, section: TrackSectionKind.TechnicalStart },
+  { x: -38.3, z: -879.3, halfWidth: 4.2, section: TrackSectionKind.TechnicalStart },
+  { x: -10.4, z: -866.5, halfWidth: 4.1, section: TrackSectionKind.TechnicalStart },
+  { x: 19.7, z: -857.2, halfWidth: 4.3, section: TrackSectionKind.TechnicalStart },
+  { x: 45.2, z: -832.9, halfWidth: 4.6, bank: 0.18, section: TrackSectionKind.TechnicalStart },
+  { x: 55.7, z: -795.8, halfWidth: 5.2, bank: 0.22, section: TrackSectionKind.TechnicalStart },
 
   // ── 2. Scree run: open, straight, build speed ────────────────────────────
-  { x: 88, z: -1280, halfWidth: 5.5, section: TrackSectionKind.ScreeRun },
-  { x: 64, z: -1160, halfWidth: 7.0, section: TrackSectionKind.ScreeRun },
-  { x: 40, z: -1030, halfWidth: 8.0, section: TrackSectionKind.ScreeRun },
-  { x: 26, z: -900, halfWidth: 8.0, section: TrackSectionKind.ScreeRun },
-  { x: 24, z: -790, halfWidth: 6.5, section: TrackSectionKind.ScreeRun },
+  { x: 51, z: -742.4, halfWidth: 8, section: TrackSectionKind.ScreeRun },
+  { x: 37.1, z: -672.8, halfWidth: 10.2, section: TrackSectionKind.ScreeRun },
+  { x: 23.2, z: -597.4, halfWidth: 11.6, section: TrackSectionKind.ScreeRun },
+  { x: 15.1, z: -522, halfWidth: 11.6, section: TrackSectionKind.ScreeRun },
+  { x: 13.9, z: -458.2, halfWidth: 9.4, section: TrackSectionKind.ScreeRun },
 
   // ── 3. Switchbacks: six bermed corners, tightening ───────────────────────
-  { x: 52, z: -710, halfWidth: 4.6, bank: -0.34, section: TrackSectionKind.Switchbacks },
-  { x: 118, z: -680, halfWidth: 4.2, bank: -0.46, section: TrackSectionKind.Switchbacks },
-  { x: 150, z: -630, halfWidth: 4.0, bank: -0.40, section: TrackSectionKind.Switchbacks },
-  { x: 120, z: -578, halfWidth: 3.9, bank: 0.44, section: TrackSectionKind.Switchbacks },
-  { x: 40, z: -556, halfWidth: 3.9, bank: 0.48, section: TrackSectionKind.Switchbacks },
-  { x: -42, z: -536, halfWidth: 3.8, bank: 0.44, section: TrackSectionKind.Switchbacks },
-  { x: -96, z: -496, halfWidth: 3.7, bank: -0.50, section: TrackSectionKind.Switchbacks },
-  { x: -86, z: -434, halfWidth: 3.6, bank: -0.52, section: TrackSectionKind.Switchbacks },
-  { x: -20, z: -404, halfWidth: 3.6, bank: -0.44, section: TrackSectionKind.Switchbacks },
-  { x: 54, z: -388, halfWidth: 3.7, bank: 0.46, section: TrackSectionKind.Switchbacks },
-  { x: 106, z: -344, halfWidth: 3.6, bank: 0.54, section: TrackSectionKind.Switchbacks },
-  { x: 96, z: -282, halfWidth: 3.5, bank: 0.50, section: TrackSectionKind.Switchbacks },
-  { x: 34, z: -252, halfWidth: 3.8, bank: -0.30, section: TrackSectionKind.Switchbacks },
+  { x: 30.2, z: -411.8, halfWidth: 6.7, bank: -0.34, section: TrackSectionKind.Switchbacks },
+  { x: 68.4, z: -394.4, halfWidth: 6.1, bank: -0.46, section: TrackSectionKind.Switchbacks },
+  { x: 87, z: -365.4, halfWidth: 5.8, bank: -0.40, section: TrackSectionKind.Switchbacks },
+  { x: 69.6, z: -335.2, halfWidth: 5.7, bank: 0.44, section: TrackSectionKind.Switchbacks },
+  { x: 23.2, z: -322.5, halfWidth: 5.7, bank: 0.48, section: TrackSectionKind.Switchbacks },
+  { x: -24.4, z: -310.9, halfWidth: 5.5, bank: 0.44, section: TrackSectionKind.Switchbacks },
+  { x: -55.7, z: -287.7, halfWidth: 5.4, bank: -0.50, section: TrackSectionKind.Switchbacks },
+  { x: -49.9, z: -251.7, halfWidth: 5.2, bank: -0.52, section: TrackSectionKind.Switchbacks },
+  { x: -11.6, z: -234.3, halfWidth: 5.2, bank: -0.44, section: TrackSectionKind.Switchbacks },
+  { x: 31.3, z: -225, halfWidth: 5.4, bank: 0.46, section: TrackSectionKind.Switchbacks },
+  { x: 61.5, z: -199.5, halfWidth: 5.2, bank: 0.54, section: TrackSectionKind.Switchbacks },
+  { x: 55.7, z: -163.6, halfWidth: 5.1, bank: 0.50, section: TrackSectionKind.Switchbacks },
+  { x: 19.7, z: -146.2, halfWidth: 5.5, bank: -0.30, section: TrackSectionKind.Switchbacks },
 
   // ── 4. Rock garden: broken diagonal, punishes a bad line ─────────────────
-  { x: -18, z: -212, halfWidth: 4.4, section: TrackSectionKind.RockGarden },
-  { x: -54, z: -156, halfWidth: 4.8, section: TrackSectionKind.RockGarden },
-  { x: -66, z: -96, halfWidth: 5.2, section: TrackSectionKind.RockGarden },
-  { x: -48, z: -36, halfWidth: 5.0, section: TrackSectionKind.RockGarden },
-  { x: -14, z: 12, halfWidth: 4.6, section: TrackSectionKind.RockGarden },
+  { x: -10.4, z: -123, halfWidth: 6.4, section: TrackSectionKind.RockGarden },
+  { x: -31.3, z: -90.5, halfWidth: 7, section: TrackSectionKind.RockGarden },
+  { x: -38.3, z: -55.7, halfWidth: 7.5, section: TrackSectionKind.RockGarden },
+  { x: -27.8, z: -20.9, halfWidth: 7.2, section: TrackSectionKind.RockGarden },
+  { x: -8.1, z: 7, halfWidth: 6.7, section: TrackSectionKind.RockGarden },
 
   // ── 5. Tabletop: straight, clear takeoff read ────────────────────────────
-  { x: 10, z: 62, halfWidth: 5.0, section: TrackSectionKind.Tabletop },
-  { x: 22, z: 122, halfWidth: 5.4, section: TrackSectionKind.Tabletop },
-  { x: 28, z: 182, halfWidth: 5.4, section: TrackSectionKind.Tabletop },
+  { x: 5.8, z: 36, halfWidth: 7.2, section: TrackSectionKind.Tabletop },
+  { x: 12.8, z: 70.8, halfWidth: 7.8, section: TrackSectionKind.Tabletop },
+  { x: 16.2, z: 105.6, halfWidth: 7.8, section: TrackSectionKind.Tabletop },
 
   // ── 6. Ravine gap: a real hole in the ground ─────────────────────────────
-  { x: 30, z: 246, halfWidth: 5.0, section: TrackSectionKind.RavineGap },
-  { x: 32, z: 306, halfWidth: 4.6, section: TrackSectionKind.RavineGap },
-  { x: 34, z: 362, halfWidth: 5.0, section: TrackSectionKind.RavineGap },
+  { x: 17.4, z: 142.7, halfWidth: 7.2, section: TrackSectionKind.RavineGap },
+  { x: 18.6, z: 177.5, halfWidth: 6.7, section: TrackSectionKind.RavineGap },
+  { x: 19.7, z: 210, halfWidth: 7.2, section: TrackSectionKind.RavineGap },
 
   // ── 7. Ridge sprint: exposure on both sides ──────────────────────────────
-  { x: 40, z: 430, halfWidth: 2.6, section: TrackSectionKind.RidgeSprint },
-  { x: 54, z: 510, halfWidth: 2.3, section: TrackSectionKind.RidgeSprint },
-  { x: 74, z: 596, halfWidth: 2.2, section: TrackSectionKind.RidgeSprint },
-  { x: 92, z: 684, halfWidth: 2.4, section: TrackSectionKind.RidgeSprint },
-  { x: 100, z: 766, halfWidth: 2.9, section: TrackSectionKind.RidgeSprint },
+  { x: 23.2, z: 249.4, halfWidth: 3.8, section: TrackSectionKind.RidgeSprint },
+  { x: 31.3, z: 295.8, halfWidth: 3.3, section: TrackSectionKind.RidgeSprint },
+  { x: 42.9, z: 345.7, halfWidth: 3.2, section: TrackSectionKind.RidgeSprint },
+  { x: 53.4, z: 396.7, halfWidth: 3.5, section: TrackSectionKind.RidgeSprint },
+  { x: 58, z: 444.3, halfWidth: 4.2, section: TrackSectionKind.RidgeSprint },
 
   // ── 8. Stream bed: a drop in, wet rock, then out ─────────────────────────
-  { x: 92, z: 838, halfWidth: 3.8, section: TrackSectionKind.StreamBed },
-  { x: 66, z: 898, halfWidth: 4.4, section: TrackSectionKind.StreamBed },
-  { x: 40, z: 962, halfWidth: 4.6, section: TrackSectionKind.StreamBed },
-  { x: 30, z: 1032, halfWidth: 4.4, section: TrackSectionKind.StreamBed },
+  { x: 53.4, z: 486, halfWidth: 5.5, section: TrackSectionKind.StreamBed },
+  { x: 38.3, z: 520.8, halfWidth: 6.4, section: TrackSectionKind.StreamBed },
+  { x: 23.2, z: 558, halfWidth: 6.7, section: TrackSectionKind.StreamBed },
+  { x: 17.4, z: 598.6, halfWidth: 6.4, section: TrackSectionKind.StreamBed },
 
   // ── 9. Final sprint ──────────────────────────────────────────────────────
-  { x: 44, z: 1110, halfWidth: 5.6, section: TrackSectionKind.FinalSprint },
-  { x: 72, z: 1200, halfWidth: 6.4, section: TrackSectionKind.FinalSprint },
-  { x: 96, z: 1300, halfWidth: 7.0, section: TrackSectionKind.FinalSprint },
-  { x: 106, z: 1400, halfWidth: 7.0, section: TrackSectionKind.FinalSprint },
-  { x: 108, z: 1490, halfWidth: 6.0, section: TrackSectionKind.FinalSprint },
+  { x: 25.5, z: 643.8, halfWidth: 8.1, section: TrackSectionKind.FinalSprint },
+  { x: 41.8, z: 696, halfWidth: 9.3, section: TrackSectionKind.FinalSprint },
+  { x: 55.7, z: 754, halfWidth: 10.2, section: TrackSectionKind.FinalSprint },
+  { x: 61.5, z: 812, halfWidth: 10.2, section: TrackSectionKind.FinalSprint },
+  { x: 62.6, z: 864.2, halfWidth: 8.7, section: TrackSectionKind.FinalSprint },
 ];
 
 /**
@@ -231,18 +257,18 @@ export const TABLETOP = {
 };
 
 export const TERRAIN_FEATURES: TerrainFeature[] = [
-  { kind: 'start-plateau', x: -120, z: -1620, params: { radius: 26, flatness: 0.92 } },
+  { kind: 'start-plateau', x: -69.6, z: -939.6, params: { radius: 15, flatness: 0.92 } },
   // The tabletop. x/z is the TAKEOFF LIP and sits on the route; everything else
   // is measured along the route from there. See TABLETOP above.
-  { kind: 'tabletop', x: 23.5, z: 133, params: { ...TABLETOP } },
+  { kind: 'tabletop', x: 13.6, z: 77.1, params: { ...TABLETOP } },
   // The ravine: a genuine gap the rider must clear. Steep sides, 11m across.
-  { kind: 'ravine', x: 32, z: 306, params: { width: 11.5, depth: 26, length: 240, angle: 1.44 } },
+  { kind: 'ravine', x: 18.6, z: 177.5, params: { width: 11.5, depth: 26, length: 139, angle: 1.44 } },
   // The ridge: narrow the crest and drop the flanks hard.
-  { kind: 'ridge-narrow', x: 74, z: 596, params: { length: 360, halfWidth: 9, flankDrop: 42, angle: 0.24 } },
+  { kind: 'ridge-narrow', x: 42.9, z: 345.7, params: { length: 209, halfWidth: 9, flankDrop: 42, angle: 0.24 } },
   // The stream: a carved channel with a wet floor.
-  { kind: 'stream-channel', x: 55, z: 940, params: { width: 14, depth: 5.5, length: 260, angle: 0.86 } },
-  { kind: 'rock-garden', x: -50, z: -100, params: { radius: 70, roughness: 1.35, boulderCount: 46 } },
-  { kind: 'finish-flat', x: 108, z: 1490, params: { radius: 60, flatness: 0.85 } },
+  { kind: 'stream-channel', x: 31.9, z: 545.2, params: { width: 14, depth: 5.5, length: 151, angle: 0.86 } },
+  { kind: 'rock-garden', x: -29, z: -58, params: { radius: 41, roughness: 1.35, boulderCount: 46 } },
+  { kind: 'finish-flat', x: 62.6, z: 864.2, params: { radius: 35, flatness: 0.85 } },
 ];
 
 // ── The tabletop, as one shape both systems build ────────────────────────────
@@ -370,10 +396,22 @@ export const BIKE = {
    */
   dragK: 0.42,
   /** Maximum steering angle at the bars, radians. */
-  maxSteer: 0.62,
+  maxSteer: 0.78,
   /** How much steering authority falls off with speed. */
   steerSpeedFalloff: 0.055,
-  maxLean: 0.86,
+  /**
+   * Maximum body lean, radians. 1.02 rad is 58 degrees.
+   *
+   * Lean is what a corner IS in this model — the steer input asks for a
+   * cornering acceleration and `tan(lean) = a / g` is the angle that holds it —
+   * so this constant is the hard ceiling on how sharply the player can turn at
+   * any speed. At 0.86 (49 deg) the bike simply would not come round quickly
+   * enough to feel connected to the keys, which a player described as the
+   * controls being "very weak". Raising it is the single largest change to how
+   * responsive the bike feels, and it is an arcade racer: real downhill riders
+   * do reach 50-55 degrees, and going a little past that is the point.
+   */
+  maxLean: 1.02,
   /** Air rotation rates, rad/s. */
   airPitchRate: 4.6,
   airYawRate: 3.9,

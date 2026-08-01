@@ -79,6 +79,34 @@ const UP = new Vector3(0, 1, 0);
  */
 const LATERAL_BUDGET = 0.55;
 
+/**
+ * A single scalar on the AI steer output, kept at 1.0 — and the swept data
+ * saying why a scalar is the wrong tool here.
+ *
+ * The bike was made much more responsive for the player (lean servo gains
+ * roughly doubled, lateral grip up a quarter, max lean 49 to 58 degrees: at
+ * full lock for two seconds it went from 45 degrees of heading change with 2
+ * degrees of lean to 94 with 46). The personalities' gains are all "steer
+ * command per radian of heading error", so they only mean anything against a
+ * fixed vehicle response, and the obvious move is to scale them.
+ *
+ * There is no scale that works. Worst excursion per rider, in metres:
+ *
+ *   trim   ai0    ai1    ai2    sum
+ *   0.55   35.8   20.9    6.4   63.1
+ *   1.00   15.5    5.6    6.3   27.4
+ *   1.35    7.5   34.9    5.5   47.9
+ *   1.80    8.7   40.0   33.2   81.9
+ *
+ * ai0 wants MORE gain and ai1 wants much less; they are different personalities
+ * with different steerKp/Kd/lateralGain and their optima genuinely diverge.
+ * 1.0 is the best available compromise and it is a compromise, not a solution.
+ * The real fix is a per-personality re-tune against the current bike, which is
+ * a subsystem pass and is written down here rather than hidden behind a number
+ * that looks tuned.
+ */
+const AI_RESPONSE_TRIM = 1.0;
+
 /** How far ahead the planner scans for corners, metres. */
 const CORNER_SCAN = 110;
 /** Sampling step for that scan, metres. Fine enough to catch a hairpin entry. */
@@ -1192,7 +1220,7 @@ export class AIRider extends RacerBase {
     // bottomed out at 0.36 instead of at 1.0, and why 44% of frames sat at full
     // lock. A sweep that keeps recommending "less" all the way down is evidence
     // about the sign, not the gain.
-    let steer = -(err * p.steerKp + errRate * p.steerKd + lateralErr * p.lateralGain);
+    let steer = -(err * p.steerKp + errRate * p.steerKd + lateralErr * p.lateralGain) * AI_RESPONSE_TRIM;
 
     // Steering authority falls off with speed in the physics; ask for more when
     // fast so the closed loop keeps roughly constant response.

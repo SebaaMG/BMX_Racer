@@ -13,7 +13,7 @@ await p.evaluate(() => { window.__DESCENT__.game.race.forceRacing?.();
 await p.evaluate(() => new Promise(r => setTimeout(r, 20000)));
 const W = await p.evaluate(() => { clearInterval(window.__I); return window.__W; });
 const t0 = W.filter(x=>x.t<=6);
-console.log('lateral vs time, first 20 s (hw ~3.0-3.6 m):');for (const id of ['ai0','ai1','ai2']) { console.log(' '+id+': '+W.filter(x=>x.id===id).map(x=>x.lat).join(' ')); }
+const off = W.filter(x=>Math.abs(x.lat) > x.hw); console.log('off-track: ' + (off.length/W.length*100).toFixed(0) + '% of samples; trail half-width ' + W[0].hw + '-' + Math.max(...W.map(x=>x.hw)) + ' m');
 const byId = {};
 for (const x of W) { byId[x.id] = byId[x.id] || {max:0,crash:0}; byId[x.id].max = Math.max(byId[x.id].max, Math.abs(x.lat)); byId[x.id].crash = x.crash; }
 for (const k in byId) console.log(`  ${k}: max |lateral| ${byId[k].max.toFixed(1)} m, crashes ${byId[k].crash}`);

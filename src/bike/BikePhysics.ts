@@ -99,8 +99,22 @@ export const BODY_TUNE = {
    * in the switchbacks, the stream bed and the rock garden: roll was a free
    * integrator and the first bump decided which way it went.
    */
-  leanKp: 168,
-  leanKd: 27,
+  /**
+   * Lean servo gains, raised from 168 / 27.
+   *
+   * Lean is the corner: the steer input asks for a cornering acceleration and
+   * `tan(lean) = a / g` is the angle that holds it, so if the servo does not
+   * REACH its target the bike does not turn however much authority the tyres
+   * have. Measured at the old gains, holding full lock for two seconds from
+   * 21 km/h: the demanded lean was around 30 degrees and the achieved lean was
+   * TWO. The bike came round 45 degrees in that time, all of it from the bars,
+   * with the lean contributing essentially nothing.
+   *
+   * That is the "controls are very weak" report, and it is not an authority
+   * problem — it is a servo that never arrives.
+   */
+  leanKp: 340,
+  leanKd: 41,
   /**
    * How much of the gravitational tipping moment the balance loop takes off the
    * bike. 1 = the rider holds their weight perfectly over the contact line and
@@ -109,7 +123,7 @@ export const BODY_TUNE = {
    */
   tipCancel: 0.94,
   /** How fast the bars move to the demanded angle, radians per second. */
-  steerRate: 5.4,
+  steerRate: 8.6,
   /**
    * How firmly the rider holds the bars, N·m per radian.
    *
@@ -137,7 +151,13 @@ export const BODY_TUNE = {
   /** Hard limit on how far the castor may push the bars off the demand, rad. */
   barGive: 0.30,
   /** Speed at which lean fully replaces steer as the cornering mechanism. */
-  leanAuthoritySpeed: 9.5,
+  /**
+   * Speed at which the turn is fully carried by lean rather than by the bars.
+   * Lowered from 9.5: at 34 km/h the rider was still only being granted a
+   * fraction of the lean the corner needed, which is most of a technical
+   * section spent unable to turn properly.
+   */
+  leanAuthoritySpeed: 6.2,
 
   /**
    * Pitch: manual/endo authority and the passive stabiliser toward the slope.
