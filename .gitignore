@@ -1,4 +1,12 @@
 node_modules/
 dist/
+.DS_Store
+*.log
+
+# Review artefacts. These are REGENERATED, never authored:
+#   node tools/capture/capture.mjs --poses
+#   node tools/capture/capture.mjs --seq all
+# They were 225 MB of a 280 MB repository, which is 225 MB cloned on every
+# deploy for images nothing in the build reads.
 captures/
-.claude/
+tools/capture/_out/
