@@ -1,9 +1,9 @@
 {
-  "name": "descent",
+  "name": "descent-rally",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Cel-shaded downhill BMX racing — zero external assets, everything generated in code.",
+  "description": "Cel-shaded downhill rally racing — zero external assets, everything generated in code.",
   "scripts": {
     "dev": "vite",
     "build": "node tools/check-glsl.mjs && tsc --noEmit && vite build",
