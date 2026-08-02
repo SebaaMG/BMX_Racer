@@ -12,6 +12,7 @@
 import { Color, Object3D, Quaternion, Vector3 } from 'three';
 
 import {
+  BikeMode,
   type BikeAnchors,
   type BikeInput,
   type IBike,
@@ -121,6 +122,7 @@ export class Bike implements IBike {
     });
     this.object = this.visual.root;
     this.anchors = this.visual.anchors;
+    syncOutlineTransforms(this.object);
     opts.parent?.add(this.object);
   }
 
@@ -167,7 +169,7 @@ export class Bike implements IBike {
     v.lateralSlip = Math.abs(s.rear.lateralSlip);
     v.boosting = s.boosting;
     v.brake = clamp01(this.lastInput.brakeFront * 0.72 + this.lastInput.brakeRear * 0.62);
-    v.crashed = s.mode === 'crashing';
+    v.crashed = s.mode === BikeMode.Crashing;
 
     const cameraDistance = this.cameraRef
       ? this.cameraRef.getWorldPosition(_cameraPosition).distanceTo(_position)
@@ -224,4 +226,15 @@ function copyInput(src: BikeInput, dst: BikeInput): void {
   dst.airRoll = src.airRoll;
   dst.wantBoost = src.wantBoost;
   dst.wantHop = src.wantHop;
+}
+
+/** attachOutline creates a sibling; copy authored transforms onto that sibling. */
+function syncOutlineTransforms(root: Object3D): void {
+  root.traverse((node) => {
+    const hull = node.userData.hull as Object3D | undefined;
+    if (!hull) return;
+    hull.position.copy(node.position);
+    hull.quaternion.copy(node.quaternion);
+    hull.scale.copy(node.scale);
+  });
 }
