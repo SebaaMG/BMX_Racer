@@ -6,9 +6,10 @@
   "description": "Cel-shaded downhill rally racing — zero external assets, everything generated in code.",
   "scripts": {
     "dev": "vite",
-    "build": "node tools/check-glsl.mjs && tsc --noEmit && vite build",
+    "build": "node tools/rally/model-audit.mjs && node tools/check-glsl.mjs && tsc --noEmit && vite build",
     "preview": "vite preview --port 4173",
     "typecheck": "tsc --noEmit",
+    "audit:rally": "node tools/rally/model-audit.mjs",
     "capture": "node tools/capture/capture.mjs",
     "capture:install": "playwright install chromium",
     "check:glsl": "node tools/check-glsl.mjs"
