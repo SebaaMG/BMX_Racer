@@ -13,6 +13,7 @@ import { Color, Object3D, Quaternion, Vector3 } from 'three';
 
 import {
   BikeMode,
+  TrickKind,
   type BikeAnchors,
   type BikeInput,
   type IBike,
@@ -88,6 +89,19 @@ export class Bike implements IBike {
   readonly anchors: BikeAnchors;
   readonly isRallyCar = true;
 
+  /**
+   * RacerBase adopts this state instead of its BMX trick driver. Keeping it at
+   * None prevents tailwhip/tabletop/manual labels leaking into the rally HUD;
+   * boost is earned directly by controlled drifts and clean landings in physics.
+   */
+  readonly trick: TrickState = {
+    kind: TrickKind.None,
+    phase: 0,
+    rotations: 0,
+    pendingScore: 0,
+    committed: true,
+  };
+
   private cameraRef: Object3D | null = null;
   private linkedTrick: TrickState | null = null;
   private readonly lastInput: BikeInput = { ...EMPTY_INPUT };
@@ -138,7 +152,7 @@ export class Bike implements IBike {
     this.cameraRef = camera;
   }
 
-  /** Retained for the race layer; car attitude no longer performs BMX tricks. */
+  /** Retained for the race layer and future rally-specific style telemetry. */
   linkTrick(trick: TrickState): void {
     this.linkedTrick = trick;
   }
@@ -177,8 +191,6 @@ export class Bike implements IBike {
     this.visual.update(v, dt, cameraDistance);
     this.visual.setContacts(s.front.contactPoint, s.rear.contactPoint);
 
-    // Reading the link prevents it becoming dead compatibility state and leaves
-    // an intentional hook for future rally-specific stunt scoring.
     void this.linkedTrick;
   }
 
