@@ -9,10 +9,10 @@
 import type { BikeAnchors, IBike, IRiderRig } from '../game/Contracts';
 import type { RacerSpec } from '../ai/RaceDirector';
 import { RiderRig, type RiderRigOptions } from './RiderRig';
-import { RallyDriverRig } from '../rally/RallyDriverRig';
+import { RallyDriverRig } from '../rally/RallyDriverRigPolished';
 
 export { RiderRig, type RiderRigOptions } from './RiderRig';
-export { RallyDriverRig, type RallyDriverRigOptions } from '../rally/RallyDriverRig';
+export { RallyDriverRig, type RallyDriverRigOptions } from '../rally/RallyDriverRigPolished';
 export { RiderSkeleton, REST, LIMB, RIDER_DIMS, BONE_NAMES, BONE_INDEX, type BoneName } from './Skeleton';
 export {
   buildRiderMeshes,
