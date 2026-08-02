@@ -94,6 +94,11 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
     super(opts);
 
     this.root.traverse((node) => {
+      // Hulls are siblings that receive the final authored transform through
+      // syncHull(). Mutating them a second time double-scales aero and makes a
+      // spoke name end in ":hull", which parsed as NaN in the first pass.
+      if (node.userData.isHull) return;
+
       const name = node.name;
 
       if (name === 'rally:lofted-shell') advanceGreenhouse(node);
