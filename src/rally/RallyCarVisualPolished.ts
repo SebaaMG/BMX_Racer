@@ -6,7 +6,7 @@
  * layer can be folded into RallyCarVisual.ts and the rejected V2 deleted.
  */
 
-import { BufferGeometry, Mesh, Object3D } from 'three';
+import { BufferGeometry, Mesh, Object3D, ShaderMaterial } from 'three';
 import { prepareOutlineGeometry } from '../npr/OutlineGeometry';
 import {
   RallyCarVisual as LoftedRallyCarVisual,
@@ -42,6 +42,21 @@ function translateGeometryZ(node: Object3D, dz: number, key: string): void {
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   geometry.userData[key] = true;
+}
+
+function makeGlassOpaque(node: Object3D): void {
+  const mesh = node as Mesh;
+  const material = mesh.material;
+  if (!material || Array.isArray(material)) return;
+  material.transparent = false;
+  material.depthWrite = true;
+  material.needsUpdate = true;
+  mesh.renderOrder = 1;
+
+  const shader = material as ShaderMaterial;
+  if (shader.uniforms?.uOpacity) shader.uniforms.uOpacity.value = 1;
+  if (shader.uniforms?.uTintStrength) shader.uniforms.uTintStrength.value = 0.70;
+  if (shader.uniforms?.uSpecStrength) shader.uniforms.uSpecStrength.value = 0.24;
 }
 
 /**
@@ -82,9 +97,20 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
       const name = node.name;
 
       if (name === 'rally:lofted-shell') advanceGreenhouse(node);
-      if (name === 'rally:windshield') translateGeometryZ(node, 0.24, 'rallyWindshieldAdvanced');
-      if (name.startsWith('rally:front-side-glass:')) {
+      if (name === 'rally:windshield') {
+        translateGeometryZ(node, 0.24, 'rallyWindshieldAdvanced');
+        node.position.z += 0.012;
+        makeGlassOpaque(node);
+      } else if (name === 'rally:rear-glass') {
+        node.position.z -= 0.012;
+        makeGlassOpaque(node);
+      } else if (name.startsWith('rally:front-side-glass:')) {
         translateGeometryZ(node, 0.18, 'rallyFrontSideGlassAdvanced');
+        node.position.x += Math.sign(node.scale.x || 1) * 0.012;
+        makeGlassOpaque(node);
+      } else if (name.startsWith('rally:rear-side-glass:')) {
+        node.position.x += Math.sign(node.scale.x || 1) * 0.012;
+        makeGlassOpaque(node);
       }
 
       // These geometries were authored along Z already. A second placement
