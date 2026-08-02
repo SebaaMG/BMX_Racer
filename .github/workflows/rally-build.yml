@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 24
+    timeout-minutes: 28
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,6 +33,11 @@ jobs:
           done
           cat /tmp/descent-vite.log
           exit 1
+      - name: Capture orthographic model turntable
+        run: >-
+          node tools/rally/capture-model-review.mjs
+          --width 1200 --height 900 --pr 1
+          --outdir captures/rally-review/orthographic
       - name: Capture rally model and pack motion
         run: |
           node tools/capture/capture.mjs \
