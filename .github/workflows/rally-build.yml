@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,3 +22,33 @@ jobs:
         run: npm ci
       - name: Typecheck, GLSL check, and production build
         run: npm run build
+      - name: Install capture browser
+        run: npx playwright install --with-deps chromium
+      - name: Start review server
+        run: |
+          npm run dev -- --host 127.0.0.1 > /tmp/descent-vite.log 2>&1 &
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:5173 >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/descent-vite.log
+          exit 1
+      - name: Capture rally still and pack motion
+        run: >-
+          node tools/capture/capture.mjs
+          --pose rider-threequarter
+          --seq pack-race
+          --frames 16
+          --fps 30
+          --width 1280
+          --height 720
+          --pr 1
+          --outdir captures/rally-review
+      - name: Upload visual review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rally-visual-review
+          path: captures/rally-review
+          if-no-files-found: warn
+          retention-days: 7
