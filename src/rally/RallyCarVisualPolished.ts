@@ -6,7 +6,8 @@
  * layer can be folded into RallyCarVisual.ts and the rejected V2 deleted.
  */
 
-import { Object3D } from 'three';
+import { BufferGeometry, Mesh, Object3D } from 'three';
+import { prepareOutlineGeometry } from '../npr/OutlineGeometry';
 import {
   RallyCarVisual as LoftedRallyCarVisual,
   RALLY_BODY_DIMENSIONS,
@@ -25,12 +26,66 @@ function syncHull(node: Object3D): void {
   hull.scale.copy(node.scale);
 }
 
+function geometryOf(node: Object3D): BufferGeometry | null {
+  const geometry = (node as Mesh).geometry;
+  return geometry?.isBufferGeometry ? geometry : null;
+}
+
+function translateGeometryZ(node: Object3D, dz: number, key: string): void {
+  const geometry = geometryOf(node);
+  if (!geometry || geometry.userData[key]) return;
+  const position = geometry.getAttribute('position');
+  if (!position) return;
+  for (let i = 0; i < position.count; i++) position.setZ(i, position.getZ(i) + dz);
+  position.needsUpdate = true;
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  geometry.userData[key] = true;
+}
+
+/**
+ * Move only the upper cabin forward. Low sill/shoulder vertices keep the real
+ * wheelbase and overhangs, while belt/roof vertices advance up to 24 cm. This
+ * converts the first loft's sports-coupe hood into a compact rally greenhouse.
+ */
+function advanceGreenhouse(node: Object3D): void {
+  const geometry = geometryOf(node);
+  if (!geometry || geometry.userData.rallyGreenhouseAdvanced) return;
+  const position = geometry.getAttribute('position');
+  if (!position) return;
+
+  for (let i = 0; i < position.count; i++) {
+    const y = position.getY(i);
+    const z = position.getZ(i);
+    if (y <= 0.40 || z <= -1.18 || z >= 0.58) continue;
+    const height = Math.min(1, Math.max(0, (y - 0.40) / 0.36));
+    const longitudinal = Math.min(1, Math.max(0, (z + 1.18) / 0.66));
+    position.setZ(i, z + 0.24 * height * longitudinal);
+  }
+
+  position.needsUpdate = true;
+  geometry.computeVertexNormals();
+  // Rebuild the outline attributes after changing positions. The hull shares
+  // this exact buffer, so main, prepass and ink remain in lockstep.
+  prepareOutlineGeometry(geometry, { maxWeldAngle: 66, curvatureGain: 1.26 });
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  geometry.userData.rallyGreenhouseAdvanced = true;
+}
+
 export class RallyCarVisual extends LoftedRallyCarVisual {
   constructor(opts: RallyCarVisualOptions) {
     super(opts);
 
     this.root.traverse((node) => {
       const name = node.name;
+
+      if (name === 'rally:lofted-shell') advanceGreenhouse(node);
+      if (name === 'rally:windshield') translateGeometryZ(node, 0.24, 'rallyWindshieldAdvanced');
+      if (name.startsWith('rally:front-side-glass:')) {
+        translateGeometryZ(node, 0.18, 'rallyFrontSideGlassAdvanced');
+      }
 
       // These geometries were authored along Z already. A second placement
       // rotation turned them sideways in the first loft capture.
@@ -73,9 +128,14 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
         syncHull(node);
       }
 
-      // Keep the roof vent as a competition detail, not a second cabin block.
+      // Follow the forward greenhouse, and keep the vent as a detail rather
+      // than a second cabin block.
       if (name === 'rally:roof-vent') {
+        node.position.z += 0.15;
         node.scale.set(0.82, 0.68, 0.80);
+        syncHull(node);
+      } else if (name.startsWith('rally:mirror:')) {
+        node.position.z += 0.13;
         syncHull(node);
       }
     });
