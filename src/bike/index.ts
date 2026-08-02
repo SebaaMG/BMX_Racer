@@ -29,7 +29,7 @@ import {
 import {
   RallyCarVisual,
   type RallyCarVisualState,
-} from '../rally/RallyCarVisualV2';
+} from '../rally/RallyCarVisual';
 import type { BikeTerrain } from './Wheel';
 
 // Keep the legacy low-level exports available for physics harnesses and tools.
@@ -44,8 +44,8 @@ export { BIKE_GEOM, getBikeGeometries } from './BikeModel';
 export { TrickSystem, TRICK_TUNE } from './TrickSystem';
 export { RallyCarPhysics, RALLY_TUNE } from '../rally/RallyCarPhysics';
 export type { RallyCarPhysicsOptions, RallyCarState } from '../rally/RallyCarPhysics';
-export { RallyCarVisual } from '../rally/RallyCarVisualV2';
-export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisualV2';
+export { RallyCarVisual, RALLY_BODY_DIMENSIONS } from '../rally/RallyCarVisual';
+export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisual';
 
 const _position = new Vector3();
 const _orientation = new Quaternion();
