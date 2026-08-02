@@ -43,14 +43,19 @@ within('gravelTyreDiameter', tyre, 0.66, 0.74);
 within('roofHeightFromGround', roof, 1.36, 1.54);
 within('length/wheelbase', ratio, 1.54, 1.66);
 
-const stationZ = [...visual.matchAll(/\{\s*z:\s*(-?[0-9.]+)/g)].map((m) => Number(m[1]));
+const stationMatch = visual.match(
+  /const BODY_STATIONS:[\s\S]*?=\s*\[([\s\S]*?)\n\];/,
+);
+if (!stationMatch) throw new Error('rally model audit: BODY_STATIONS block not found');
+const stations = stationMatch[1];
+const stationZ = [...stations.matchAll(/\{\s*z:\s*(-?[0-9.]+)/g)].map((m) => Number(m[1]));
 if (stationZ.length < 9) throw new Error(`rally model audit: only ${stationZ.length} body stations`);
 const stationSpan = Math.max(...stationZ) - Math.min(...stationZ);
 if (Math.abs(stationSpan - length) > 0.03) {
   throw new Error(`rally model audit: station span ${stationSpan.toFixed(3)} does not match length ${length}`);
 }
 
-const shoulderHalf = [...visual.matchAll(/shoulderHalf:\s*([0-9.]+)/g)].map((m) => Number(m[1]));
+const shoulderHalf = [...stations.matchAll(/shoulderHalf:\s*([0-9.]+)/g)].map((m) => Number(m[1]));
 const maxShoulderWidth = Math.max(...shoulderHalf) * 2;
 if (Math.abs(maxShoulderWidth - width) > 0.08) {
   throw new Error(
@@ -64,7 +69,7 @@ for (const forbidden of ['GLTFLoader', '.glb', '.gltf', '.fbx', 'MeshStandardMat
   }
 }
 
-if (!seam.includes("RallyCarVisualPolished")) {
+if (!seam.includes('RallyCarVisualPolished')) {
   throw new Error('rally model audit: gameplay is not wired to the reviewed rally model');
 }
 
