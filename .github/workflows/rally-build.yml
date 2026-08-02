@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 28
+    timeout-minutes: 24
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,20 +38,13 @@ jobs:
           node tools/rally/capture-model-review.mjs
           --width 1200 --height 900 --pr 1
           --outdir captures/rally-review/orthographic
-      - name: Capture rally model and pack motion
-        run: |
-          node tools/capture/capture.mjs \
-            --pose rider-threequarter \
-            --width 1280 --height 720 --pr 1 \
-            --outdir captures/rally-review
-          node tools/capture/capture.mjs \
-            --pose bike-detail \
-            --width 1280 --height 720 --pr 1 \
-            --outdir captures/rally-review
-          node tools/capture/capture.mjs \
-            --seq pack-race --frames 20 --fps 30 \
-            --width 1280 --height 720 --pr 1 \
-            --outdir captures/rally-review
+      - name: Capture rally gameplay and pack motion
+        run: >-
+          node tools/capture/capture.mjs
+          --pose rider-threequarter
+          --seq pack-race --frames 20 --fps 30
+          --width 1280 --height 720 --pr 1
+          --outdir captures/rally-review
       - name: Upload visual review
         if: always()
         uses: actions/upload-artifact@v4
