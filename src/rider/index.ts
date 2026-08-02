@@ -1,27 +1,18 @@
 /**
- * The rider rig, assembled.
+ * Driver rig assembly.
  *
- * `createRiderRig` matches `RigFactory = (spec: RacerSpec) => IRiderRig` in
- * ai/RaceDirector, so the orchestrator wires a whole grid of riders with:
- *
- *     new RaceDirector({ ..., makeRig: createRiderRig, makeBike: ... });
- *
- * The rig deliberately does not require the bike at construction — RaceDirector
- * builds both from the same spec and has no ordering guarantee between them.
- * If nothing ever attaches the bike's anchors the rig falls back to deriving the
- * grips and pedals from BIKE_GEOM, which keeps the rider rideable in isolation
- * (the capture harness poses a rider with no bike at all). Wire the real anchors
- * whenever you have them — one call, any time:
- *
- *     const rig = createRiderRig(spec);
- *     attachRigToBike(rig, bike);
+ * The race factory now creates RallyDriverRig instances seated inside each car.
+ * The original full BMX RiderRig remains exported for the standalone model
+ * viewer and historical capture tools, but it is no longer part of gameplay.
  */
 
-import type { IBike, IRiderRig } from '../game/Contracts';
+import type { BikeAnchors, IBike, IRiderRig } from '../game/Contracts';
 import type { RacerSpec } from '../ai/RaceDirector';
 import { RiderRig, type RiderRigOptions } from './RiderRig';
+import { RallyDriverRig } from '../rally/RallyDriverRig';
 
 export { RiderRig, type RiderRigOptions } from './RiderRig';
+export { RallyDriverRig, type RallyDriverRigOptions } from '../rally/RallyDriverRig';
 export { RiderSkeleton, REST, LIMB, RIDER_DIMS, BONE_NAMES, BONE_INDEX, type BoneName } from './Skeleton';
 export {
   buildRiderMeshes,
@@ -34,7 +25,7 @@ export {
 export * from './Poses';
 export * from './IK';
 
-/** Deterministic per-rider phase so four riders never breathe in unison. */
+/** Deterministic per-driver animation phase so the grid never moves in unison. */
 function phaseFor(id: string): number {
   let h = 2166136261;
   for (let i = 0; i < id.length; i++) {
@@ -44,25 +35,26 @@ function phaseFor(id: string): number {
   return ((h >>> 0) / 0xffffffff) * Math.PI * 2;
 }
 
-/** The `RigFactory` the race director takes. */
+/** Gameplay factory: a helmeted driver seated behind the rally windshield. */
 export function createRiderRig(spec: RacerSpec): IRiderRig {
-  return new RiderRig({
+  return new RallyDriverRig({
     jersey: spec.jersey,
     accent: spec.accent,
-    name: `rider:${spec.id}`,
+    name: `rally-driver:${spec.id}`,
     phase: phaseFor(spec.id),
   });
 }
 
-/** Build a rig outside a race — the capture harness and the model viewer. */
+/** Build the legacy exposed rider outside a race for old tooling/model views. */
 export function makeRiderRig(opts: RiderRigOptions = {}): RiderRig {
   return new RiderRig(opts);
 }
 
 /**
- * Point a rig at a bike's contact anchors. Safe to call at any time, including
- * on a rig that has already been updating against the fallback anchors.
+ * Attach whichever rig the active vehicle uses. Both the legacy RiderRig and
+ * RallyDriverRig expose the same small attach hook over BikeAnchors.
  */
 export function attachRigToBike(rig: IRiderRig, bike: IBike): void {
-  (rig as RiderRig).attach?.(bike.anchors);
+  const attachable = rig as IRiderRig & { attach?: (anchors: BikeAnchors) => void };
+  attachable.attach?.(bike.anchors);
 }
