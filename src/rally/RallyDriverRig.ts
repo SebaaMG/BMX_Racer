@@ -21,11 +21,12 @@ import {
   TorusGeometry,
 } from 'three';
 
-import type {
-  BikeAnchors,
-  BikeState,
-  IRiderRig,
-  TrickState,
+import {
+  BikeMode,
+  type BikeAnchors,
+  type BikeState,
+  type IRiderRig,
+  type TrickState,
 } from '../game/Contracts';
 import {
   CelMaterial,
@@ -203,6 +204,9 @@ export class RallyDriverRig implements IRiderRig {
     registerNprMesh(mesh, material);
     const hull = attachOutline(mesh, preset, material.celOptions);
     if (hull) {
+      hull.position.copy(mesh.position);
+      hull.rotation.copy(mesh.rotation);
+      hull.scale.copy(mesh.scale);
       this.hullMaterials.add(hull.material as ShaderMaterial);
       parent.add(hull);
     }
@@ -238,18 +242,18 @@ export class RallyDriverRig implements IRiderRig {
     this.rightArm.rotation.y = this.steerVisual * 0.20;
 
     const suspensionPunch = clamp01(this.compression) * 0.055;
-    const airFloat = state.mode === 'airborne' ? 0.035 : 0;
+    const airFloat = state.mode === BikeMode.Airborne ? 0.035 : 0;
     const idle = Math.sin(time * 2.2 + this.phase) * 0.004;
     this.torsoRoot.position.y = -suspensionPunch + airFloat + idle;
     this.torsoRoot.rotation.x = dampHL(
       this.torsoRoot.rotation.x,
-      state.mode === 'airborne' ? -0.055 : state.pitch * -0.16,
+      state.mode === BikeMode.Airborne ? -0.055 : state.pitch * -0.16,
       0.12,
       dt,
     );
     this.torsoRoot.rotation.z = dampHL(
       this.torsoRoot.rotation.z,
-      state.mode === 'crashing' ? -state.crashDirection.x * 0.45 : state.lean * -0.32,
+      state.mode === BikeMode.Crashing ? -state.crashDirection.x * 0.45 : state.lean * -0.32,
       0.10,
       dt,
     );
@@ -259,14 +263,18 @@ export class RallyDriverRig implements IRiderRig {
     this.head.rotation.z = dampHL(this.head.rotation.z, state.lean * -0.38, 0.13, dt);
     this.head.rotation.x = dampHL(
       this.head.rotation.x,
-      state.mode === 'crashing' ? 0.24 : clamp01(state.landingImpact) * -0.12,
+      state.mode === BikeMode.Crashing ? 0.24 : clamp01(state.landingImpact) * -0.12,
       0.09,
       dt,
     );
 
     if (!this.attached) {
-      // Standalone model-viewer fallback. The race path always calls attach().
-      this.object.position.set(0.43, 0.37, -0.35);
+      // Ghost/standalone fallback: follow the synthetic vehicle pose directly.
+      this.object.position.copy(state.position);
+      this.object.quaternion.copy(state.orientation);
+      this.object.translateX(0.43);
+      this.object.translateY(0.37);
+      this.object.translateZ(-0.35);
     }
   }
 
