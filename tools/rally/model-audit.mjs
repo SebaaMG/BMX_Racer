@@ -11,8 +11,10 @@
 import { readFile } from 'node:fs/promises';
 
 const visualPath = new URL('../../src/rally/RallyCarVisual.ts', import.meta.url);
+const productionPath = new URL('../../src/rally/RallyCarVisualProduction.ts', import.meta.url);
 const seamPath = new URL('../../src/bike/index.ts', import.meta.url);
 const visual = await readFile(visualPath, 'utf8');
+const production = await readFile(productionPath, 'utf8');
 const seam = await readFile(seamPath, 'utf8');
 
 function numberField(name) {
@@ -34,8 +36,6 @@ const tyre = numberField('gravelTyreDiameter');
 const roof = numberField('roofHeightFromGround');
 const ratio = length / wheelbase;
 
-// A broad fictional Rally1/Rally2-inspired envelope. These are guardrails, not
-// homologation claims and not a copy of any one manufacturer's dimensions.
 within('length', length, 4.00, 4.30);
 within('width', width, 1.80, 1.90);
 within('wheelbase', wheelbase, 2.50, 2.70);
@@ -43,13 +43,13 @@ within('gravelTyreDiameter', tyre, 0.66, 0.74);
 within('roofHeightFromGround', roof, 1.36, 1.54);
 within('length/wheelbase', ratio, 1.54, 1.66);
 
-const stationMatch = visual.match(
-  /const BODY_STATIONS:[\s\S]*?=\s*\[([\s\S]*?)\n\];/,
+const stationMatch = production.match(
+  /const HATCH:[\s\S]*?=\s*\[([\s\S]*?)\n\];/,
 );
-if (!stationMatch) throw new Error('rally model audit: BODY_STATIONS block not found');
+if (!stationMatch) throw new Error('rally model audit: production HATCH block not found');
 const stations = stationMatch[1];
 const stationZ = [...stations.matchAll(/\{\s*z:\s*(-?[0-9.]+)/g)].map((m) => Number(m[1]));
-if (stationZ.length < 9) throw new Error(`rally model audit: only ${stationZ.length} body stations`);
+if (stationZ.length < 12) throw new Error(`rally model audit: only ${stationZ.length} production stations`);
 const stationSpan = Math.max(...stationZ) - Math.min(...stationZ);
 if (Math.abs(stationSpan - length) > 0.03) {
   throw new Error(`rally model audit: station span ${stationSpan.toFixed(3)} does not match length ${length}`);
@@ -63,14 +63,21 @@ if (Math.abs(maxShoulderWidth - width) > 0.08) {
   );
 }
 
+const floorY = [...stations.matchAll(/floorY:\s*(-?[0-9.]+)/g)].map((m) => Number(m[1]));
+const lowestFloor = Math.min(...floorY);
+within('production floorY', lowestFloor, -0.43, -0.34);
+
+const roofZ = stationZ.filter((z) => z <= 0.35 && z >= -1.20);
+if (roofZ.length < 4) throw new Error('rally model audit: greenhouse is too short for a rally hatch');
+
 for (const forbidden of ['GLTFLoader', '.glb', '.gltf', '.fbx', 'MeshStandardMaterial']) {
-  if (visual.includes(forbidden) || seam.includes(forbidden)) {
+  if (visual.includes(forbidden) || production.includes(forbidden) || seam.includes(forbidden)) {
     throw new Error(`rally model audit: forbidden external/PBR dependency ${forbidden}`);
   }
 }
 
-if (!seam.includes('RallyCarVisualPolished')) {
-  throw new Error('rally model audit: gameplay is not wired to the reviewed rally model');
+if (!seam.includes('RallyCarVisualProduction')) {
+  throw new Error('rally model audit: gameplay is not wired to the production rally hatch');
 }
 
 console.log([
@@ -78,5 +85,5 @@ console.log([
   `  envelope ${length.toFixed(2)}m × ${width.toFixed(2)}m`,
   `  wheelbase ${wheelbase.toFixed(2)}m  ratio ${ratio.toFixed(3)}`,
   `  tyre ${tyre.toFixed(2)}m  roof ${roof.toFixed(2)}m`,
-  `  ${stationZ.length} loft stations`,
+  `  ${stationZ.length} production hatch stations`,
 ].join('\n'));
