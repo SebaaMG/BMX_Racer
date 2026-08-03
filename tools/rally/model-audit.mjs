@@ -1,21 +1,25 @@
 #!/usr/bin/env node
 /**
- * Static quality gate for the generated rally model.
- *
- * This intentionally reads source rather than importing TypeScript: it runs in
- * plain Node before Vite and catches proportion regressions even when the model
- * still compiles. Visual review remains mandatory; this only prevents known
- * numerical failure modes from returning.
+ * Static quality gate for the generated rally model and its car-specific seams.
  */
 
 import { readFile } from 'node:fs/promises';
 
 const visualPath = new URL('../../src/rally/RallyCarVisual.ts', import.meta.url);
 const productionPath = new URL('../../src/rally/RallyCarVisualProduction.ts', import.meta.url);
+const finalVisualPath = new URL('../../src/rally/RallyCarVisualFinal.ts', import.meta.url);
+const finalPhysicsPath = new URL('../../src/rally/RallyCarPhysicsFinal.ts', import.meta.url);
+const runtimePath = new URL('../../src/rally/RallyRuntimeIntegration.ts', import.meta.url);
 const seamPath = new URL('../../src/bike/index.ts', import.meta.url);
+const reviewPath = new URL('./model-review.ts', import.meta.url);
+
 const visual = await readFile(visualPath, 'utf8');
 const production = await readFile(productionPath, 'utf8');
+const finalVisual = await readFile(finalVisualPath, 'utf8');
+const finalPhysics = await readFile(finalPhysicsPath, 'utf8');
+const runtime = await readFile(runtimePath, 'utf8');
 const seam = await readFile(seamPath, 'utf8');
+const review = await readFile(reviewPath, 'utf8');
 
 function numberField(name) {
   const match = visual.match(new RegExp(`\\b${name}:\\s*([0-9.]+)`));
@@ -64,20 +68,35 @@ if (Math.abs(maxShoulderWidth - width) > 0.08) {
 }
 
 const floorY = [...stations.matchAll(/floorY:\s*(-?[0-9.]+)/g)].map((m) => Number(m[1]));
-const lowestFloor = Math.min(...floorY);
-within('production floorY', lowestFloor, -0.43, -0.34);
+within('production floorY', Math.min(...floorY), -0.43, -0.34);
 
-const roofZ = stationZ.filter((z) => z <= 0.35 && z >= -1.20);
-if (roofZ.length < 4) throw new Error('rally model audit: greenhouse is too short for a rally hatch');
+for (const token of [
+  'rallyFinalHatchShell',
+  'signedLateralSlip',
+  'frontSteerRoots',
+]) {
+  if (!finalVisual.includes(token)) throw new Error(`rally model audit: final visual missing ${token}`);
+}
+for (const token of ['rallyWheels', 'rallyLateralVelocity', 'updateContactPatches']) {
+  if (!finalPhysics.includes(token)) throw new Error(`rally model audit: four-wheel physics missing ${token}`);
+}
+for (const token of ['collisionHalfLength', 'testAxis', 'emitWheel(wheels[3]']) {
+  if (!runtime.includes(token) && !seam.includes(token)) {
+    throw new Error(`rally model audit: runtime rally integration missing ${token}`);
+  }
+}
 
 for (const forbidden of ['GLTFLoader', '.glb', '.gltf', '.fbx', 'MeshStandardMaterial']) {
-  if (visual.includes(forbidden) || production.includes(forbidden) || seam.includes(forbidden)) {
+  if ([visual, production, finalVisual, finalPhysics, runtime, seam].some((source) => source.includes(forbidden))) {
     throw new Error(`rally model audit: forbidden external/PBR dependency ${forbidden}`);
   }
 }
 
-if (!seam.includes('RallyCarVisualProduction')) {
-  throw new Error('rally model audit: gameplay is not wired to the production rally hatch');
+if (!seam.includes('RallyCarVisualFinal') || !seam.includes('RallyCarPhysicsFinal')) {
+  throw new Error('rally model audit: gameplay is not wired to final rally systems');
+}
+if (!review.includes('RallyCarVisualFinal')) {
+  throw new Error('rally model audit: orthographic review is not rendering the shipping visual');
 }
 
 console.log([
@@ -86,4 +105,5 @@ console.log([
   `  wheelbase ${wheelbase.toFixed(2)}m  ratio ${ratio.toFixed(3)}`,
   `  tyre ${tyre.toFixed(2)}m  roof ${roof.toFixed(2)}m`,
   `  ${stationZ.length} production hatch stations`,
+  '  final greenhouse + countersteer + four patches + OBB contacts',
 ].join('\n'));
