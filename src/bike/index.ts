@@ -31,6 +31,11 @@ import {
   RallyCarVisual,
   type RallyCarVisualState,
 } from '../rally/RallyCarVisualPolished';
+import {
+  addRallyNumberPlates,
+  rallyNumberFromName,
+  type RallyNumberPlateHandle,
+} from '../rally/RallyNumberPlate';
 import type { BikeTerrain } from './Wheel';
 
 // Keep the legacy low-level exports available for physics harnesses and tools.
@@ -76,13 +81,7 @@ export interface BikeOptions extends RallyCarPhysicsOptions {
   parent?: Object3D;
 }
 
-/**
- * Compatibility wrapper used by the rest of the game.
- *
- * Consumers still receive an IBike, but every visible and physical operation is
- * delegated to rally-car systems. This avoids brittle casts and keeps the
- * capture harness, effects and race director functioning without special cases.
- */
+/** Compatibility wrapper used by the rest of the game. */
 export class Bike implements IBike {
   readonly physics: RallyCarPhysics;
   readonly visual: RallyCarVisual;
@@ -90,11 +89,6 @@ export class Bike implements IBike {
   readonly anchors: BikeAnchors;
   readonly isRallyCar = true;
 
-  /**
-   * RacerBase adopts this state instead of its BMX trick driver. Keeping it at
-   * None prevents tailwhip/tabletop/manual labels leaking into the rally HUD;
-   * boost is earned directly by controlled drifts and clean landings in physics.
-   */
   readonly trick: TrickState = {
     kind: TrickKind.None,
     phase: 0,
@@ -106,6 +100,7 @@ export class Bike implements IBike {
   private cameraRef: Object3D | null = null;
   private linkedTrick: TrickState | null = null;
   private readonly lastInput: BikeInput = { ...EMPTY_INPUT };
+  private readonly numberPlate: RallyNumberPlateHandle;
 
   private readonly visualState: RallyCarVisualState = {
     steerAngle: 0,
@@ -137,6 +132,11 @@ export class Bike implements IBike {
     });
     this.object = this.visual.root;
     this.anchors = this.visual.anchors;
+    this.numberPlate = addRallyNumberPlates(
+      this.object,
+      rallyNumberFromName(opts.name),
+      `${opts.name ?? 'rally-car'}:competition-number`,
+    );
     syncOutlineTransforms(this.object);
     opts.parent?.add(this.object);
   }
@@ -153,7 +153,6 @@ export class Bike implements IBike {
     this.cameraRef = camera;
   }
 
-  /** Retained for the race layer and future rally-specific style telemetry. */
   linkTrick(trick: TrickState): void {
     this.linkedTrick = trick;
   }
@@ -202,6 +201,7 @@ export class Bike implements IBike {
   }
 
   dispose(): void {
+    this.numberPlate.dispose();
     this.visual.dispose();
   }
 }
@@ -241,7 +241,6 @@ function copyInput(src: BikeInput, dst: BikeInput): void {
   dst.wantHop = src.wantHop;
 }
 
-/** attachOutline creates a sibling; copy authored transforms onto that sibling. */
 function syncOutlineTransforms(root: Object3D): void {
   root.traverse((node) => {
     const hull = node.userData.hull as Object3D | undefined;
