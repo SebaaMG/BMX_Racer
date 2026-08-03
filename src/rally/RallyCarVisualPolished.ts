@@ -1,12 +1,20 @@
 /**
  * Final construction corrections over the proportion-led loft.
  *
- * Kept separate while the new body is under critic review so corrections are
- * small, readable and easy to compare against captures. Once approved this
- * layer can be folded into RallyCarVisual.ts and the rejected V2 deleted.
+ * The base loft provides deterministic topology and audited dimensions. This
+ * layer performs the critic-led body refinement that turns that neutral cage
+ * into a planted gravel rally hatch: lower sill, broader greenhouse, compact
+ * hatch, smooth panel normals, open-spoke wheels and restrained aero.
  */
 
-import { BufferGeometry, Mesh, Object3D, ShaderMaterial } from 'three';
+import {
+  BufferGeometry,
+  Mesh,
+  Object3D,
+  ShaderMaterial,
+  TorusGeometry,
+  Vector3,
+} from 'three';
 import { prepareOutlineGeometry } from '../npr/OutlineGeometry';
 import {
   RallyCarVisual as LoftedRallyCarVisual,
@@ -18,8 +26,14 @@ import {
 export { RALLY_BODY_DIMENSIONS };
 export type { RallyCarVisualOptions, RallyCarVisualState };
 
+const _normal = new Vector3();
+
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 function syncHull(node: Object3D): void {
@@ -36,9 +50,42 @@ function geometryOf(node: Object3D): BufferGeometry | null {
   return geometry?.isBufferGeometry ? geometry : null;
 }
 
-function finishGeometry(geometry: BufferGeometry, outline = false): void {
+/**
+ * Average face normals at coincident positions. The loft remains non-indexed so
+ * material/outline code stays simple, but broad body panels no longer fracture
+ * into unrelated triangular light bands.
+ */
+function smoothCoincidentNormals(geometry: BufferGeometry): void {
   geometry.computeVertexNormals();
-  if (outline) prepareOutlineGeometry(geometry, { maxWeldAngle: 66, curvatureGain: 1.26 });
+  const position = geometry.getAttribute('position');
+  const normal = geometry.getAttribute('normal');
+  if (!position || !normal) return;
+
+  const groups = new Map<string, { x: number; y: number; z: number; indices: number[] }>();
+  for (let i = 0; i < position.count; i++) {
+    const key = `${Math.round(position.getX(i) * 10000)},${Math.round(position.getY(i) * 10000)},${Math.round(position.getZ(i) * 10000)}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { x: 0, y: 0, z: 0, indices: [] };
+      groups.set(key, group);
+    }
+    group.x += normal.getX(i);
+    group.y += normal.getY(i);
+    group.z += normal.getZ(i);
+    group.indices.push(i);
+  }
+
+  for (const group of groups.values()) {
+    _normal.set(group.x, group.y, group.z).normalize();
+    for (const index of group.indices) normal.setXYZ(index, _normal.x, _normal.y, _normal.z);
+  }
+  normal.needsUpdate = true;
+}
+
+function finishGeometry(geometry: BufferGeometry, outline = false, smooth = false): void {
+  if (smooth) smoothCoincidentNormals(geometry);
+  else geometry.computeVertexNormals();
+  if (outline) prepareOutlineGeometry(geometry, { maxWeldAngle: 72, curvatureGain: 1.18 });
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
 }
@@ -48,6 +95,7 @@ function reshapeGeometry(
   key: string,
   edit: (x: number, y: number, z: number) => [number, number, number],
   outline = false,
+  smooth = false,
 ): void {
   const geometry = geometryOf(node);
   if (!geometry || geometry.userData[key]) return;
@@ -58,8 +106,53 @@ function reshapeGeometry(
     position.setXYZ(i, x, y, z);
   }
   position.needsUpdate = true;
-  finishGeometry(geometry, outline);
+  finishGeometry(geometry, outline, smooth);
   geometry.userData[key] = true;
+}
+
+/** Shared body-space deformation for the shell and conformed surface panels. */
+function mapBodyPoint(x: number, y: number, z: number): [number, number, number] {
+  const originalY = y;
+  const upper = clamp01((originalY - 0.30) / 0.50);
+
+  // Lower the floor/sill from crossover clearance to gravel-rally clearance,
+  // while keeping the audited roof height almost unchanged.
+  y = originalY * 1.13 - 0.124;
+
+  // A rally greenhouse is broad, not pinched like a sports coupe.
+  x *= 1 + upper * 0.105;
+
+  // Compact hood: move the cowl toward the front axle.
+  if (z > -0.20 && upper > 0) {
+    const front = clamp01((z + 0.20) / 0.86);
+    z += (0.20 + front * 0.15) * (0.56 + upper * 0.44);
+  }
+
+  // Compact hatch: compress the upper rear longitudinally. The lower rear body
+  // and bumper remain at the audited 4.10 m envelope, producing a steep hatch
+  // instead of a long fastback.
+  if (z < -0.55 && upper > 0) {
+    const compressed = -0.55 + (z + 0.55) * 0.69;
+    z = lerp(z, compressed, 0.58 + upper * 0.42);
+    const rear = clamp01((-z - 0.55) / 1.10);
+    y += 0.055 * rear * (1 - upper * 0.34);
+  }
+
+  return [x, y, z];
+}
+
+function mapFrontGlass(x: number, y: number, z: number): [number, number, number] {
+  const point = mapBodyPoint(x, y, z);
+  return [point[0], point[1], point[2] + 0.018];
+}
+
+function mapRearGlass(x: number, y: number, z: number): [number, number, number] {
+  // Rear glazing gets a steeper dedicated mapping than the surrounding shell.
+  const point = mapBodyPoint(x, y, z);
+  const t = clamp01((-z - 0.78) / 0.62);
+  point[2] -= 0.12 + t * 0.12;
+  point[1] += t * 0.035;
+  return point;
 }
 
 function makeGlassOpaque(node: Object3D): void {
@@ -73,54 +166,8 @@ function makeGlassOpaque(node: Object3D): void {
 
   const shader = material as ShaderMaterial;
   if (shader.uniforms?.uOpacity) shader.uniforms.uOpacity.value = 1;
-  if (shader.uniforms?.uTintStrength) shader.uniforms.uTintStrength.value = 0.74;
-  if (shader.uniforms?.uSpecStrength) shader.uniforms.uSpecStrength.value = 0.22;
-}
-
-/**
- * Convert the loft into a compact five-door-style rally hatch.
- *
- * The audited 4.10 m body and 2.56 m wheelbase remain unchanged. The cowl moves
- * toward the front axle, while the rear roof and glass move much closer to the
- * rear axle and the rear shoulder rises into a near-vertical hatch. This is a
- * silhouette correction, not a global scale or camera trick.
- */
-function reshapeHatchGreenhouse(node: Object3D): void {
-  reshapeGeometry(
-    node,
-    'rallyHatchGreenhouseV3',
-    (x, y, z) => {
-      if (y <= 0.34) return [x, y, z];
-
-      const height = clamp01((y - 0.34) / 0.46);
-      let dz = 0;
-      if (z > -0.20) {
-        const front = clamp01((z + 0.20) / 0.80);
-        dz += (0.20 + front * 0.16) * (0.62 + height * 0.38);
-      }
-      if (z < -0.50) {
-        const rear = clamp01((-z - 0.50) / 0.85);
-        dz -= 0.36 * rear * (0.62 + height * 0.38);
-        y = Math.min(0.82, y + 0.13 * rear * (1 - height * 0.42));
-      }
-      return [x, y, z + dz];
-    },
-    true,
-  );
-}
-
-function reshapeFrontGlass(node: Object3D): void {
-  reshapeGeometry(node, 'rallyFrontGlassV3', (x, y, z) => {
-    const front = clamp01((z + 0.20) / 0.80);
-    return [x, y, z + (0.20 + front * 0.16)];
-  });
-}
-
-function reshapeRearGlass(node: Object3D): void {
-  reshapeGeometry(node, 'rallyRearGlassV3', (x, y, z) => {
-    const rear = clamp01((-z - 0.50) / 0.85);
-    return [x, Math.min(0.82, y + 0.10 * rear), z - 0.36 * rear];
-  });
+  if (shader.uniforms?.uTintStrength) shader.uniforms.uTintStrength.value = 0.78;
+  if (shader.uniforms?.uSpecStrength) shader.uniforms.uSpecStrength.value = 0.18;
 }
 
 function hidePart(node: Object3D): void {
@@ -130,68 +177,114 @@ function hidePart(node: Object3D): void {
 }
 
 export class RallyCarVisual extends LoftedRallyCarVisual {
+  private readonly refinedRimGeometry: BufferGeometry;
+
   constructor(opts: RallyCarVisualOptions) {
     super(opts);
 
+    this.refinedRimGeometry = new TorusGeometry(0.174, 0.026, 8, 20);
+    this.refinedRimGeometry.rotateY(Math.PI * 0.5);
+    prepareOutlineGeometry(this.refinedRimGeometry, { maxWeldAngle: 120, curvatureGain: 0.82 });
+
+    const shell = this.root.getObjectByName('rally:lofted-shell') as Mesh | undefined;
+    const bodyMaterial = shell?.material;
+    const bodyPrepass = shell?.userData.prepassMaterial;
+    const bodyShadow = shell?.userData.shadowMaterial;
+
     this.root.traverse((node) => {
       if (node.userData.isHull) return;
-
       const name = node.name;
 
-      if (name === 'rally:lofted-shell') reshapeHatchGreenhouse(node);
-      if (name === 'rally:windshield') {
-        reshapeFrontGlass(node);
-        node.position.z += 0.012;
+      if (name === 'rally:lofted-shell') {
+        reshapeGeometry(node, 'rallyBodyV4', mapBodyPoint, true, true);
+      } else if (
+        name === 'rally:hood-livery' ||
+        name.startsWith('rally:door-number-panel:')
+      ) {
+        reshapeGeometry(node, 'rallyBodyPanelV4', mapBodyPoint, false, true);
+      } else if (name === 'rally:windshield' || name.startsWith('rally:front-side-glass:')) {
+        reshapeGeometry(node, 'rallyFrontGlassV4', mapFrontGlass, false, true);
         makeGlassOpaque(node);
-      } else if (name === 'rally:rear-glass') {
-        reshapeRearGlass(node);
-        node.position.z -= 0.012;
-        makeGlassOpaque(node);
-      } else if (name.startsWith('rally:front-side-glass:')) {
-        reshapeFrontGlass(node);
-        node.position.x += Math.sign(node.scale.x || 1) * 0.012;
-        makeGlassOpaque(node);
-      } else if (name.startsWith('rally:rear-side-glass:')) {
-        reshapeRearGlass(node);
-        node.position.x += Math.sign(node.scale.x || 1) * 0.012;
+      } else if (name === 'rally:rear-glass' || name.startsWith('rally:rear-side-glass:')) {
+        reshapeGeometry(node, 'rallyRearGlassV4', mapRearGlass, false, true);
         makeGlassOpaque(node);
       }
 
       if (name.startsWith('rally:spot-lamp:')) hidePart(node);
 
-      if (name.startsWith('rally:exhaust:') || name.startsWith('rally:flame:')) {
-        node.rotation.x = 0;
-        syncHull(node);
+      if (name.startsWith('rally:rim:')) {
+        const mesh = node as Mesh;
+        mesh.geometry = this.refinedRimGeometry;
+        const hull = node.userData.hull as Mesh | undefined;
+        if (hull) hull.geometry = this.refinedRimGeometry;
       }
 
       if (name.startsWith('rally:spoke:')) {
         const index = Number(name.slice(name.lastIndexOf(':') + 1));
         const angle = (index / 5) * Math.PI * 2;
-        const radius = 0.095;
+        const radius = 0.103;
         node.position.set(0, -Math.sin(angle) * radius, Math.cos(angle) * radius);
         node.rotation.x = angle;
+        node.scale.set(0.86, 0.86, 0.86);
         syncHull(node);
       }
 
+      // Body-colour bumpers and mirrors remove the toy gold-bar read.
+      if (
+        bodyMaterial &&
+        (name === 'rally:front-bumper' || name === 'rally:rear-bumper' || name.startsWith('rally:mirror:'))
+      ) {
+        (node as Mesh).material = bodyMaterial;
+        if (bodyPrepass) node.userData.prepassMaterial = bodyPrepass;
+        if (bodyShadow) node.userData.shadowMaterial = bodyShadow;
+      }
+
+      // Primitive accessories must follow the vertical body remap explicitly.
       if (name === 'rally:front-bumper' || name === 'rally:rear-bumper') {
-        node.scale.x *= 0.94;
-        node.scale.y *= 0.52;
+        node.position.y = node.position.y * 1.13 - 0.124;
+        node.scale.y *= 0.68;
+        node.scale.z *= 0.82;
+        syncHull(node);
+      } else if (name === 'rally:front-splitter') {
+        node.position.y = -0.425;
         node.scale.z *= 0.78;
-        node.position.y -= 0.035;
         syncHull(node);
       } else if (name.startsWith('rally:sill:')) {
-        node.scale.y *= 0.58;
-        node.position.y -= 0.025;
+        node.position.y = -0.285;
+        node.scale.y *= 0.48;
+        syncHull(node);
+      } else if (name === 'rally:grille') {
+        node.position.y = -0.055;
+        node.scale.y *= 0.76;
+        syncHull(node);
+      } else if (name.startsWith('rally:mirror:')) {
+        node.position.y = node.position.y * 1.13 - 0.124;
+        node.position.z += 0.23;
+        node.scale.multiplyScalar(0.82);
+        syncHull(node);
+      } else if (name.startsWith('rally:mudflap:') || name.includes('-flap:')) {
+        node.position.y = -0.405;
+        node.scale.y *= 0.82;
+        syncHull(node);
+      } else if (name.startsWith('rally:exhaust:') || name.startsWith('rally:flame:')) {
+        node.rotation.x = 0;
+        node.position.y = -0.345;
         syncHull(node);
       }
 
-      // One low spoiler blade is enough. End plates, visible posts and the roof
-      // vent all read as toy roof-rack hardware in the cel silhouette.
+      if (name.startsWith('rally:headlight:')) {
+        reshapeGeometry(node, 'rallyHeadlightV4', mapBodyPoint, false, true);
+        node.position.z += 0.025;
+      } else if (name.startsWith('rally:taillight:')) {
+        reshapeGeometry(node, 'rallyTaillightV4', mapBodyPoint, false, true);
+        node.position.z -= 0.025;
+      }
+
+      // One low integrated spoiler blade. Everything that looked like roof-rack
+      // hardware in the critic sheet is removed.
       if (name === 'rally:rear-wing') {
-        node.position.y -= 0.15;
-        node.position.z -= 0.20;
-        node.scale.x *= 0.56;
-        node.scale.z *= 0.46;
+        node.position.set(0, 0.47, -1.57);
+        node.scale.set(0.48, 0.55, 0.38);
         syncHull(node);
       } else if (
         name.startsWith('rally:wing-post-') ||
@@ -199,11 +292,12 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
         name === 'rally:roof-vent'
       ) {
         hidePart(node);
-      } else if (name.startsWith('rally:mirror:')) {
-        node.position.z += 0.24;
-        node.scale.multiplyScalar(0.88);
-        syncHull(node);
       }
     });
+  }
+
+  override dispose(): void {
+    super.dispose();
+    this.refinedRimGeometry.dispose();
   }
 }
