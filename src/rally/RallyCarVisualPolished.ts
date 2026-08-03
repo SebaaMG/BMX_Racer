@@ -78,18 +78,17 @@ function makeGlassOpaque(node: Object3D): void {
 }
 
 /**
- * Turn the first loft's short two-door greenhouse into a compact rally hatch.
+ * Convert the loft into a compact five-door-style rally hatch.
  *
- * The verified 4.10 m body and 2.56 m wheelbase do not move. Only belt/roof
- * vertices move: the cowl advances toward the front axle, the rear glass walks
- * back toward the rear axle, and the low rear shoulder rises slightly into a
- * hatch rather than a separate boot. The centre roof remains at the audited
- * 1.46 m contact-patch height.
+ * The audited 4.10 m body and 2.56 m wheelbase remain unchanged. The cowl moves
+ * toward the front axle, while the rear roof and glass move much closer to the
+ * rear axle and the rear shoulder rises into a near-vertical hatch. This is a
+ * silhouette correction, not a global scale or camera trick.
  */
 function reshapeHatchGreenhouse(node: Object3D): void {
   reshapeGeometry(
     node,
-    'rallyHatchGreenhouseV2',
+    'rallyHatchGreenhouseV3',
     (x, y, z) => {
       if (y <= 0.34) return [x, y, z];
 
@@ -101,8 +100,8 @@ function reshapeHatchGreenhouse(node: Object3D): void {
       }
       if (z < -0.50) {
         const rear = clamp01((-z - 0.50) / 0.85);
-        dz -= 0.27 * rear * (0.62 + height * 0.38);
-        y = Math.min(0.80, y + 0.085 * rear * (1 - height * 0.35));
+        dz -= 0.36 * rear * (0.62 + height * 0.38);
+        y = Math.min(0.82, y + 0.13 * rear * (1 - height * 0.42));
       }
       return [x, y, z + dz];
     },
@@ -111,16 +110,16 @@ function reshapeHatchGreenhouse(node: Object3D): void {
 }
 
 function reshapeFrontGlass(node: Object3D): void {
-  reshapeGeometry(node, 'rallyFrontGlassV2', (x, y, z) => {
+  reshapeGeometry(node, 'rallyFrontGlassV3', (x, y, z) => {
     const front = clamp01((z + 0.20) / 0.80);
     return [x, y, z + (0.20 + front * 0.16)];
   });
 }
 
 function reshapeRearGlass(node: Object3D): void {
-  reshapeGeometry(node, 'rallyRearGlassV2', (x, y, z) => {
+  reshapeGeometry(node, 'rallyRearGlassV3', (x, y, z) => {
     const rear = clamp01((-z - 0.50) / 0.85);
-    return [x, Math.min(0.80, y + 0.06 * rear), z - 0.27 * rear];
+    return [x, Math.min(0.82, y + 0.10 * rear), z - 0.36 * rear];
   });
 }
 
@@ -135,9 +134,6 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
     super(opts);
 
     this.root.traverse((node) => {
-      // Hulls are siblings that receive the final authored transform through
-      // syncHull(). Mutating them a second time double-scales aero and makes a
-      // spoke name end in ":hull", which parsed as NaN in the first pass.
       if (node.userData.isHull) return;
 
       const name = node.name;
@@ -161,18 +157,13 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
         makeGlassOpaque(node);
       }
 
-      // Daylight auxiliary lamps obscured the hood line as four black spikes in
-      // the orthographic sheet. Night-stage lamps can return as a separate rig.
       if (name.startsWith('rally:spot-lamp:')) hidePart(node);
 
-      // These geometries were authored along Z already. A second placement
-      // rotation turned them sideways in the first loft capture.
       if (name.startsWith('rally:exhaust:') || name.startsWith('rally:flame:')) {
         node.rotation.x = 0;
         syncHull(node);
       }
 
-      // Rotate positions around the axle as well as the spoke geometry itself.
       if (name.startsWith('rally:spoke:')) {
         const index = Number(name.slice(name.lastIndexOf(':') + 1));
         const angle = (index / 5) * Math.PI * 2;
@@ -182,8 +173,6 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
         syncHull(node);
       }
 
-      // Remove the toy-like gold bars without losing the competition bumper
-      // and skid silhouettes.
       if (name === 'rally:front-bumper' || name === 'rally:rear-bumper') {
         node.scale.x *= 0.94;
         node.scale.y *= 0.52;
@@ -196,32 +185,20 @@ export class RallyCarVisual extends LoftedRallyCarVisual {
         syncHull(node);
       }
 
-      // Compact roof-edge aero, not a roof rack.
+      // One low spoiler blade is enough. End plates, visible posts and the roof
+      // vent all read as toy roof-rack hardware in the cel silhouette.
       if (name === 'rally:rear-wing') {
-        node.position.y -= 0.070;
-        node.position.z -= 0.10;
-        node.scale.x *= 0.76;
-        node.scale.z *= 0.70;
+        node.position.y -= 0.15;
+        node.position.z -= 0.20;
+        node.scale.x *= 0.56;
+        node.scale.z *= 0.46;
         syncHull(node);
-      } else if (name.startsWith('rally:wing-post-')) {
-        node.position.y -= 0.060;
-        node.position.z -= 0.10;
-        node.scale.y *= 0.62;
-        syncHull(node);
-      } else if (name.startsWith('rally:wing-plate-')) {
-        node.position.y -= 0.070;
-        node.position.z -= 0.10;
-        node.position.x *= 0.78;
-        node.scale.y *= 0.68;
-        node.scale.z *= 0.70;
-        syncHull(node);
-      }
-
-      // Follow the longer greenhouse and keep the vent/mirrors subordinate.
-      if (name === 'rally:roof-vent') {
-        node.position.z += 0.20;
-        node.scale.set(0.72, 0.56, 0.70);
-        syncHull(node);
+      } else if (
+        name.startsWith('rally:wing-post-') ||
+        name.startsWith('rally:wing-plate-') ||
+        name === 'rally:roof-vent'
+      ) {
+        hidePart(node);
       } else if (name.startsWith('rally:mirror:')) {
         node.position.z += 0.24;
         node.scale.multiplyScalar(0.88);
