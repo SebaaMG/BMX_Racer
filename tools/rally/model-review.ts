@@ -8,7 +8,7 @@ import {
 } from 'three';
 
 import { NPR, updateNprGlobals } from '../../src/npr/NprGlobals';
-import { RallyCarVisual } from '../../src/rally/RallyCarVisualProduction';
+import { RallyCarVisual } from '../../src/rally/RallyCarVisualFinal';
 
 const params = new URLSearchParams(location.search);
 const view = params.get('view') ?? 'front-threequarter';
@@ -36,14 +36,17 @@ const car = new RallyCarVisual({
 });
 scene.add(car.root);
 
+// A mild loaded slide makes the turntable verify visible countersteer as well
+// as static construction. It is deterministic and identical for every view.
 const state = {
-  steerAngle: 0.20,
-  frontCompression: 0.38,
-  rearCompression: 0.30,
+  steerAngle: 0.18,
+  frontCompression: 0.40,
+  rearCompression: 0.29,
   frontSpin: 0.42,
   rearSpin: 0.42,
-  speed: 0,
-  lateralSlip: 0,
+  speed: 20,
+  lateralSlip: 3.8,
+  signedLateralSlip: 3.8,
   boosting: false,
   brake: 0.35,
   crashed: false,
