@@ -10,6 +10,7 @@
  */
 
 import '../rally/RallyCameraProfile';
+import '../rally/RallyRuntimeIntegration';
 import { Color, Object3D, Quaternion, Vector3 } from 'three';
 
 import {
@@ -26,11 +27,11 @@ import {
   RALLY_TUNE,
   type RallyCarPhysicsOptions,
   type RallyCarState,
-} from '../rally/RallyCarPhysics';
+} from '../rally/RallyCarPhysicsFinal';
 import {
   RallyCarVisual,
   type RallyCarVisualState,
-} from '../rally/RallyCarVisualProduction';
+} from '../rally/RallyCarVisualFinal';
 import {
   addRallyNumberPlates,
   rallyNumberFromName,
@@ -48,10 +49,10 @@ export { Wheel, SURFACE_TABLE, createFallbackTerrain, slipCurve } from './Wheel'
 export type { BikeTerrain, WheelConfig, TyreConfig } from './Wheel';
 export { BIKE_GEOM, getBikeGeometries } from './BikeModel';
 export { TrickSystem, TRICK_TUNE } from './TrickSystem';
-export { RallyCarPhysics, RALLY_TUNE } from '../rally/RallyCarPhysics';
-export type { RallyCarPhysicsOptions, RallyCarState } from '../rally/RallyCarPhysics';
-export { RallyCarVisual, RALLY_BODY_DIMENSIONS } from '../rally/RallyCarVisualProduction';
-export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisualProduction';
+export { RallyCarPhysics, RALLY_TUNE } from '../rally/RallyCarPhysicsFinal';
+export type { RallyCarPhysicsOptions, RallyCarState } from '../rally/RallyCarPhysicsFinal';
+export { RallyCarVisual, RALLY_BODY_DIMENSIONS } from '../rally/RallyCarVisualFinal';
+export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisualFinal';
 
 const _position = new Vector3();
 const _orientation = new Quaternion();
@@ -89,6 +90,12 @@ export class Bike implements IBike {
   readonly anchors: BikeAnchors;
   readonly isRallyCar = true;
 
+  /** Oriented collision footprint consumed by RallyRuntimeIntegration. */
+  readonly collisionHalfLength = 1.98;
+  readonly collisionHalfWidth = 0.90;
+  readonly collisionHalfHeight = 0.72;
+  readonly collisionMass = RALLY_TUNE.mass;
+
   readonly trick: TrickState = {
     kind: TrickKind.None,
     phase: 0,
@@ -110,6 +117,7 @@ export class Bike implements IBike {
     rearSpin: 0,
     speed: 0,
     lateralSlip: 0,
+    signedLateralSlip: 0,
     boosting: false,
     brake: 0,
     crashed: false,
@@ -166,6 +174,10 @@ export class Bike implements IBike {
     copyInput(input, this.lastInput);
   }
 
+  applyRallyContact(normal: Vector3, deltaVelocity: number, yawDelta: number): void {
+    this.physics.applyRallyContact(normal, deltaVelocity, yawDelta);
+  }
+
   updateVisual(alpha: number, dt: number): void {
     const s = this.physics.state;
     this.physics.interpolatedPosition(alpha, _position);
@@ -180,7 +192,8 @@ export class Bike implements IBike {
     v.frontSpin = this.physics.interpolatedFrontSpin(alpha);
     v.rearSpin = this.physics.interpolatedRearSpin(alpha);
     v.speed = s.speed;
-    v.lateralSlip = Math.abs(s.rear.lateralSlip);
+    v.lateralSlip = Math.abs(s.rallyLateralVelocity);
+    v.signedLateralSlip = s.rallyLateralVelocity;
     v.boosting = s.boosting;
     v.brake = clamp01(this.lastInput.brakeFront * 0.72 + this.lastInput.brakeRear * 0.62);
     v.crashed = s.mode === BikeMode.Crashing;
