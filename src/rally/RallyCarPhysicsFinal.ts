@@ -38,7 +38,6 @@ const _forward = new Vector3();
 const _left = new Vector3();
 const _offset = new Vector3();
 const _wheelCenter = new Vector3();
-const _normal = new Vector3();
 
 function wheelState(): WheelState {
   return {
@@ -169,7 +168,7 @@ export class RallyCarPhysics extends BaseRallyCarPhysics {
     _wheelCenter.copy(s.position).add(_offset);
     this.terrain.sampleAt(_wheelCenter.x, _wheelCenter.z, sample);
 
-    const axle = front ? super.front : super.rear;
+    const axle = front ? this.front : this.rear;
     const previousCompression = patch.compression;
     const compression = clamp01(
       (sample.height + RALLY_TUNE.wheelRadius - _wheelCenter.y) /
@@ -189,7 +188,7 @@ export class RallyCarPhysics extends BaseRallyCarPhysics {
     patch.lateralSlip = s.rallyLateralVelocity + s.angularVelocity.y * axleZ;
     patch.surface = sample.surface;
 
-    const axleLoad = front ? super.front.load : super.rear.load;
+    const axleLoad = axle.load;
     const sideFactor = clamp(1 - side * transfer, 0.28, 1.72);
     patch.load = patch.grounded ? axleLoad * 0.5 * sideFactor : 0;
   }
