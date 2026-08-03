@@ -9,6 +9,7 @@
  * without a risky whole-project rename.
  */
 
+import '../rally/RallyCameraProfile';
 import { Color, Object3D, Quaternion, Vector3 } from 'three';
 
 import {
