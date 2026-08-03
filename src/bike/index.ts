@@ -30,7 +30,7 @@ import {
 import {
   RallyCarVisual,
   type RallyCarVisualState,
-} from '../rally/RallyCarVisualPolished';
+} from '../rally/RallyCarVisualProduction';
 import {
   addRallyNumberPlates,
   rallyNumberFromName,
@@ -50,8 +50,8 @@ export { BIKE_GEOM, getBikeGeometries } from './BikeModel';
 export { TrickSystem, TRICK_TUNE } from './TrickSystem';
 export { RallyCarPhysics, RALLY_TUNE } from '../rally/RallyCarPhysics';
 export type { RallyCarPhysicsOptions, RallyCarState } from '../rally/RallyCarPhysics';
-export { RallyCarVisual, RALLY_BODY_DIMENSIONS } from '../rally/RallyCarVisualPolished';
-export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisualPolished';
+export { RallyCarVisual, RALLY_BODY_DIMENSIONS } from '../rally/RallyCarVisualProduction';
+export type { RallyCarVisualState, RallyCarVisualOptions } from '../rally/RallyCarVisualProduction';
 
 const _position = new Vector3();
 const _orientation = new Quaternion();
