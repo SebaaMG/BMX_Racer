@@ -1,0 +1,55 @@
+name: Rally conversion build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [codex/rally-car-conversion]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 24
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Typecheck, GLSL check, and production build
+        run: npm run build
+      - name: Install capture browser
+        run: npx playwright install --with-deps chromium
+      - name: Start review server
+        run: |
+          npm run dev -- --host 127.0.0.1 > /tmp/descent-vite.log 2>&1 &
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:5173 >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/descent-vite.log
+          exit 1
+      - name: Capture orthographic model turntable
+        run: >-
+          node tools/rally/capture-model-review.mjs
+          --width 1200 --height 900 --pr 1
+          --outdir captures/rally-review/orthographic
+      - name: Capture rally gameplay and switchback motion
+        run: >-
+          node tools/capture/capture.mjs
+          --pose rider-threequarter
+          --seq switchback --frames 36 --fps 30
+          --width 1280 --height 720 --pr 1
+          --outdir captures/rally-review
+      - name: Upload visual review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rally-visual-review
+          path: captures/rally-review
+          if-no-files-found: warn
+          retention-days: 7

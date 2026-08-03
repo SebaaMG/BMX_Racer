@@ -31,12 +31,14 @@ import { RACER_COUNT, RACE_LENGTH, START_SPACING } from '../game/WorldConstants'
 import { TrackSpline, TrackProjection, SectionRange, createTrackSample } from './TrackSpline';
 import { TrackRibbon } from './TrackRibbon';
 import { Furniture } from './Furniture';
+import { RallyStageFurniture } from './RallyStageFurniture';
 import { Checkpoints, CornerPreview, CheckpointEvent, RacerTracker } from './Checkpoints';
 
 export { TrackSpline, createTrackSample } from './TrackSpline';
 export type { TrackProjection, SectionRange, TrackGap } from './TrackSpline';
 export { TrackRibbon } from './TrackRibbon';
 export { Furniture } from './Furniture';
+export { RallyStageFurniture } from './RallyStageFurniture';
 export { Checkpoints, RacerTracker } from './Checkpoints';
 export type { CornerPreview, CheckpointEvent } from './Checkpoints';
 
@@ -58,6 +60,7 @@ export class Track implements ITrack {
   readonly checkpointSystem: Checkpoints;
   readonly ribbon: TrackRibbon | null = null;
   readonly furniture: Furniture | null = null;
+  readonly rallyFurniture: RallyStageFurniture | null = null;
 
   constructor(terrain: ITerrain, options: CreateTrackOptions = {}) {
     this.object.name = 'track';
@@ -73,6 +76,8 @@ export class Track implements ITrack {
       this.object.add(this.ribbon.object);
       this.furniture = new Furniture(this.spline, terrain);
       this.object.add(this.furniture.object);
+      this.rallyFurniture = new RallyStageFurniture(this.spline, terrain);
+      this.object.add(this.rallyFurniture.object);
     }
 
     this.checkpointSystem = new Checkpoints(this.spline);
@@ -166,6 +171,7 @@ export class Track implements ITrack {
   dispose(): void {
     this.ribbon?.dispose();
     this.furniture?.dispose();
+    this.rallyFurniture?.dispose();
     this.spline.dispose();
     this.object.clear();
   }

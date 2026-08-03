@@ -1,14 +1,17 @@
 {
-  "name": "descent",
+  "name": "descent-rally",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Cel-shaded downhill BMX racing — zero external assets, everything generated in code.",
+  "description": "Cel-shaded downhill rally racing — zero external assets, everything generated in code.",
   "scripts": {
     "dev": "vite",
-    "build": "node tools/check-glsl.mjs && tsc --noEmit && vite build",
+    "build": "node tools/rally/model-audit.mjs && node tools/check-glsl.mjs && tsc --noEmit && vite build",
     "preview": "vite preview --port 4173",
     "typecheck": "tsc --noEmit",
+    "audit:rally": "node tools/rally/model-audit.mjs",
+    "export:rally-body": "node tools/rally/export-body-obj.mjs",
+    "capture:rally-model": "node tools/rally/capture-model-review.mjs",
     "capture": "node tools/capture/capture.mjs",
     "capture:install": "playwright install chromium",
     "check:glsl": "node tools/check-glsl.mjs"
