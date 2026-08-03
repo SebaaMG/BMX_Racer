@@ -8,7 +8,7 @@ import {
 } from 'three';
 
 import { NPR, updateNprGlobals } from '../../src/npr/NprGlobals';
-import { RallyCarVisual } from '../../src/rally/RallyCarVisualPolished';
+import { RallyCarVisual } from '../../src/rally/RallyCarVisualProduction';
 
 const params = new URLSearchParams(location.search);
 const view = params.get('view') ?? 'front-threequarter';
@@ -24,9 +24,6 @@ const scene = new Scene();
 const camera = new OrthographicCamera(-3.2, 3.2, 2.4, -2.4, 0.1, 40);
 scene.add(camera);
 
-// Model-only review: no atmospheric wash or missing shadow maps are allowed to
-// hide a silhouette defect. The same cel ramps, matcaps and inverted hulls are
-// still used by the actual shipping model.
 NPR.uFogStrengths.value = [0, 0, 0, 0];
 NPR.uShadowStrength.value = 0;
 NPR.uAmbient.value = 0.46;
