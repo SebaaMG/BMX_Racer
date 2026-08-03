@@ -38,11 +38,11 @@ jobs:
           node tools/rally/capture-model-review.mjs
           --width 1200 --height 900 --pr 1
           --outdir captures/rally-review/orthographic
-      - name: Capture rally gameplay and pack motion
+      - name: Capture rally gameplay and switchback motion
         run: >-
           node tools/capture/capture.mjs
           --pose rider-threequarter
-          --seq pack-race --frames 20 --fps 30
+          --seq switchback --frames 36 --fps 30
           --width 1280 --height 720 --pr 1
           --outdir captures/rally-review
       - name: Upload visual review
